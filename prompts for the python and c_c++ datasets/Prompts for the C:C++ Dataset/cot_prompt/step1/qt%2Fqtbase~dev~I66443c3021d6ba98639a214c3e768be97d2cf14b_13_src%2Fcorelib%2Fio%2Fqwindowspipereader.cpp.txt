@@ -1,0 +1,562 @@
+Based on the given code from a commit, please generate supplementary code files according to the commit message.
+####commit message
+Allow QWindowsPipe{Reader|Writer} to work with foreign event loops, take 2
+
+When a foreign event loop that does not enter an alertable wait state
+is running (which is also the case when a native dialog window is
+modal), pipe handlers would freeze temporarily due to their APC
+callbacks not being invoked.
+
+We address this problem by moving the I/O callbacks to the Windows
+thread pool, and only posting completion events to the main loop
+from there. That makes the actual I/O completely independent from
+any main loop, while the signal delivery works also with foreign
+loops (because Qt event delivery uses Windows messages, which foreign
+loops typically handle correctly).
+
+As a nice side effect, performance (and in particular scalability)
+is improved.
+
+Several other approaches have been tried:
+1) Using QWinEventNotifier was about a quarter slower and scaled much
+   worse. Additionally, it also required a rather egregious hack to
+   handle the (pathological) case of a single thread talking to both
+   ends of a QLocalSocket synchronously.
+2) Queuing APCs from the thread pool to the main thread and also
+   posting wake-up events to its event loop, and handling I/O on the
+   main thread; this performed roughly like this solution, but scaled
+   half as well, and the separate wake-up path was still deemed hacky.
+3) Only posting wake-up events to the main thread from the thread pool,
+   and still handling I/O on the main thread; this still performed
+   comparably to 2), and the pathological case was not handled at all.
+4) Using this approach for reads and that of 3) for writes was slightly
+   faster with big amounts of data, but scaled slightly worse, and the
+   diverging implementations were deemed not desirable.
+
+Fixes: QTBUG-64443
+Change-Id: I66443c3021d6ba98639a214c3e768be97d2cf14b
+
+####code 
+1 /****************************************************************************
+2 **
+3 ** Copyright (C) 2021 The Qt Company Ltd.
+4 ** Contact: https://www.qt.io/licensing/
+5 **
+6 ** This file is part of the QtCore module of the Qt Toolkit.
+7 **
+8 ** $QT_BEGIN_LICENSE:LGPL$
+9 ** Commercial License Usage
+10 ** Licensees holding valid commercial Qt licenses may use this file in
+11 ** accordance with the commercial license agreement provided with the
+12 ** Software or, alternatively, in accordance with the terms contained in
+13 ** a written agreement between you and The Qt Company. For licensing terms
+14 ** and conditions see https://www.qt.io/terms-conditions. For further
+15 ** information use the contact form at https://www.qt.io/contact-us.
+16 **
+17 ** GNU Lesser General Public License Usage
+18 ** Alternatively, this file may be used under the terms of the GNU Lesser
+19 ** General Public License version 3 as published by the Free Software
+20 ** Foundation and appearing in the file LICENSE.LGPL3 included in the
+21 ** packaging of this file. Please review the following information to
+22 ** ensure the GNU Lesser General Public License version 3 requirements
+23 ** will be met: https://www.gnu.org/licenses/lgpl-3.0.html.
+24 **
+25 ** GNU General Public License Usage
+26 ** Alternatively, this file may be used under the terms of the GNU
+27 ** General Public License version 2.0 or (at your option) the GNU General
+28 ** Public license version 3 or any later version approved by the KDE Free
+29 ** Qt Foundation. The licenses are as published by the Free Software
+30 ** Foundation and appearing in the file LICENSE.GPL2 and LICENSE.GPL3
+31 ** included in the packaging of this file. Please review the following
+32 ** information to ensure the GNU General Public License requirements will
+33 ** be met: https://www.gnu.org/licenses/gpl-2.0.html and
+34 ** https://www.gnu.org/licenses/gpl-3.0.html.
+35 **
+36 ** $QT_END_LICENSE$
+37 **
+38 ****************************************************************************/
+39 
+40 #include "qwindowspipereader_p.h"
+41 #include "qiodevice_p.h"
+42 #include <qelapsedtimer.h>
+43 #include <qdeadlinetimer.h>
+44 #include <qscopedvaluerollback.h>
+45 #include <qcoreapplication.h>
+46 #include <QMutexLocker>
+47 
+48 QT_BEGIN_NAMESPACE
+49 
+50 static const DWORD minReadBufferSize = 4096;
+51 
+52 QWindowsPipeReader::QWindowsPipeReader(QObject *parent)
+53     : QObject(parent),
+54       handle(INVALID_HANDLE_VALUE),
+55       eventHandle(CreateEvent(NULL, FALSE, FALSE, NULL)),
+56       syncHandle(CreateEvent(NULL, TRUE, FALSE, NULL)),
+57       waitObject(NULL),
+58       readBufferMaxSize(0),
+59       actualReadBufferSize(0),
+60       pendingReadBytes(0),
+61       lastError(ERROR_SUCCESS),
+62       state(Stopped),
+63       readSequenceStarted(false),
+64       pipeBroken(false),
+65       readyReadPending(false),
+66       winEventActPosted(false),
+67       inReadyRead(false)
+68 {
+69     ZeroMemory(&overlapped, sizeof(OVERLAPPED));
+70     overlapped.hEvent = eventHandle;
+71     waitObject = CreateThreadpoolWait(waitCallback, this, NULL);
+72     if (waitObject == NULL)
+73         qErrnoWarning("QWindowsPipeReader: CreateThreadpollWait failed.");
+74 }
+75 
+76 QWindowsPipeReader::~QWindowsPipeReader()
+77 {
+78     stop();
+79 
+80     // Wait for thread pool callback to complete. It can be still
+81     // executing some completion code.
+82     WaitForThreadpoolWaitCallbacks(waitObject, FALSE);
+83     CloseThreadpoolWait(waitObject);
+84     CloseHandle(eventHandle);
+85     CloseHandle(syncHandle);
+86 }
+87 
+88 /*!
+89     Sets the handle to read from. The handle must be valid.
+90     Do not call this function while the pipe is running.
+91  */
+92 void QWindowsPipeReader::setHandle(HANDLE hPipeReadEnd)
+93 {
+94     readBuffer.clear();
+95     actualReadBufferSize = 0;
+96     readyReadPending = false;
+97     pendingReadBytes = 0;
+98     handle = hPipeReadEnd;
+99     pipeBroken = false;
+100     lastError = ERROR_SUCCESS;
+101 }
+102 
+103 /*!
+104     Stops the asynchronous read sequence.
+105     If the read sequence is running then the I/O operation is canceled.
+106  */
+107 void QWindowsPipeReader::stop()
+108 {
+109     cancelAsyncRead(Stopped);
+110 }
+111 
+112 /*!
+113     Stops the asynchronous read sequence.
+114     Reads all pending bytes into the internal buffer.
+115  */
+116 void QWindowsPipeReader::drainAndStop()
+117 {
+118     cancelAsyncRead(Draining);
+119 
+120     // Note that signals are not emitted in the call below, as the caller
+121     // is expected to do that synchronously.
+122     consumePendingResults(false);
+123 }
+124 
+125 /*!
+126     Stops the asynchronous read sequence.
+127  */
+128 void QWindowsPipeReader::cancelAsyncRead(State newState)
+129 {
+130     if (state != Running)
+131         return;
+132 
+133     QMutexLocker locker(&mutex);
+134     state = newState;
+135     if (readSequenceStarted) {
+136         consumePending(false);
+137         // This can legitimately fail due to the GetOverlappedResult()
+138         // in the callback not being locked. We ignore ERROR_NOT_FOUND
+139         // in this case.
+140         if (!CancelIoEx(handle, &overlapped)) {
+141             const DWORD dwError = GetLastError();
+142             if (dwError != ERROR_NOT_FOUND) {
+143                 qErrnoWarning(dwError, "QWindowsPipeReader: CancelIoEx on handle %p failed.",
+144                               handle);
+145             }
+146         }
+147         locker.unlock();
+148         waitForNotification(-1);
+149     }
+150 }
+151 
+152 /*!
+153     Sets the size of internal read buffer.
+154  */
+155 void QWindowsPipeReader::setMaxReadBufferSize(qint64 size)
+156 {
+157     QMutexLocker locker(&mutex);
+158     readBufferMaxSize = size;
+159 }
+160 
+161 /*!
+162     Returns the number of bytes we've read so far.
+163  */
+164 qint64 QWindowsPipeReader::bytesAvailable() const
+165 {
+166     return actualReadBufferSize;
+167 }
+168 
+169 /*!
+170     Copies at most \c{maxlen} bytes from the internal read buffer to \c{data}.
+171  */
+172 qint64 QWindowsPipeReader::read(char *data, qint64 maxlen)
+173 {
+174     if (pipeBroken && actualReadBufferSize == 0)
+175         return 0;  // signal EOF
+176 
+177     mutex.lock();
+178     qint64 readSoFar;
+179     // If startAsyncRead() has read data, copy it to its destination.
+180     if (maxlen == 1 && actualReadBufferSize > 0) {
+181         *data = readBuffer.getChar();
+182         actualReadBufferSize--;
+183         readSoFar = 1;
+184     } else {
+185         readSoFar = readBuffer.read(data, qMin(actualReadBufferSize, maxlen));
+186         actualReadBufferSize -= readSoFar;
+187     }
+188     mutex.unlock();
+189 
+190     if (!pipeBroken) {
+191         if (state == Running)
+192             startAsyncRead();
+193         if (readSoFar == 0)
+194             return -2;      // signal EWOULDBLOCK
+195     }
+196 
+197     return readSoFar;
+198 }
+199 
+200 /*!
+201     Returns \c true if a complete line of data can be read from the buffer.
+202  */
+203 bool QWindowsPipeReader::canReadLine() const
+204 {
+205     QMutexLocker locker(&mutex);
+206     return readBuffer.indexOf('\n', actualReadBufferSize) >= 0;
+207 }
+208 
+209 /*!
+210     Starts an asynchronous read sequence on the pipe.
+211  */
+212 void QWindowsPipeReader::startAsyncRead()
+213 {
+214     QMutexLocker locker(&mutex);
+215 
+216     if (readSequenceStarted || lastError != ERROR_SUCCESS)
+217         return;
+218 
+219     state = Running;
+220     startAsyncReadLocked();
+221 
+222     // Do not post the event, if the read operation will be completed asynchronously.
+223     if (!readyReadPending && lastError == ERROR_SUCCESS)
+224         return;
+225 
+226     if (!winEventActPosted) {
+227         winEventActPosted = true;
+228         locker.unlock();
+229         QCoreApplication::postEvent(this, new QEvent(QEvent::WinEventAct));
+230     } else {
+231         locker.unlock();
+232     }
+233 
+234     SetEvent(syncHandle);
+235 }
+236 
+237 /*!
+238     Starts a new read sequence. Thread-safety should be ensured
+239     by the caller.
+240  */
+241 void QWindowsPipeReader::startAsyncReadLocked()
+242 {
+243     // Determine the number of bytes to read.
+244     qint64 bytesToRead = qMax(checkPipeState(), state == Running ? minReadBufferSize : 0);
+245 
+246     // This can happen only while draining; just do nothing in this case.
+247     if (bytesToRead == 0)
+248         return;
+249 
+250     while (lastError == ERROR_SUCCESS) {
+251         if (readBufferMaxSize && bytesToRead > (readBufferMaxSize - readBuffer.size())) {
+252             bytesToRead = readBufferMaxSize - readBuffer.size();
+253             if (bytesToRead <= 0) {
+254                 // Buffer is full. User must read data from the buffer
+255                 // before we can read more from the pipe.
+256                 return;
+257             }
+258         }
+259 
+260         char *ptr = readBuffer.reserve(bytesToRead);
+261 
+262         // ReadFile() returns true, if the read operation completes synchronously.
+263         // We don't need to call GetOverlappedResult() additionally, because
+264         // 'numberOfBytesRead' is valid in this case.
+265         DWORD numberOfBytesRead;
+266         DWORD errorCode = ERROR_SUCCESS;
+267         if (!ReadFile(handle, ptr, bytesToRead, &numberOfBytesRead, &overlapped)) {
+268             errorCode = GetLastError();
+269             if (errorCode == ERROR_IO_PENDING) {
+270                 Q_ASSERT(state == Running);
+271                 // Operation has been queued and will complete in the future.
+272                 readSequenceStarted = true;
+273                 SetThreadpoolWait(waitObject, eventHandle, NULL);
+274                 return;
+275             }
+276         }
+277 
+278         if (!readCompleted(errorCode, numberOfBytesRead))
+279             return;
+280 
+281         // In the 'Draining' state, we have to get all the data with one call
+282         // to ReadFile(). Note that message mode pipes are not supported here.
+283         if (state == Draining) {
+284             Q_ASSERT(bytesToRead == qint64(numberOfBytesRead));
+285             return;
+286         }
+287 
+288         // We need to loop until all pending data has been read and an
+289         // operation is queued for asynchronous completion.
+290         // If the pipe is configured to work in message mode, we read
+291         // the data in chunks.
+292         bytesToRead = qMax(checkPipeState(), minReadBufferSize);
+293     }
+294 }
+295 
+296 /*!
+297     Thread pool callback procedure.
+298  */
+299 void QWindowsPipeReader::waitCallback(PTP_CALLBACK_INSTANCE instance, PVOID context,
+300                                       PTP_WAIT wait, TP_WAIT_RESULT waitResult)
+301 {
+302     Q_UNUSED(instance);
+303     Q_UNUSED(wait);
+304     Q_UNUSED(waitResult);
+305     QWindowsPipeReader *pipeReader = reinterpret_cast<QWindowsPipeReader *>(context);
+306 
+307     // Get the result of the asynchronous operation.
+308     DWORD numberOfBytesTransfered = 0;
+309     DWORD errorCode = ERROR_SUCCESS;
+310     if (!GetOverlappedResult(pipeReader->handle, &pipeReader->overlapped,
+311                              &numberOfBytesTransfered, FALSE))
+312         errorCode = GetLastError();
+313 
+314     QMutexLocker locker(&pipeReader->mutex);
+315 
+316     pipeReader->readSequenceStarted = false;
+317 
+318     // Do not overwrite error code, if error has been detected by
+319     // checkPipeState() in waitForPipeClosed().
+320     if (pipeReader->lastError != ERROR_SUCCESS
+321             // After the reader was stopped, the only reason why this function can
+322             // be called is the completion of a cancellation. No signals should be
+323             // emitted, and no new read sequence should be started in this case.
+324             || pipeReader->state == Stopped) {
+325         SetEvent(pipeReader->syncHandle);
+326         return;
+327     }
+328 
+329     // Ignore ERROR_OPERATION_ABORTED. We have canceled the I/O operation
+330     // specifically for flushing the pipe.
+331     if (pipeReader->state == Draining && errorCode == ERROR_OPERATION_ABORTED)
+332         errorCode = ERROR_SUCCESS;
+333 
+334     const bool wasPendingBytes = pipeReader->readyReadPending;
+335     if (pipeReader->readCompleted(errorCode, numberOfBytesTransfered))
+336         pipeReader->startAsyncReadLocked();
+337 
+338     if (pipeReader->state == Running && !pipeReader->winEventActPosted) {
+339         pipeReader->winEventActPosted = true;
+340         locker.unlock();
+341         QCoreApplication::postEvent(pipeReader, new QEvent(QEvent::WinEventAct));
+342     } else {
+343         locker.unlock();
+344     }
+345 
+346     // To avoid a race condition with waitForReadyRead(), skip setting
+347     // the event if it has already been set.
+348     if (!wasPendingBytes)
+349         SetEvent(pipeReader->syncHandle);
+350 }
+351 
+352 /*!
+353     Will be called whenever the read operation completes. Returns \c true if
+354     no error occurred; otherwise returns \c false.
+355  */
+356 bool QWindowsPipeReader::readCompleted(DWORD errorCode, DWORD numberOfBytesRead)
+357 {
+358     // ERROR_MORE_DATA is not an error. We're connected to a message mode
+359     // pipe and the message didn't fit into the pipe's system
+360     // buffer. We will read the remaining data in the next call.
+361     if (errorCode == ERROR_SUCCESS || errorCode == ERROR_MORE_DATA) {
+362         readyReadPending = true;
+363         pendingReadBytes += numberOfBytesRead;
+364         readBuffer.truncate(actualReadBufferSize + pendingReadBytes);
+365         return true;
+366     }
+367 
+368     lastError = errorCode;
+369     return false;
+370 }
+371 
+372 /*!
+373     Receives notification that the read operation has completed.
+374  */
+375 bool QWindowsPipeReader::event(QEvent *e)
+376 {
+377     if (e->type() == QEvent::WinEventAct) {
+378         consumePendingResults(true);
+379         return true;
+380     }
+381     return QObject::event(e);
+382 }
+383 
+384 /*!
+385     Updates the read buffer size and emits pending signals in the main thread.
+386     Returns \c true, if readyRead() was emitted.
+387  */
+388 bool QWindowsPipeReader::consumePendingResults(bool allowWinActPosting)
+389 {
+390     mutex.lock();
+391 
+392     const bool emitReadyRead = consumePending(allowWinActPosting);
+393     const DWORD dwError = lastError;
+394 
+395     mutex.unlock();
+396 
+397     // Disable any further processing, if the pipe was stopped.
+398     // We are not allowed to emit signals in either 'Stopped'
+399     // or 'Draining' state.
+400     if (state != Running)
+401         return false;
+402 
+403     if (emitReadyRead && !inReadyRead) {
+404         QScopedValueRollback<bool> guard(inReadyRead, true);
+405         emit readyRead();
+406     }
+407 
+408     // Trigger 'pipeBroken' only once.
+409     if (dwError != ERROR_SUCCESS && !pipeBroken) {
+410         pipeBroken = true;
+411         if (dwError != ERROR_BROKEN_PIPE && dwError != ERROR_PIPE_NOT_CONNECTED)
+412             emit winError(dwError, QLatin1String("QWindowsPipeReader::consumePendingResults"));
+413         emit pipeClosed();
+414     }
+415 
+416     return emitReadyRead;
+417 }
+418 
+419 /*!
+420     Updates the read buffer size. Returns \c true, if readyRead()
+421     should be emitted. Thread-safety should be ensured by the caller.
+422  */
+423 bool QWindowsPipeReader::consumePending(bool allowWinActPosting)
+424 {
+425     // Confirm that the I/O operation is complete.
+426     ResetEvent(syncHandle);
+427 
+428     // Enable QEvent::WinEventAct posting.
+429     if (allowWinActPosting)
+430         winEventActPosted = false;
+431 
+432     if (readyReadPending) {
+433         readyReadPending = false;
+434         actualReadBufferSize += pendingReadBytes;
+435         pendingReadBytes = 0;
+436         return true;
+437     }
+438 
+439     return false;
+440 }
+441 
+442 /*!
+443     Returns the number of available bytes in the pipe.
+444  */
+445 DWORD QWindowsPipeReader::checkPipeState()
+446 {
+447     DWORD bytes;
+448     if (PeekNamedPipe(handle, nullptr, 0, nullptr, &bytes, nullptr))
+449         return bytes;
+450 
+451     lastError = GetLastError();
+452     return 0;
+453 }
+454 
+455 bool QWindowsPipeReader::waitForNotification(int timeout)
+456 {
+457     QElapsedTimer t;
+458     t.start();
+459     int msecs = timeout;
+460     do {
+461         DWORD waitRet = WaitForSingleObjectEx(syncHandle,
+462                                               msecs == -1 ? INFINITE : msecs, TRUE);
+463         if (waitRet == WAIT_OBJECT_0)
+464             return true;
+465 
+466         if (waitRet != WAIT_IO_COMPLETION)
+467             return false;
+468 
+469         // Some I/O completion routine was called. Wait some more.
+470         msecs = qt_subtract_from_timeout(timeout, t.elapsed());
+471     } while (msecs != 0);
+472 
+473     return false;
+474 }
+475 
+476 /*!
+477     Waits for the completion of the asynchronous read operation.
+478     Returns \c true, if we've emitted the readyRead signal (non-recursive case)
+479     or readyRead will be emitted by the event loop (recursive case).
+480  */
+481 bool QWindowsPipeReader::waitForReadyRead(int msecs)
+482 {
+483     if (readBufferMaxSize && actualReadBufferSize >= readBufferMaxSize)
+484         return false;
+485 
+486     // Make sure that 'syncHandle' was triggered by the thread pool callback.
+487     return !pipeBroken && waitForNotification(msecs)
+488            && consumePendingResults(false);
+489 }
+490 
+491 /*!
+492     Waits until the pipe is closed.
+493  */
+494 bool QWindowsPipeReader::waitForPipeClosed(int msecs)
+495 {
+496     const int sleepTime = 10;
+497     QDeadlineTimer timer(msecs);
+498 
+499     while (waitForReadyRead(timer.remainingTime())) {}
+500     if (pipeBroken)
+501         return true;
+502 
+503     if (timer.hasExpired())
+504         return false;
+505 
+506     // When the read buffer is full, the read sequence is not running,
+507     // so we need to peek the pipe to detect disconnection.
+508     forever {
+509         mutex.lock();
+510         checkPipeState();
+511         mutex.unlock();
+512         consumePendingResults(false);
+513         if (pipeBroken)
+514             return true;
+515 
+516         if (timer.hasExpired())
+517             return false;
+518 
+519         Sleep(sleepTime);
+520     }
+521 }
+522 
+523 QT_END_NAMESPACE

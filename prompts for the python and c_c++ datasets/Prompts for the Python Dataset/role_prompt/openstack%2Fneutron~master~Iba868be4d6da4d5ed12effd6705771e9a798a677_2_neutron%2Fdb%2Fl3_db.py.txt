@@ -1,0 +1,2082 @@
+I want you to act as a code reviewer of Neutron in OpenStack. Please review the code below to detect security defects. If any are found, please describe the security defect in detail and indicate the corresponding line number of code and solution. If none are found, please state '''No security defects are detected in the code'''.
+
+1 # Copyright 2012 VMware, Inc.  All rights reserved.
+2 #
+3 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
+4 #    not use this file except in compliance with the License. You may obtain
+5 #    a copy of the License at
+6 #
+7 #         http://www.apache.org/licenses/LICENSE-2.0
+8 #
+9 #    Unless required by applicable law or agreed to in writing, software
+10 #    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+11 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+12 #    License for the specific language governing permissions and limitations
+13 #    under the License.
+14 
+15 import functools
+16 import random
+17 
+18 import netaddr
+19 from neutron_lib.api.definitions import l3 as l3_apidef
+20 from neutron_lib.api import extensions
+21 from neutron_lib.api import validators
+22 from neutron_lib.callbacks import events
+23 from neutron_lib.callbacks import exceptions
+24 from neutron_lib.callbacks import registry
+25 from neutron_lib.callbacks import resources
+26 from neutron_lib import constants
+27 from neutron_lib import context as n_ctx
+28 from neutron_lib.db import api as db_api
+29 from neutron_lib.db import model_query
+30 from neutron_lib.db import resource_extend
+31 from neutron_lib.db import utils as lib_db_utils
+32 from neutron_lib import exceptions as n_exc
+33 from neutron_lib.exceptions import l3 as l3_exc
+34 from neutron_lib.plugins import constants as plugin_constants
+35 from neutron_lib.plugins import directory
+36 from neutron_lib.plugins import utils as plugin_utils
+37 from neutron_lib import rpc as n_rpc
+38 from neutron_lib.services import base as base_services
+39 from oslo_log import log as logging
+40 from oslo_utils import uuidutils
+41 from sqlalchemy import orm
+42 from sqlalchemy.orm import exc
+43 
+44 from neutron._i18n import _
+45 from neutron.api.rpc.agentnotifiers import l3_rpc_agent_api
+46 from neutron.common import ipv6_utils
+47 from neutron.common import utils
+48 from neutron.db import _utils as db_utils
+49 from neutron.db.models import l3 as l3_models
+50 from neutron.db import models_v2
+51 from neutron.db import standardattrdescription_db as st_attr
+52 from neutron.extensions import l3
+53 from neutron.extensions import qos_fip
+54 from neutron.objects import base as base_obj
+55 from neutron.objects import port_forwarding
+56 from neutron.objects import ports as port_obj
+57 from neutron.objects import router as l3_obj
+58 from neutron.objects import subnet as subnet_obj
+59 from neutron import worker as neutron_worker
+60 
+61 LOG = logging.getLogger(__name__)
+62 
+63 
+64 DEVICE_OWNER_HA_REPLICATED_INT = constants.DEVICE_OWNER_HA_REPLICATED_INT
+65 DEVICE_OWNER_ROUTER_INTF = constants.DEVICE_OWNER_ROUTER_INTF
+66 DEVICE_OWNER_ROUTER_GW = constants.DEVICE_OWNER_ROUTER_GW
+67 DEVICE_OWNER_FLOATINGIP = constants.DEVICE_OWNER_FLOATINGIP
+68 EXTERNAL_GW_INFO = l3_apidef.EXTERNAL_GW_INFO
+69 
+70 # Maps API field to DB column
+71 # API parameter name and Database column names may differ.
+72 # Useful to keep the filtering between API and Database.
+73 API_TO_DB_COLUMN_MAP = {'port_id': 'fixed_port_id'}
+74 CORE_ROUTER_ATTRS = ('id', 'name', 'tenant_id', 'admin_state_up', 'status')
+75 FIP_ASSOC_MSG = ('Floating IP %(fip_id)s %(assoc)s. External IP: %(ext_ip)s, '
+76                  'port: %(port_id)s.')
+77 
+78 
+79 @registry.has_registry_receivers
+80 class L3_NAT_dbonly_mixin(l3.RouterPluginBase,
+81                           base_services.WorkerBase,
+82                           st_attr.StandardAttrDescriptionMixin):
+83     """Mixin class to add L3/NAT router methods to db_base_plugin_v2."""
+84 
+85     router_device_owners = (
+86         DEVICE_OWNER_HA_REPLICATED_INT,
+87         DEVICE_OWNER_ROUTER_INTF,
+88         DEVICE_OWNER_ROUTER_GW,
+89         DEVICE_OWNER_FLOATINGIP
+90     )
+91 
+92     _dns_integration = None
+93 
+94     _fip_qos = None
+95 
+96     def __new__(cls, *args, **kwargs):
+97         inst = super(L3_NAT_dbonly_mixin, cls).__new__(cls, *args, **kwargs)
+98         inst._start_janitor()
+99         return inst
+100 
+101     @staticmethod
+102     @registry.receives(resources.PORT, [events.BEFORE_DELETE])
+103     def _prevent_l3_port_delete_callback(resource, event,
+104                                          trigger, payload=None):
+105         l3plugin = directory.get_plugin(plugin_constants.L3)
+106         if l3plugin and payload.metadata['port_check']:
+107             l3plugin.prevent_l3_port_deletion(
+108                 payload.context, payload.resource_id)
+109 
+110     @staticmethod
+111     def _validate_subnet_address_mode(subnet):
+112         if (subnet['ip_version'] == 6 and subnet['ipv6_ra_mode'] is None and
+113                 subnet['ipv6_address_mode'] is not None):
+114             msg = (_('IPv6 subnet %s configured to receive RAs from an '
+115                    'external router cannot be added to Neutron Router.') %
+116                    subnet['id'])
+117             raise n_exc.BadRequest(resource='router', msg=msg)
+118 
+119     @property
+120     def _is_dns_integration_supported(self):
+121         if self._dns_integration is None:
+122             self._dns_integration = (
+123                 extensions.is_extension_supported(
+124                     self._core_plugin, 'dns-integration') or
+125                 extensions.is_extension_supported(
+126                     self._core_plugin, 'dns-domain-ports'))
+127         return self._dns_integration
+128 
+129     @property
+130     def _is_fip_qos_supported(self):
+131         if self._fip_qos is None:
+132             # Check L3 service plugin
+133             self._fip_qos = extensions.is_extension_supported(
+134                 self, qos_fip.FIP_QOS_ALIAS)
+135         return self._fip_qos
+136 
+137     @property
+138     def _core_plugin(self):
+139         return directory.get_plugin()
+140 
+141     def _start_janitor(self):
+142         """Starts the periodic job that cleans up broken complex resources.
+143 
+144         This job will look for things like floating IP ports without an
+145         associated floating IP and delete them 5 minutes after detection.
+146         """
+147         interval = 60 * 5  # only every 5 minutes. cleanups should be rare
+148         initial_delay = random.randint(0, interval)  # splay multiple servers
+149         janitor = neutron_worker.PeriodicWorker(self._clean_garbage, interval,
+150                                                 initial_delay)
+151         self.add_worker(janitor)
+152 
+153     def _clean_garbage(self):
+154         if not hasattr(self, '_candidate_broken_fip_ports'):
+155             self._candidate_broken_fip_ports = set()
+156         context = n_ctx.get_admin_context()
+157         candidates = self._get_dead_floating_port_candidates(context)
+158         # just because a port is in 'candidates' doesn't necessarily mean
+159         # it's broken, we could have just caught it before it was updated.
+160         # We confirm by waiting until the next call of this function to see
+161         # if it persists.
+162         to_cleanup = candidates & self._candidate_broken_fip_ports
+163         self._candidate_broken_fip_ports = candidates - to_cleanup
+164         for port_id in to_cleanup:
+165             # ensure it wasn't just a failure to update device_id before we
+166             # delete it
+167             try:
+168                 self._fix_or_kill_floating_port(context, port_id)
+169             except Exception:
+170                 LOG.exception("Error cleaning up floating IP port: %s",
+171                               port_id)
+172 
+173     def _fix_or_kill_floating_port(self, context, port_id):
+174         pager = base_obj.Pager(limit=1)
+175         fips = l3_obj.FloatingIP.get_objects(
+176             context, _pager=pager, floating_port_id=port_id)
+177         if fips:
+178             LOG.warning("Found incorrect device_id on floating port "
+179                         "%(pid)s, correcting to %(fip)s.",
+180                         {'pid': port_id, 'fip': fips[0].id})
+181             self._core_plugin.update_port(
+182                 context, port_id, {'port': {'device_id': fips[0].id}})
+183         else:
+184             LOG.warning("Found floating IP port %s without floating IP, "
+185                         "deleting.", port_id)
+186             self._core_plugin.delete_port(
+187                 context, port_id, l3_port_check=False)
+188             registry.notify(resources.FLOATING_IP, events.AFTER_DELETE,
+189                             self, context=context, **fips[0])
+190 
+191     def _get_dead_floating_port_candidates(self, context):
+192         filters = {'device_id': ['PENDING'],
+193                    'device_owner': [DEVICE_OWNER_FLOATINGIP]}
+194         return {p['id'] for p in self._core_plugin.get_ports(context, filters)}
+195 
+196     @db_api.CONTEXT_READER
+197     def _get_router(self, context, router_id):
+198         try:
+199             router = model_query.get_by_id(
+200                 context, l3_models.Router, router_id)
+201         except exc.NoResultFound:
+202             raise l3_exc.RouterNotFound(router_id=router_id)
+203         return router
+204 
+205     def _make_router_dict(self, router, fields=None, process_extensions=True):
+206         res = dict((key, router[key]) for key in CORE_ROUTER_ATTRS)
+207         if router['gw_port_id']:
+208             ext_gw_info = {
+209                 'network_id': router.gw_port['network_id'],
+210                 'external_fixed_ips': [{'subnet_id': ip["subnet_id"],
+211                                         'ip_address': ip["ip_address"]}
+212                                        for ip in router.gw_port['fixed_ips']]}
+213         else:
+214             ext_gw_info = None
+215         res.update({
+216             EXTERNAL_GW_INFO: ext_gw_info,
+217             'gw_port_id': router['gw_port_id'],
+218         })
+219         # NOTE(salv-orlando): The following assumes this mixin is used in a
+220         # class inheriting from CommonDbMixin, which is true for all existing
+221         # plugins.
+222         if process_extensions:
+223             resource_extend.apply_funcs(l3_apidef.ROUTERS, res, router)
+224         return lib_db_utils.resource_fields(res, fields)
+225 
+226     def _create_router_db(self, context, router, tenant_id):
+227         """Create the DB object."""
+228         router.setdefault('id', uuidutils.generate_uuid())
+229         router['tenant_id'] = tenant_id
+230         registry.notify(resources.ROUTER, events.BEFORE_CREATE,
+231                         self, context=context, router=router)
+232         with db_api.CONTEXT_WRITER.using(context):
+233             # pre-generate id so it will be available when
+234             # configuring external gw port
+235             router_db = l3_models.Router(
+236                 id=router['id'],
+237                 tenant_id=router['tenant_id'],
+238                 name=router['name'],
+239                 admin_state_up=router['admin_state_up'],
+240                 status=constants.ACTIVE,
+241                 description=router.get('description'))
+242             context.session.add(router_db)
+243             registry.notify(resources.ROUTER, events.PRECOMMIT_CREATE,
+244                             self, context=context, router=router,
+245                             router_id=router['id'], router_db=router_db)
+246             return router_db
+247 
+248     def _update_gw_for_create_router(self, context, gw_info, router_id):
+249         if gw_info:
+250             with db_utils.context_if_transaction(
+251                     context, not context.session.is_active, writer=False):
+252                 router_db = self._get_router(context, router_id)
+253             self._update_router_gw_info(context, router_id,
+254                                         gw_info, router=router_db)
+255 
+256             return self._get_router(context, router_id), None
+257         return None, None
+258 
+259     @db_api.retry_if_session_inactive()
+260     def create_router(self, context, router):
+261         r = router['router']
+262         gw_info = r.pop(EXTERNAL_GW_INFO, None)
+263         create = functools.partial(self._create_router_db, context, r,
+264                                    r['tenant_id'])
+265         delete = functools.partial(self.delete_router, context)
+266         update_gw = functools.partial(self._update_gw_for_create_router,
+267                                       context, gw_info)
+268         router_db, _unused = db_utils.safe_creation(context, create,
+269                                                     delete, update_gw,
+270                                                     transaction=False)
+271         new_router = self._make_router_dict(router_db)
+272         registry.notify(resources.ROUTER, events.AFTER_CREATE, self,
+273                         context=context, router_id=router_db.id,
+274                         router=new_router, request_attrs=r,
+275                         router_db=router_db)
+276         return new_router
+277 
+278     def _update_router_db(self, context, router_id, data):
+279         """Update the DB object."""
+280         with db_api.CONTEXT_WRITER.using(context):
+281             router_db = self._get_router(context, router_id)
+282             old_router = self._make_router_dict(router_db)
+283             if data:
+284                 router_db.update(data)
+285             registry.publish(resources.ROUTER, events.PRECOMMIT_UPDATE, self,
+286                              payload=events.DBEventPayload(
+287                                  context, request_body=data,
+288                                  states=(old_router,), resource_id=router_id,
+289                                  desired_state=router_db))
+290             return router_db
+291 
+292     @db_api.retry_if_session_inactive()
+293     def update_router(self, context, id, router):
+294         r = router['router']
+295         gw_info = r.pop(EXTERNAL_GW_INFO, constants.ATTR_NOT_SPECIFIED)
+296         original = self.get_router(context, id)
+297         if gw_info != constants.ATTR_NOT_SPECIFIED:
+298             self._update_router_gw_info(context, id, gw_info)
+299         router_db = self._update_router_db(context, id, r)
+300         updated = self._make_router_dict(router_db)
+301         registry.notify(resources.ROUTER, events.AFTER_UPDATE, self,
+302                         context=context, router_id=id, old_router=original,
+303                         router=updated, request_attrs=r, router_db=router_db)
+304         return updated
+305 
+306     def _create_router_gw_port(self, context, router, network_id, ext_ips):
+307         # Port has no 'tenant-id', as it is hidden from user
+308         port_data = {'tenant_id': '',  # intentionally not set
+309                      'network_id': network_id,
+310                      'fixed_ips': ext_ips or constants.ATTR_NOT_SPECIFIED,
+311                      'device_id': router['id'],
+312                      'device_owner': DEVICE_OWNER_ROUTER_GW,
+313                      'admin_state_up': True,
+314                      'name': ''}
+315 
+316         if context.session.is_active:
+317             # TODO(ralonsoh): ML2 plugin "create_port" should be called outside
+318             # a DB transaction. In this case an exception is made but in order
+319             # to prevent future errors, this call should be moved outside
+320             # the current transaction.
+321             context.GUARD_TRANSACTION = False
+322         gw_port = plugin_utils.create_port(
+323             self._core_plugin, context.elevated(), {'port': port_data})
+324 
+325         if not gw_port['fixed_ips']:
+326             LOG.debug('No IPs available for external network %s',
+327                       network_id)
+328         with plugin_utils.delete_port_on_error(
+329                 self._core_plugin, context.elevated(), gw_port['id']):
+330             with db_api.CONTEXT_WRITER.using(context):
+331                 router = self._get_router(context, router['id'])
+332                 router.gw_port = self._core_plugin._get_port(
+333                     context.elevated(), gw_port['id'])
+334                 router_port = l3_obj.RouterPort(
+335                     context,
+336                     router_id=router.id,
+337                     port_id=gw_port['id'],
+338                     port_type=DEVICE_OWNER_ROUTER_GW
+339                 )
+340                 router_port.create()
+341 
+342     def _validate_gw_info(self, context, gw_port, info, ext_ips):
+343         network_id = info['network_id'] if info else None
+344         if network_id:
+345             network_db = self._core_plugin._get_network(context, network_id)
+346             if not network_db.external:
+347                 msg = _("Network %s is not an external network") % network_id
+348                 raise n_exc.BadRequest(resource='router', msg=msg)
+349             if ext_ips:
+350                 subnets = self._core_plugin.get_subnets_by_network(context,
+351                                                                    network_id)
+352                 for s in subnets:
+353                     if not s['gateway_ip']:
+354                         continue
+355                     for ext_ip in ext_ips:
+356                         if ext_ip.get('ip_address') == s['gateway_ip']:
+357                             msg = _("External IP %s is the same as the "
+358                                     "gateway IP") % ext_ip.get('ip_address')
+359                             raise n_exc.BadRequest(resource='router', msg=msg)
+360         return network_id
+361 
+362     # NOTE(yamamoto): This method is an override point for plugins
+363     # inheriting this class.  Do not optimize this out.
+364     def router_gw_port_has_floating_ips(self, context, router_id):
+365         """Return True if the router's gateway port is serving floating IPs."""
+366         return bool(self.get_floatingips_count(context,
+367                                                {'router_id': [router_id]}))
+368 
+369     def _delete_current_gw_port(self, context, router_id, router,
+370                                 new_network_id):
+371         """Delete gw port if attached to an old network."""
+372         port_requires_deletion = (
+373             router.gw_port and router.gw_port['network_id'] != new_network_id)
+374         if not port_requires_deletion:
+375             return
+376         admin_ctx = context.elevated()
+377         old_network_id = router.gw_port['network_id']
+378 
+379         if self.router_gw_port_has_floating_ips(admin_ctx, router_id):
+380             raise l3_exc.RouterExternalGatewayInUseByFloatingIp(
+381                 router_id=router_id, net_id=router.gw_port['network_id'])
+382         gw_ips = [x['ip_address'] for x in router.gw_port['fixed_ips']]
+383         gw_port_id = router.gw_port['id']
+384         self._delete_router_gw_port_db(context, router)
+385         if admin_ctx.session.is_active:
+386             # TODO(ralonsoh): ML2 plugin "delete_port" should be called outside
+387             # a DB transaction. In this case an exception is made but in order
+388             # to prevent future errors, this call should be moved outside
+389             # the current transaction.
+390             admin_ctx.GUARD_TRANSACTION = False
+391         self._core_plugin.delete_port(
+392             admin_ctx, gw_port_id, l3_port_check=False)
+393         # TODO(boden): normalize metadata
+394         metadata = {'network_id': old_network_id,
+395                     'new_network_id': new_network_id,
+396                     'gateway_ips': gw_ips}
+397         registry.publish(resources.ROUTER_GATEWAY,
+398                          events.AFTER_DELETE, self,
+399                          payload=events.DBEventPayload(
+400                              context, states=(router,),
+401                              metadata=metadata,
+402                              resource_id=router_id))
+403 
+404     def _delete_router_gw_port_db(self, context, router):
+405         with db_api.CONTEXT_WRITER.using(context):
+406             router.gw_port = None
+407             if router not in context.session:
+408                 context.session.add(router)
+409             try:
+410                 registry.publish(resources.ROUTER_GATEWAY,
+411                                  events.BEFORE_DELETE, self,
+412                                  payload=events.DBEventPayload(
+413                                      context, states=(router,),
+414                                      resource_id=router.id))
+415             except exceptions.CallbackFailure as e:
+416                 # NOTE(armax): preserve old check's behavior
+417                 if len(e.errors) == 1:
+418                     raise e.errors[0].error
+419                 raise l3_exc.RouterInUse(router_id=router.id, reason=e)
+420 
+421     def _create_gw_port(self, context, router_id, router, new_network_id,
+422                         ext_ips):
+423         with db_api.CONTEXT_READER.using(context):
+424             router = self._get_router(context, router_id)
+425             new_valid_gw_port_attachment = (
+426                 new_network_id and
+427                 (not router.gw_port or
+428                 router.gw_port['network_id'] != new_network_id))
+429         if new_valid_gw_port_attachment:
+430             subnets = self._core_plugin.get_subnets_by_network(context,
+431                                                                new_network_id)
+432             try:
+433                 registry.publish(
+434                     resources.ROUTER_GATEWAY, events.BEFORE_CREATE, self,
+435                     payload=events.DBEventPayload(
+436                         context, request_body=router,
+437                         metadata={
+438                             'network_id': new_network_id,
+439                             'subnets': subnets},
+440                         resource_id=router_id))
+441             except exceptions.CallbackFailure as e:
+442                 # raise the underlying exception
+443                 raise e.errors[0].error
+444 
+445             self._check_for_dup_router_subnets(context, router,
+446                                                new_network_id,
+447                                                subnets)
+448             self._create_router_gw_port(context, router,
+449                                         new_network_id, ext_ips)
+450 
+451             with db_api.CONTEXT_READER.using(context):
+452                 router = self._get_router(context, router_id)
+453                 gw_ips = [x['ip_address'] for x in router.gw_port['fixed_ips']]
+454 
+455             registry.publish(resources.ROUTER_GATEWAY,
+456                              events.AFTER_CREATE,
+457                              self._create_gw_port,
+458                              payload=events.DBEventPayload(
+459                                  context, states=(router,),
+460                                  metadata={'gateway_ips': gw_ips,
+461                                            'network_id': new_network_id},
+462                                  resource_id=router_id))
+463 
+464     def _update_current_gw_port(self, context, router_id, router, ext_ips):
+465         self._core_plugin.update_port(context.elevated(), router.gw_port['id'],
+466                                       {'port': {'fixed_ips': ext_ips}})
+467 
+468     def _update_router_gw_info(self, context, router_id, info, router=None):
+469         router = router or self._get_router(context, router_id)
+470         gw_port = router.gw_port
+471         ext_ips = info.get('external_fixed_ips') if info else []
+472         ext_ip_change = self._check_for_external_ip_change(
+473             context, gw_port, ext_ips)
+474         network_id = self._validate_gw_info(context, gw_port, info, ext_ips)
+475         if gw_port and ext_ip_change and gw_port['network_id'] == network_id:
+476             self._update_current_gw_port(context, router_id, router,
+477                                          ext_ips)
+478         else:
+479             self._delete_current_gw_port(context, router_id, router,
+480                                          network_id)
+481             self._create_gw_port(context, router_id, router, network_id,
+482                                  ext_ips)
+483 
+484     def _check_for_external_ip_change(self, context, gw_port, ext_ips):
+485         # determine if new external IPs differ from the existing fixed_ips
+486         if not ext_ips:
+487             # no external_fixed_ips were included
+488             return False
+489         if not gw_port:
+490             return True
+491 
+492         subnet_ids = set(ip['subnet_id'] for ip in gw_port['fixed_ips'])
+493         new_subnet_ids = set(f['subnet_id'] for f in ext_ips
+494                              if f.get('subnet_id'))
+495         subnet_change = not new_subnet_ids == subnet_ids
+496         if subnet_change:
+497             return True
+498         ip_addresses = set(ip['ip_address'] for ip in gw_port['fixed_ips'])
+499         new_ip_addresses = set(f['ip_address'] for f in ext_ips
+500                                if f.get('ip_address'))
+501         ip_address_change = not ip_addresses == new_ip_addresses
+502         return ip_address_change
+503 
+504     def _ensure_router_not_in_use(self, context, router_id):
+505         """Ensure that no internal network interface is attached
+506         to the router.
+507         """
+508         router = self._get_router(context, router_id)
+509         device_owner = self._get_device_owner(context, router)
+510         if any(rp.port_type == device_owner
+511                for rp in router.attached_ports):
+512             raise l3_exc.RouterInUse(router_id=router_id)
+513         return router
+514 
+515     @db_api.retry_if_session_inactive()
+516     def delete_router(self, context, id):
+517         registry.publish(resources.ROUTER, events.BEFORE_DELETE, self,
+518                          payload=events.DBEventPayload(
+519                              context, resource_id=id))
+520         # TODO(nati) Refactor here when we have router insertion model
+521         router = self._ensure_router_not_in_use(context, id)
+522         original = self._make_router_dict(router)
+523         self._delete_current_gw_port(context, id, router, None)
+524 
+525         router_ports_ids = (rp.port_id for rp in
+526             l3_obj.RouterPort.get_objects(context, router_id=id))
+527         if context.session.is_active:
+528             context.GUARD_TRANSACTION = False
+529         for rp_id in router_ports_ids:
+530             self._core_plugin.delete_port(context.elevated(), rp_id,
+531                                           l3_port_check=False)
+532 
+533         with db_api.CONTEXT_WRITER.using(context):
+534             router = self._get_router(context, id)
+535             registry.notify(resources.ROUTER, events.PRECOMMIT_DELETE,
+536                             self, context=context, router_db=router,
+537                             router_id=id)
+538             # we bump the revision even though we are about to delete to throw
+539             # staledataerror if something stuck in with a new interface
+540             router.bump_revision()
+541             context.session.flush()
+542             context.session.delete(router)
+543 
+544         registry.notify(resources.ROUTER, events.AFTER_DELETE, self,
+545                         context=context, router_id=id, original=original)
+546 
+547     @db_api.retry_if_session_inactive()
+548     def get_router(self, context, id, fields=None):
+549         router = self._get_router(context, id)
+550         return self._make_router_dict(router, fields)
+551 
+552     @db_api.retry_if_session_inactive()
+553     def get_routers(self, context, filters=None, fields=None,
+554                     sorts=None, limit=None, marker=None,
+555                     page_reverse=False):
+556         marker_obj = lib_db_utils.get_marker_obj(
+557             self, context, 'router', limit, marker)
+558         return model_query.get_collection(context, l3_models.Router,
+559                                           self._make_router_dict,
+560                                           filters=filters, fields=fields,
+561                                           sorts=sorts,
+562                                           limit=limit,
+563                                           marker_obj=marker_obj,
+564                                           page_reverse=page_reverse)
+565 
+566     @db_api.retry_if_session_inactive()
+567     def get_routers_count(self, context, filters=None):
+568         return model_query.get_collection_count(context, l3_models.Router,
+569                                                 filters=filters)
+570 
+571     def _check_for_dup_router_subnets(self, context, router,
+572                                       network_id, new_subnets):
+573         # It's possible these ports are on the same network, but
+574         # different subnets.
+575         new_subnet_ids = {s['id'] for s in new_subnets}
+576         router_subnets = []
+577         for p in (rp.port for rp in router.attached_ports):
+578             for ip in p['fixed_ips']:
+579                 if ip['subnet_id'] in new_subnet_ids:
+580                     msg = (_("Router already has a port on subnet %s")
+581                            % ip['subnet_id'])
+582                     raise n_exc.BadRequest(resource='router', msg=msg)
+583                 if p.get('device_owner') == DEVICE_OWNER_ROUTER_GW:
+584                     ext_subts = self._core_plugin.get_subnets(
+585                         context.elevated(),
+586                         filters={'network_id': [p['network_id']]})
+587                     for sub in ext_subts:
+588                         router_subnets.append(sub['id'])
+589                 else:
+590                     router_subnets.append(ip['subnet_id'])
+591 
+592         # Ignore temporary Prefix Delegation CIDRs
+593         new_subnets = [s for s in new_subnets
+594                        if s['cidr'] != constants.PROVISIONAL_IPV6_PD_PREFIX]
+595         id_filter = {'id': router_subnets}
+596         subnets = self._core_plugin.get_subnets(context.elevated(),
+597                                                 filters=id_filter)
+598         for sub in subnets:
+599             cidr = sub['cidr']
+600             ipnet = netaddr.IPNetwork(cidr)
+601             for s in new_subnets:
+602                 new_cidr = s['cidr']
+603                 new_ipnet = netaddr.IPNetwork(new_cidr)
+604                 match1 = netaddr.all_matching_cidrs(new_ipnet, [cidr])
+605                 match2 = netaddr.all_matching_cidrs(ipnet, [new_cidr])
+606                 if match1 or match2:
+607                     data = {'subnet_cidr': new_cidr,
+608                             'subnet_id': s['id'],
+609                             'cidr': cidr,
+610                             'sub_id': sub['id']}
+611                     msg = (_("Cidr %(subnet_cidr)s of subnet "
+612                              "%(subnet_id)s overlaps with cidr %(cidr)s "
+613                              "of subnet %(sub_id)s") % data)
+614                     raise n_exc.BadRequest(resource='router', msg=msg)
+615 
+616     def _get_device_owner(self, context, router=None):
+617         """Get device_owner for the specified router."""
+618         # NOTE(armando-migliaccio): in the base case this is invariant
+619         return DEVICE_OWNER_ROUTER_INTF
+620 
+621     def _validate_interface_info(self, interface_info, for_removal=False):
+622         port_id_specified = interface_info and 'port_id' in interface_info
+623         subnet_id_specified = interface_info and 'subnet_id' in interface_info
+624         if not (port_id_specified or subnet_id_specified):
+625             msg = _("Either subnet_id or port_id must be specified")
+626             raise n_exc.BadRequest(resource='router', msg=msg)
+627         for key in ('port_id', 'subnet_id'):
+628             if key not in interface_info:
+629                 continue
+630             err = validators.validate_uuid(interface_info[key])
+631             if err:
+632                 raise n_exc.BadRequest(resource='router', msg=err)
+633         if not for_removal:
+634             if port_id_specified and subnet_id_specified:
+635                 msg = _("Cannot specify both subnet-id and port-id")
+636                 raise n_exc.BadRequest(resource='router', msg=msg)
+637         return port_id_specified, subnet_id_specified
+638 
+639     def _check_router_port(self, context, port_id, device_id):
+640         """Check that a port is available for an attachment to a router
+641 
+642         :param context: The context of the request.
+643         :param port_id: The port to be attached.
+644         :param device_id: This method will check that device_id corresponds to
+645         the device_id of the port. It raises PortInUse exception if it
+646         doesn't.
+647         :returns: The port description returned by the core plugin.
+648         :raises: PortInUse if the device_id is not the same as the port's one.
+649         :raises: BadRequest if the port has no fixed IP.
+650         """
+651         port = self._core_plugin.get_port(context, port_id)
+652         if port['device_id'] != device_id:
+653             raise n_exc.PortInUse(net_id=port['network_id'],
+654                                   port_id=port['id'],
+655                                   device_id=port['device_id'])
+656         if not port['fixed_ips']:
+657             msg = _('Router port must have at least one fixed IP')
+658             raise n_exc.BadRequest(resource='router', msg=msg)
+659 
+660         fixed_ips = list(port['fixed_ips'])
+661         for fixed_ip in fixed_ips:
+662             subnet = self._core_plugin.get_subnet(
+663                 context, fixed_ip['subnet_id'])
+664             self._validate_subnet_address_mode(subnet)
+665 
+666         return port
+667 
+668     def _validate_port_in_range_or_admin(self, context, subnets, port):
+669         if context.is_admin:
+670             return
+671         subnets_by_id = {}
+672         for s in subnets:
+673             addr_set = netaddr.IPSet()
+674             for range in s['allocation_pools']:
+675                 addr_set.add(netaddr.IPRange(netaddr.IPAddress(range['start']),
+676                                              netaddr.IPAddress(range['end'])))
+677             subnets_by_id[s['id']] = (addr_set, s['project_id'],)
+678         for subnet_id, ip in [(fix_ip['subnet_id'], fix_ip['ip_address'],)
+679                               for fix_ip in port['fixed_ips']]:
+680             if (ip not in subnets_by_id[subnet_id][0] and
+681                     context.project_id != subnets_by_id[subnet_id][1]):
+682                 msg = (_('Cannot add interface to router because specified '
+683                          'port %(port)s has an IP address out of the '
+684                          'allocation pool of subnet %(subnet)s, which is not '
+685                          'owned by the project making the request') %
+686                        {'port': port['id'], 'subnet': subnet_id})
+687                 raise n_exc.BadRequest(resource='router', msg=msg)
+688 
+689     def _validate_router_port_info(self, context, router, port_id):
+690         with db_api.CONTEXT_READER.using(context):
+691             # check again within transaction to mitigate race
+692             port = self._check_router_port(context, port_id, router.id)
+693 
+694             # Only allow one router port with IPv6 subnets per network id
+695             if self._port_has_ipv6_address(port):
+696                 for existing_port in (rp.port for rp in router.attached_ports):
+697                     if (existing_port['network_id'] == port['network_id'] and
+698                             self._port_has_ipv6_address(existing_port)):
+699                         msg = _("Cannot have multiple router ports with the "
+700                                 "same network id if both contain IPv6 "
+701                                 "subnets. Existing port %(p)s has IPv6 "
+702                                 "subnet(s) and network id %(nid)s")
+703                         raise n_exc.BadRequest(resource='router', msg=msg % {
+704                             'p': existing_port['id'],
+705                             'nid': existing_port['network_id']})
+706 
+707             fixed_ips = list(port['fixed_ips'])
+708             subnets = []
+709             for fixed_ip in fixed_ips:
+710                 subnet = self._core_plugin.get_subnet(context,
+711                                                       fixed_ip['subnet_id'])
+712                 subnets.append(subnet)
+713 
+714             if subnets:
+715                 self._check_for_dup_router_subnets(context, router,
+716                                                    port['network_id'],
+717                                                    subnets)
+718 
+719             # Keep the restriction against multiple IPv4 subnets
+720             if len([s for s in subnets if s['ip_version'] == 4]) > 1:
+721                 msg = _("Cannot have multiple "
+722                         "IPv4 subnets on router port")
+723                 raise n_exc.BadRequest(resource='router', msg=msg)
+724             self._validate_port_in_range_or_admin(context, subnets, port)
+725             return port, subnets
+726 
+727     def _notify_attaching_interface(self, context, router_db, port,
+728                                     interface_info):
+729         """Notify third party code that an interface is being attached to a
+730         router
+731 
+732         :param context: The context of the request.
+733         :param router_db: The router db object having an interface attached.
+734         :param port: The port object being attached to the router.
+735         :param interface_info: The requested interface attachment info passed
+736         to add_router_interface.
+737         :raises: RouterInterfaceAttachmentConflict if a third party code
+738         prevent the port to be attach to the router.
+739         """
+740         try:
+741             registry.notify(resources.ROUTER_INTERFACE,
+742                             events.BEFORE_CREATE,
+743                             self,
+744                             context=context,
+745                             router_db=router_db,
+746                             port=port,
+747                             interface_info=interface_info,
+748                             router_id=router_db.id,
+749                             network_id=port['network_id'])
+750         except exceptions.CallbackFailure as e:
+751             # raise the underlying exception
+752             reason = (_('cannot perform router interface attachment '
+753                         'due to %(reason)s') % {'reason': e})
+754             raise l3_exc.RouterInterfaceAttachmentConflict(reason=reason)
+755 
+756     def _add_interface_by_port(self, context, router, port_id, owner):
+757         # Update owner before actual process in order to avoid the
+758         # case where a port might get attached to a router without the
+759         # owner successfully updating due to an unavailable backend.
+760         self._core_plugin.update_port(
+761             context, port_id, {'port': {'device_id': router.id,
+762                                         'device_owner': owner}})
+763 
+764         return self._validate_router_port_info(context, router, port_id)
+765 
+766     def _port_has_ipv6_address(self, port):
+767         for fixed_ip in port['fixed_ips']:
+768             if netaddr.IPNetwork(fixed_ip['ip_address']).version == 6:
+769                 return True
+770 
+771     def _find_ipv6_router_port_by_network(self, context, router, net_id):
+772         router_dev_owner = self._get_device_owner(context, router)
+773         for port in router.attached_ports:
+774             p = port['port']
+775             if p['device_owner'] != router_dev_owner:
+776                 # we don't want any special purpose internal ports
+777                 continue
+778             if p['network_id'] == net_id and self._port_has_ipv6_address(p):
+779                 return port
+780 
+781     def _add_interface_by_subnet(self, context, router, subnet_id, owner):
+782         subnet = self._core_plugin.get_subnet(context, subnet_id)
+783         if not subnet['gateway_ip']:
+784             msg = _('Subnet for router interface must have a gateway IP')
+785             raise n_exc.BadRequest(resource='router', msg=msg)
+786         if subnet['project_id'] != context.project_id and not context.is_admin:
+787             msg = (_('Cannot add interface to router because subnet %s is not '
+788                      'owned by project making the request') % subnet_id)
+789             raise n_exc.BadRequest(resource='router', msg=msg)
+790         self._validate_subnet_address_mode(subnet)
+791         self._check_for_dup_router_subnets(context, router,
+792                                            subnet['network_id'], [subnet])
+793         fixed_ip = {'ip_address': subnet['gateway_ip'],
+794                     'subnet_id': subnet['id']}
+795 
+796         if (subnet['ip_version'] == 6 and not
+797                 ipv6_utils.is_ipv6_pd_enabled(subnet)):
+798             # Add new prefix to an existing ipv6 port with the same network id
+799             # if one exists
+800             port = self._find_ipv6_router_port_by_network(context, router,
+801                                                           subnet['network_id'])
+802             if port:
+803                 fixed_ips = list(map(dict, port['port']['fixed_ips']))
+804                 fixed_ips.append(fixed_ip)
+805                 return (self._core_plugin.update_port(
+806                             context, port['port_id'],
+807                             {'port': {'fixed_ips': fixed_ips}}),
+808                         [subnet],
+809                         False)
+810 
+811         port_data = {'tenant_id': router.tenant_id,
+812                      'network_id': subnet['network_id'],
+813                      'fixed_ips': [fixed_ip],
+814                      'admin_state_up': True,
+815                      'device_id': router.id,
+816                      'device_owner': owner,
+817                      'name': ''}
+818         return plugin_utils.create_port(
+819             self._core_plugin, context, {'port': port_data}), [subnet], True
+820 
+821     @staticmethod
+822     def _make_router_interface_info(
+823             router_id, tenant_id, port_id, network_id, subnet_id, subnet_ids):
+824         return {
+825             'id': router_id,
+826             'tenant_id': tenant_id,
+827             'port_id': port_id,
+828             'network_id': network_id,
+829             'subnet_id': subnet_id,  # deprecated by IPv6 multi-prefix
+830             'subnet_ids': subnet_ids
+831         }
+832 
+833     @db_api.retry_if_session_inactive()
+834     def add_router_interface(self, context, router_id, interface_info=None):
+835         router = self._get_router(context, router_id)
+836         add_by_port, add_by_sub = self._validate_interface_info(interface_info)
+837         device_owner = self._get_device_owner(context, router_id)
+838 
+839         # This should be True unless adding an IPv6 prefix to an existing port
+840         new_router_intf = True
+841         cleanup_port = False
+842 
+843         if add_by_port:
+844             port_id = interface_info['port_id']
+845             port = self._check_router_port(context, port_id, '')
+846             revert_value = {'device_id': '',
+847                             'device_owner': port['device_owner']}
+848             with plugin_utils.update_port_on_error(
+849                     self._core_plugin, context, port_id, revert_value):
+850                 port, subnets = self._add_interface_by_port(
+851                     context, router, port_id, device_owner)
+852         # add_by_subnet is not used here, because the validation logic of
+853         # _validate_interface_info ensures that either of add_by_* is True.
+854         else:
+855             port, subnets, new_router_intf = self._add_interface_by_subnet(
+856                     context, router, interface_info['subnet_id'], device_owner)
+857             cleanup_port = new_router_intf  # only cleanup port we created
+858             revert_value = {'device_id': '',
+859                             'device_owner': port['device_owner']}
+860 
+861         if cleanup_port:
+862             mgr = plugin_utils.delete_port_on_error(
+863                 self._core_plugin, context, port['id'])
+864         else:
+865             mgr = plugin_utils.update_port_on_error(
+866                 self._core_plugin, context, port['id'], revert_value)
+867 
+868         if new_router_intf:
+869             with mgr:
+870                 self._notify_attaching_interface(context, router_db=router,
+871                                                  port=port,
+872                                                  interface_info=interface_info)
+873                 self._add_router_port(
+874                     context, port['id'], router.id, device_owner)
+875 
+876         gw_ips = []
+877         gw_network_id = None
+878         if router.gw_port:
+879             gw_network_id = router.gw_port.network_id
+880             gw_ips = [x['ip_address'] for x in router.gw_port.fixed_ips]
+881 
+882         registry.notify(resources.ROUTER_INTERFACE,
+883                         events.AFTER_CREATE,
+884                         self,
+885                         context=context,
+886                         network_id=gw_network_id,
+887                         gateway_ips=gw_ips,
+888                         cidrs=[x['cidr'] for x in subnets],
+889                         subnets=subnets,
+890                         port_id=port['id'],
+891                         router_id=router_id,
+892                         port=port,
+893                         new_interface=new_router_intf,
+894                         interface_info=interface_info)
+895 
+896         return self._make_router_interface_info(
+897             router.id, port['tenant_id'], port['id'], port['network_id'],
+898             subnets[-1]['id'], [subnet['id'] for subnet in subnets])
+899 
+900     @db_api.retry_if_session_inactive()
+901     def _add_router_port(self, context, port_id, router_id, device_owner):
+902         l3_obj.RouterPort(
+903             context,
+904             port_id=port_id,
+905             router_id=router_id,
+906             port_type=device_owner
+907         ).create()
+908         # Update owner after actual process again in order to
+909         # make sure the records in routerports table and ports
+910         # table are consistent.
+911         self._core_plugin.update_port(
+912             context, port_id, {'port': {'device_id': router_id,
+913                                         'device_owner': device_owner}})
+914 
+915     def _check_router_interface_not_in_use(self, router_id, subnet):
+916         context = n_ctx.get_admin_context()
+917         subnet_cidr = netaddr.IPNetwork(subnet['cidr'])
+918 
+919         fip_objs = l3_obj.FloatingIP.get_objects(context, router_id=router_id)
+920         pf_plugin = directory.get_plugin(plugin_constants.PORTFORWARDING)
+921         subnet_port_ids = [
+922             port.id for port in
+923             port_obj.Port.get_ports_allocated_by_subnet_id(
+924                 context, subnet_id=subnet['id'])]
+925         if pf_plugin:
+926             fip_ids = [fip_obj.id for fip_obj in fip_objs]
+927             pf_objs = port_forwarding.PortForwarding.get_objects(
+928                 context, floatingip_id=fip_ids)
+929             for pf_obj in pf_objs:
+930                 if (pf_obj.internal_ip_address and
+931                         pf_obj.internal_ip_address in subnet_cidr):
+932                     if pf_obj.internal_port_id in subnet_port_ids:
+933                         raise l3_exc.RouterInterfaceInUseByFloatingIP(
+934                             router_id=router_id, subnet_id=subnet['id'])
+935 
+936         for fip_obj in fip_objs:
+937             if (fip_obj.fixed_ip_address and
+938                     fip_obj.fixed_ip_address in subnet_cidr):
+939                 if fip_obj.fixed_port_id in subnet_port_ids:
+940                     raise l3_exc.RouterInterfaceInUseByFloatingIP(
+941                         router_id=router_id, subnet_id=subnet['id'])
+942 
+943     def _confirm_router_interface_not_in_use(self, context, router_id,
+944                                              subnet):
+945         try:
+946             registry.publish(
+947                 resources.ROUTER_INTERFACE,
+948                 events.BEFORE_DELETE, self,
+949                 payload=events.DBEventPayload(
+950                     context, metadata={'subnet_id': subnet['id']},
+951                     resource_id=router_id))
+952         except exceptions.CallbackFailure as e:
+953             # NOTE(armax): preserve old check's behavior
+954             if len(e.errors) == 1:
+955                 raise e.errors[0].error
+956             raise l3_exc.RouterInUse(router_id=router_id, reason=e)
+957 
+958         self._check_router_interface_not_in_use(router_id, subnet)
+959 
+960     def _remove_interface_by_port(self, context, router_id,
+961                                   port_id, subnet_id, owner):
+962         ports = port_obj.Port.get_ports_by_router_and_port(
+963             context, router_id, owner, port_id)
+964         if len(ports) < 1:
+965             raise l3_exc.RouterInterfaceNotFound(
+966                 router_id=router_id, port_id=port_id)
+967 
+968         port = ports[0]
+969         port_subnet_ids = [fixed_ip['subnet_id']
+970                            for fixed_ip in port['fixed_ips']]
+971         if subnet_id and subnet_id not in port_subnet_ids:
+972             raise n_exc.SubnetMismatchForPort(
+973                 port_id=port_id, subnet_id=subnet_id)
+974         subnets = subnet_obj.Subnet.get_objects(context, id=port_subnet_ids)
+975         for subnet in subnets:
+976             self._confirm_router_interface_not_in_use(
+977                     context, router_id, subnet)
+978         self._core_plugin.delete_port(context, port['id'],
+979                                       l3_port_check=False)
+980         return port, subnets
+981 
+982     def _remove_interface_by_subnet(self, context,
+983                                     router_id, subnet_id, owner):
+984         subnet = self._core_plugin.get_subnet(context, subnet_id)
+985         ports = port_obj.Port.get_ports_by_router_and_network(
+986             context, router_id, owner, subnet['network_id'])
+987         if ports:
+988             self._confirm_router_interface_not_in_use(
+989                 context, router_id, subnet)
+990 
+991         for p in ports:
+992             try:
+993                 p = self._core_plugin.get_port(context, p.id)
+994             except n_exc.PortNotFound:
+995                 continue
+996             port_subnets = [fip['subnet_id'] for fip in p['fixed_ips']]
+997             if subnet_id in port_subnets and len(port_subnets) > 1:
+998                 # multiple prefix port - delete prefix from port
+999                 fixed_ips = [dict(fip) for fip in p['fixed_ips']
+1000                              if fip['subnet_id'] != subnet_id]
+1001                 self._core_plugin.update_port(
+1002                     context, p['id'], {'port': {'fixed_ips': fixed_ips}})
+1003                 return (p, [subnet])
+1004             elif subnet_id in port_subnets:
+1005                 # only one subnet on port - delete the port
+1006                 self._core_plugin.delete_port(context, p['id'],
+1007                                               l3_port_check=False)
+1008                 return (p, [subnet])
+1009         raise l3_exc.RouterInterfaceNotFoundForSubnet(
+1010             router_id=router_id, subnet_id=subnet_id)
+1011 
+1012     @db_api.retry_if_session_inactive()
+1013     def remove_router_interface(self, context, router_id, interface_info):
+1014         remove_by_port, _ = self._validate_interface_info(interface_info,
+1015                                                           for_removal=True)
+1016         port_id = interface_info.get('port_id')
+1017         subnet_id = interface_info.get('subnet_id')
+1018         device_owner = self._get_device_owner(context, router_id)
+1019         if remove_by_port:
+1020             port, subnets = self._remove_interface_by_port(context, router_id,
+1021                                                            port_id, subnet_id,
+1022                                                            device_owner)
+1023         else:
+1024             port, subnets = self._remove_interface_by_subnet(
+1025                     context, router_id, subnet_id, device_owner)
+1026 
+1027         gw_network_id = None
+1028         gw_ips = []
+1029         router = self._get_router(context, router_id)
+1030         if router.gw_port:
+1031             gw_network_id = router.gw_port.network_id
+1032             gw_ips = [x['ip_address'] for x in router.gw_port.fixed_ips]
+1033 
+1034         registry.notify(resources.ROUTER_INTERFACE,
+1035                         events.AFTER_DELETE,
+1036                         self,
+1037                         context=context,
+1038                         cidrs=[x['cidr'] for x in subnets],
+1039                         network_id=gw_network_id,
+1040                         gateway_ips=gw_ips,
+1041                         port=port,
+1042                         router_id=router_id,
+1043                         interface_info=interface_info)
+1044         return self._make_router_interface_info(router_id, port['tenant_id'],
+1045                                                 port['id'], port['network_id'],
+1046                                                 subnets[0]['id'],
+1047                                                 [subnet['id'] for subnet in
+1048                                                     subnets])
+1049 
+1050     def _get_floatingip(self, context, id):
+1051         floatingip = l3_obj.FloatingIP.get_object(context, id=id)
+1052         if not floatingip:
+1053             raise l3_exc.FloatingIPNotFound(floatingip_id=id)
+1054         return floatingip
+1055 
+1056     def _make_floatingip_dict(self, floatingip, fields=None,
+1057                               process_extensions=True):
+1058         floating_ip_address = (str(floatingip.floating_ip_address)
+1059                                if floatingip.floating_ip_address else None)
+1060         fixed_ip_address = (str(floatingip.fixed_ip_address)
+1061                             if floatingip.fixed_ip_address else None)
+1062         res = {'id': floatingip.id,
+1063                'tenant_id': floatingip.project_id,
+1064                'floating_ip_address': floating_ip_address,
+1065                'floating_network_id': floatingip.floating_network_id,
+1066                'router_id': floatingip.router_id,
+1067                'port_id': floatingip.fixed_port_id,
+1068                'fixed_ip_address': fixed_ip_address,
+1069                'status': floatingip.status,
+1070                'standard_attr_id': floatingip.db_obj.standard_attr.id,
+1071                }
+1072         # NOTE(mlavalle): The following assumes this mixin is used in a
+1073         # class inheriting from CommonDbMixin, which is true for all existing
+1074         # plugins.
+1075         # TODO(lujinluo): Change floatingip.db_obj to floatingip once all
+1076         # codes are migrated to use Floating IP OVO object.
+1077         if process_extensions:
+1078             resource_extend.apply_funcs(
+1079                 l3_apidef.FLOATINGIPS, res, floatingip.db_obj)
+1080         return lib_db_utils.resource_fields(res, fields)
+1081 
+1082     def _get_router_for_floatingip(self, context, internal_port,
+1083                                    internal_subnet_id,
+1084                                    external_network_id):
+1085         subnet = self._core_plugin.get_subnet(context, internal_subnet_id)
+1086         return self.get_router_for_floatingip(
+1087             context, internal_port, subnet, external_network_id)
+1088 
+1089     # NOTE(yamamoto): This method is an override point for plugins
+1090     # inheriting this class.  Do not optimize this out.
+1091     def get_router_for_floatingip(self, context, internal_port,
+1092                                   internal_subnet, external_network_id):
+1093         """Find a router to handle the floating-ip association.
+1094 
+1095         :param internal_port: The port for the fixed-ip.
+1096         :param internal_subnet: The subnet for the fixed-ip.
+1097         :param external_network_id: The external network for floating-ip.
+1098 
+1099         :raises: ExternalGatewayForFloatingIPNotFound if no suitable router
+1100                  is found.
+1101         """
+1102 
+1103         # Find routers(with router_id and interface address) that
+1104         # connect given internal subnet and the external network.
+1105         # Among them, if the router's interface address matches
+1106         # with subnet's gateway-ip, return that router.
+1107         # Otherwise return the first router.
+1108         RouterPort = l3_models.RouterPort
+1109         gw_port = orm.aliased(models_v2.Port, name="gw_port")
+1110         # TODO(lujinluo): Need IPAllocation and Port object
+1111         routerport_qry = context.session.query(
+1112             RouterPort.router_id, models_v2.IPAllocation.ip_address).join(
+1113             RouterPort.port, models_v2.Port.fixed_ips).filter(
+1114             models_v2.Port.network_id == internal_port['network_id'],
+1115             RouterPort.port_type.in_(constants.ROUTER_INTERFACE_OWNERS),
+1116             models_v2.IPAllocation.subnet_id == internal_subnet['id']
+1117         ).join(gw_port, gw_port.device_id == RouterPort.router_id).filter(
+1118             gw_port.network_id == external_network_id,
+1119             gw_port.device_owner == DEVICE_OWNER_ROUTER_GW
+1120         ).distinct()
+1121 
+1122         first_router_id = None
+1123         for router_id, interface_ip in routerport_qry:
+1124             if interface_ip == internal_subnet['gateway_ip']:
+1125                 return router_id
+1126             if not first_router_id:
+1127                 first_router_id = router_id
+1128         if first_router_id:
+1129             return first_router_id
+1130 
+1131         raise l3_exc.ExternalGatewayForFloatingIPNotFound(
+1132             subnet_id=internal_subnet['id'],
+1133             external_network_id=external_network_id,
+1134             port_id=internal_port['id'])
+1135 
+1136     def _port_ipv4_fixed_ips(self, port):
+1137         return [ip for ip in port['fixed_ips']
+1138                 if netaddr.IPAddress(ip['ip_address']).version == 4]
+1139 
+1140     def _internal_fip_assoc_data(self, context, fip, tenant_id):
+1141         """Retrieve internal port data for floating IP.
+1142 
+1143         Retrieve information concerning the internal port where
+1144         the floating IP should be associated to.
+1145         """
+1146         internal_port = self._core_plugin.get_port(context, fip['port_id'])
+1147         if internal_port['tenant_id'] != tenant_id and not context.is_admin:
+1148             port_id = fip['port_id']
+1149             msg = (_('Cannot process floating IP association with '
+1150                      'Port %s, since that port is owned by a '
+1151                      'different tenant') % port_id)
+1152             raise n_exc.BadRequest(resource='floatingip', msg=msg)
+1153 
+1154         internal_subnet_id = None
+1155         if not utils.is_fip_serviced(internal_port.get('device_owner')):
+1156             msg = _('Port %(id)s is unable to be assigned a floating IP')
+1157             raise n_exc.BadRequest(resource='floatingip', msg=msg)
+1158         if fip.get('fixed_ip_address'):
+1159             internal_ip_address = fip['fixed_ip_address']
+1160             if netaddr.IPAddress(internal_ip_address).version != 4:
+1161                 msg = (_('Cannot process floating IP association with %s, '
+1162                          'since that is not an IPv4 address') %
+1163                        internal_ip_address)
+1164                 raise n_exc.BadRequest(resource='floatingip', msg=msg)
+1165             for ip in internal_port['fixed_ips']:
+1166                 if ip['ip_address'] == internal_ip_address:
+1167                     internal_subnet_id = ip['subnet_id']
+1168             if not internal_subnet_id:
+1169                 msg = (_('Port %(id)s does not have fixed ip %(address)s') %
+1170                        {'id': internal_port['id'],
+1171                         'address': internal_ip_address})
+1172                 raise n_exc.BadRequest(resource='floatingip', msg=msg)
+1173         else:
+1174             ipv4_fixed_ips = self._port_ipv4_fixed_ips(internal_port)
+1175             if not ipv4_fixed_ips:
+1176                 msg = (_('Cannot add floating IP to port %s that has '
+1177                          'no fixed IPv4 addresses') % internal_port['id'])
+1178                 raise n_exc.BadRequest(resource='floatingip', msg=msg)
+1179             if len(ipv4_fixed_ips) > 1:
+1180                 msg = (_('Port %s has multiple fixed IPv4 addresses.  Must '
+1181                          'provide a specific IPv4 address when assigning a '
+1182                          'floating IP') % internal_port['id'])
+1183                 raise n_exc.BadRequest(resource='floatingip', msg=msg)
+1184             internal_ip_address = ipv4_fixed_ips[0]['ip_address']
+1185             internal_subnet_id = ipv4_fixed_ips[0]['subnet_id']
+1186         return internal_port, internal_subnet_id, internal_ip_address
+1187 
+1188     def _get_assoc_data(self, context, fip, floatingip_obj):
+1189         """Determine/extract data associated with the internal port.
+1190 
+1191         When a floating IP is associated with an internal port,
+1192         we need to extract/determine some data associated with the
+1193         internal port, including the internal_ip_address, and router_id.
+1194         The confirmation of the internal port whether owned by the tenant who
+1195         owns the floating IP will be confirmed by _get_router_for_floatingip.
+1196         """
+1197         (internal_port, internal_subnet_id,
+1198          internal_ip_address) = self._internal_fip_assoc_data(
+1199             context, fip, floatingip_obj.project_id)
+1200         router_id = self._get_router_for_floatingip(
+1201             context, internal_port,
+1202             internal_subnet_id, floatingip_obj.floating_network_id)
+1203 
+1204         if self.is_router_distributed(context, router_id):
+1205             if not plugin_utils.can_port_be_bound_to_virtual_bridge(
+1206                     internal_port):
+1207                 msg = _('Port VNIC type is not valid to associate a FIP in '
+1208                         'DVR mode')
+1209                 raise n_exc.BadRequest(resource='floatingip', msg=msg)
+1210 
+1211         return (fip['port_id'], internal_ip_address, router_id)
+1212 
+1213     def _check_and_get_fip_assoc(self, context, fip, floatingip_obj):
+1214         port_id = internal_ip_address = router_id = None
+1215         if fip.get('fixed_ip_address') and not fip.get('port_id'):
+1216             msg = _("fixed_ip_address cannot be specified without a port_id")
+1217             raise n_exc.BadRequest(resource='floatingip', msg=msg)
+1218         if fip.get('port_id'):
+1219             port_id, internal_ip_address, router_id = self._get_assoc_data(
+1220                 context,
+1221                 fip,
+1222                 floatingip_obj)
+1223 
+1224             if port_id == floatingip_obj.fixed_port_id:
+1225                 # Floating IP association is not changed.
+1226                 return port_id, internal_ip_address, router_id
+1227 
+1228             fip_exists = l3_obj.FloatingIP.objects_exist(
+1229                     context,
+1230                     fixed_port_id=fip['port_id'],
+1231                     floating_network_id=floatingip_obj.floating_network_id,
+1232                     fixed_ip_address=netaddr.IPAddress(internal_ip_address))
+1233             if fip_exists:
+1234                 floating_ip_address = (str(floatingip_obj.floating_ip_address)
+1235                                        if floatingip_obj.floating_ip_address
+1236                                        else None)
+1237                 raise l3_exc.FloatingIPPortAlreadyAssociated(
+1238                     port_id=fip['port_id'],
+1239                     fip_id=floatingip_obj.id,
+1240                     floating_ip_address=floating_ip_address,
+1241                     fixed_ip=internal_ip_address,
+1242                     net_id=floatingip_obj.floating_network_id)
+1243 
+1244         if fip and 'port_id' not in fip and floatingip_obj.fixed_port_id:
+1245             # NOTE(liuyulong): without the fix of bug #1610045 here could
+1246             # also let floating IP can be dissociated with an empty
+1247             # updating dict.
+1248             fip['port_id'] = floatingip_obj.fixed_port_id
+1249             port_id, internal_ip_address, router_id = self._get_assoc_data(
+1250                 context, fip, floatingip_obj)
+1251 
+1252         # Condition for floating IP with binding port forwarding
+1253         if not floatingip_obj.fixed_port_id and floatingip_obj.router_id:
+1254             router_id = floatingip_obj.router_id
+1255 
+1256         # After all upper conditions, if updating API dict is submitted with
+1257         # {'port_id': null}, then the floating IP cloud also be dissociated.
+1258         return port_id, internal_ip_address, router_id
+1259 
+1260     def _update_fip_assoc(self, context, fip, floatingip_obj):
+1261         previous_router_id = floatingip_obj.router_id
+1262         port_id, internal_ip_address, router_id = (
+1263             self._check_and_get_fip_assoc(context, fip, floatingip_obj))
+1264         association_event = None
+1265         if floatingip_obj.fixed_port_id != port_id:
+1266             association_event = bool(port_id)
+1267         floatingip_obj.fixed_ip_address = (
+1268             netaddr.IPAddress(internal_ip_address)
+1269             if internal_ip_address else None)
+1270         floatingip_obj.fixed_port_id = port_id
+1271         floatingip_obj.router_id = router_id
+1272         floatingip_obj.last_known_router_id = previous_router_id
+1273         if 'description' in fip:
+1274             floatingip_obj.description = fip['description']
+1275         floating_ip_address = (str(floatingip_obj.floating_ip_address)
+1276                                if floatingip_obj.floating_ip_address else None)
+1277         return {'fixed_ip_address': internal_ip_address,
+1278                 'fixed_port_id': port_id,
+1279                 'router_id': router_id,
+1280                 'last_known_router_id': previous_router_id,
+1281                 'floating_ip_address': floating_ip_address,
+1282                 'floating_network_id': floatingip_obj.floating_network_id,
+1283                 'floating_ip_id': floatingip_obj.id,
+1284                 'context': context,
+1285                 'association_event': association_event}
+1286 
+1287     def _is_ipv4_network(self, context, net_db):
+1288         return any(s.ip_version == 4 for s in net_db.subnets)
+1289 
+1290     def _create_floatingip(self, context, floatingip,
+1291                            initial_status=constants.FLOATINGIP_STATUS_ACTIVE):
+1292         try:
+1293             registry.publish(resources.FLOATING_IP, events.BEFORE_CREATE,
+1294                              self, payload=events.DBEventPayload(
+1295                                  context, request_body=floatingip))
+1296         except exceptions.CallbackFailure as e:
+1297             # raise the underlying exception
+1298             raise e.errors[0].error
+1299 
+1300         fip = floatingip['floatingip']
+1301         fip_id = uuidutils.generate_uuid()
+1302 
+1303         f_net_id = fip['floating_network_id']
+1304         f_net_db = self._core_plugin._get_network(context, f_net_id)
+1305         if not f_net_db.external:
+1306             msg = _("Network %s is not a valid external network") % f_net_id
+1307             raise n_exc.BadRequest(resource='floatingip', msg=msg)
+1308 
+1309         if not self._is_ipv4_network(context, f_net_db):
+1310             msg = _("Network %s does not contain any IPv4 subnet") % f_net_id
+1311             raise n_exc.BadRequest(resource='floatingip', msg=msg)
+1312 
+1313         # This external port is never exposed to the tenant.
+1314         # it is used purely for internal system and admin use when
+1315         # managing floating IPs.
+1316 
+1317         port = {'tenant_id': '',  # tenant intentionally not set
+1318                 'network_id': f_net_id,
+1319                 'admin_state_up': True,
+1320                 'device_id': 'PENDING',
+1321                 'device_owner': DEVICE_OWNER_FLOATINGIP,
+1322                 'status': constants.PORT_STATUS_NOTAPPLICABLE,
+1323                 'name': ''}
+1324 
+1325         # Both subnet_id and floating_ip_address are accepted, if
+1326         # floating_ip_address is not in the subnet,
+1327         # InvalidIpForSubnet exception will be raised.
+1328         fixed_ip = {}
+1329         if validators.is_attr_set(fip.get('subnet_id')):
+1330             fixed_ip['subnet_id'] = fip['subnet_id']
+1331         if validators.is_attr_set(fip.get('floating_ip_address')):
+1332             fixed_ip['ip_address'] = fip['floating_ip_address']
+1333         if fixed_ip:
+1334             port['fixed_ips'] = [fixed_ip]
+1335 
+1336         # 'status' in port dict could not be updated by default, use
+1337         # check_allow_post to stop the verification of system
+1338         external_port = plugin_utils.create_port(
+1339             self._core_plugin, context.elevated(),
+1340             {'port': port}, check_allow_post=False)
+1341 
+1342         with plugin_utils.delete_port_on_error(
+1343                 self._core_plugin, context.elevated(),
+1344                 external_port['id']),\
+1345                 db_api.CONTEXT_WRITER.using(context):
+1346             # Ensure IPv4 addresses are allocated on external port
+1347             external_ipv4_ips = self._port_ipv4_fixed_ips(external_port)
+1348             if not external_ipv4_ips:
+1349                 raise n_exc.ExternalIpAddressExhausted(net_id=f_net_id)
+1350 
+1351             floating_fixed_ip = external_ipv4_ips[0]
+1352             floating_ip_address = floating_fixed_ip['ip_address']
+1353             floatingip_obj = l3_obj.FloatingIP(
+1354                 context,
+1355                 id=fip_id,
+1356                 project_id=fip['tenant_id'],
+1357                 status=initial_status,
+1358                 floating_network_id=fip['floating_network_id'],
+1359                 floating_ip_address=floating_ip_address,
+1360                 floating_port_id=external_port['id'],
+1361                 description=fip.get('description'))
+1362             # Update association with internal port
+1363             # and define external IP address
+1364             assoc_result = self._update_fip_assoc(context, fip, floatingip_obj)
+1365             floatingip_obj.create()
+1366             floatingip_dict = self._make_floatingip_dict(
+1367                 floatingip_obj, process_extensions=False)
+1368             if self._is_dns_integration_supported:
+1369                 dns_data = self._process_dns_floatingip_create_precommit(
+1370                     context, floatingip_dict, fip)
+1371             if self._is_fip_qos_supported:
+1372                 self._process_extra_fip_qos_create(context, fip_id, fip)
+1373 
+1374             registry.notify(resources.FLOATING_IP, events.PRECOMMIT_CREATE,
+1375                             self, context=context, floatingip=fip,
+1376                             floatingip_id=fip_id,
+1377                             floatingip_db=floatingip_obj.db_obj)
+1378 
+1379         self._core_plugin.update_port(
+1380             context.elevated(), external_port['id'],
+1381             {'port': {'device_id': fip_id,
+1382                       'project_id': fip['tenant_id']}})
+1383         registry.notify(resources.FLOATING_IP,
+1384                         events.AFTER_UPDATE,
+1385                         self._update_fip_assoc,
+1386                         **assoc_result)
+1387         if assoc_result['association_event']:
+1388             LOG.info(FIP_ASSOC_MSG,
+1389                      {'fip_id': assoc_result['floating_ip_id'],
+1390                       'ext_ip': assoc_result['floating_ip_address'],
+1391                       'port_id': assoc_result['fixed_port_id'],
+1392                       'assoc': 'associated'})
+1393 
+1394         if self._is_dns_integration_supported:
+1395             self._process_dns_floatingip_create_postcommit(context,
+1396                                                            floatingip_dict,
+1397                                                            dns_data)
+1398         # TODO(lujinluo): Change floatingip_db to floatingip_obj once all
+1399         # codes are migrated to use Floating IP OVO object.
+1400         resource_extend.apply_funcs(l3_apidef.FLOATINGIPS, floatingip_dict,
+1401                                     floatingip_obj.db_obj)
+1402         return floatingip_dict
+1403 
+1404     @db_api.retry_if_session_inactive()
+1405     def create_floatingip(self, context, floatingip,
+1406                           initial_status=constants.FLOATINGIP_STATUS_ACTIVE):
+1407         return self._create_floatingip(context, floatingip, initial_status)
+1408 
+1409     def _update_floatingip(self, context, id, floatingip):
+1410         try:
+1411             registry.publish(resources.FLOATING_IP, events.BEFORE_UPDATE,
+1412                              self, payload=events.DBEventPayload(
+1413                                  context, request_body=floatingip,
+1414                                  resource_id=id))
+1415         except exceptions.CallbackFailure as e:
+1416             # raise the underlying exception
+1417             raise e.errors[0].error
+1418 
+1419         fip = floatingip['floatingip']
+1420         with db_api.CONTEXT_WRITER.using(context):
+1421             floatingip_obj = self._get_floatingip(context, id)
+1422             old_floatingip = self._make_floatingip_dict(floatingip_obj)
+1423             old_fixed_port_id = floatingip_obj.fixed_port_id
+1424             assoc_result = self._update_fip_assoc(context, fip, floatingip_obj)
+1425 
+1426             floatingip_obj.update()
+1427             floatingip_dict = self._make_floatingip_dict(floatingip_obj)
+1428             if self._is_dns_integration_supported:
+1429                 dns_data = self._process_dns_floatingip_update_precommit(
+1430                     context, floatingip_dict)
+1431             if self._is_fip_qos_supported:
+1432                 self._process_extra_fip_qos_update(context,
+1433                                                    floatingip_obj,
+1434                                                    fip,
+1435                                                    old_floatingip)
+1436             floatingip_obj = l3_obj.FloatingIP.get_object(
+1437                 context, id=floatingip_obj.id)
+1438             floatingip_db = floatingip_obj.db_obj
+1439             registry.notify(resources.FLOATING_IP,
+1440                             events.PRECOMMIT_UPDATE,
+1441                             self,
+1442                             floatingip=floatingip,
+1443                             floatingip_db=floatingip_db,
+1444                             old_floatingip=old_floatingip,
+1445                             **assoc_result)
+1446 
+1447         registry.notify(resources.FLOATING_IP,
+1448                         events.AFTER_UPDATE,
+1449                         self._update_fip_assoc,
+1450                         **assoc_result)
+1451         if assoc_result['association_event'] is not None:
+1452             port_id = old_fixed_port_id or assoc_result['fixed_port_id']
+1453             assoc = ('associated' if assoc_result['association_event']
+1454                      else 'disassociated')
+1455             LOG.info(FIP_ASSOC_MSG,
+1456                      {'fip_id': assoc_result['floating_ip_id'],
+1457                       'ext_ip': assoc_result['floating_ip_address'],
+1458                       'port_id': port_id, 'assoc': assoc})
+1459 
+1460         if self._is_dns_integration_supported:
+1461             self._process_dns_floatingip_update_postcommit(context,
+1462                                                            floatingip_dict,
+1463                                                            dns_data)
+1464         # TODO(lujinluo): Change floatingip_db to floatingip_obj once all
+1465         # codes are migrated to use Floating IP OVO object.
+1466         resource_extend.apply_funcs(l3_apidef.FLOATINGIPS, floatingip_dict,
+1467                                     floatingip_db)
+1468         return old_floatingip, floatingip_dict
+1469 
+1470     def _floatingips_to_router_ids(self, floatingips):
+1471         return list(set([floatingip['router_id']
+1472                          for floatingip in floatingips
+1473                          if floatingip['router_id']]))
+1474 
+1475     @db_api.retry_if_session_inactive()
+1476     def update_floatingip(self, context, id, floatingip):
+1477         _old_floatingip, floatingip = self._update_floatingip(
+1478             context, id, floatingip)
+1479         return floatingip
+1480 
+1481     @db_api.retry_if_session_inactive()
+1482     def update_floatingip_status(self, context, floatingip_id, status):
+1483         """Update operational status for floating IP in neutron DB."""
+1484         return l3_obj.FloatingIP.update_object(
+1485             context, {'status': status}, id=floatingip_id)
+1486 
+1487     @registry.receives(resources.PORT, [events.PRECOMMIT_DELETE])
+1488     def _precommit_delete_port_callback(
+1489             self, resource, event, trigger, **kwargs):
+1490         if (kwargs['port']['device_owner'] ==
+1491                 constants.DEVICE_OWNER_FLOATINGIP):
+1492             registry.notify(resources.FLOATING_IP, events.PRECOMMIT_DELETE,
+1493                             self, **kwargs)
+1494 
+1495     def _delete_floatingip(self, context, id):
+1496         floatingip = self._get_floatingip(context, id)
+1497         floatingip_dict = self._make_floatingip_dict(floatingip)
+1498         if self._is_dns_integration_supported:
+1499             self._process_dns_floatingip_delete(context, floatingip_dict)
+1500         # Foreign key cascade will take care of the removal of the
+1501         # floating IP record once the port is deleted. We can't start
+1502         # a transaction first to remove it ourselves because the delete_port
+1503         # method will yield in its post-commit activities.
+1504         self._core_plugin.delete_port(context.elevated(),
+1505                                       floatingip.floating_port_id,
+1506                                       l3_port_check=False)
+1507         registry.notify(resources.FLOATING_IP, events.AFTER_DELETE,
+1508                         self, context=context, **floatingip_dict)
+1509         if floatingip.fixed_port_id:
+1510             LOG.info(FIP_ASSOC_MSG,
+1511                      {'fip_id': floatingip.id,
+1512                       'ext_ip': str(floatingip.floating_ip_address),
+1513                       'port_id': floatingip.fixed_port_id,
+1514                       'assoc': 'disassociated (deleted)'})
+1515         return floatingip_dict
+1516 
+1517     @db_api.retry_if_session_inactive()
+1518     def delete_floatingip(self, context, id):
+1519         self._delete_floatingip(context, id)
+1520 
+1521     @db_api.retry_if_session_inactive()
+1522     def get_floatingip(self, context, id, fields=None):
+1523         floatingip = self._get_floatingip(context, id)
+1524         return self._make_floatingip_dict(floatingip, fields)
+1525 
+1526     @db_api.retry_if_session_inactive()
+1527     def get_floatingips(self, context, filters=None, fields=None,
+1528                         sorts=None, limit=None, marker=None,
+1529                         page_reverse=False):
+1530         pager = base_obj.Pager(sorts, limit, page_reverse, marker)
+1531         filters = filters or {}
+1532         for key, val in API_TO_DB_COLUMN_MAP.items():
+1533             if key in filters:
+1534                 filters[val] = filters.pop(key)
+1535         floatingip_objs = l3_obj.FloatingIP.get_objects(
+1536             context, _pager=pager, validate_filters=False, **filters)
+1537         floatingip_dicts = [
+1538             self._make_floatingip_dict(floatingip_obj, fields)
+1539             for floatingip_obj in floatingip_objs
+1540         ]
+1541         return floatingip_dicts
+1542 
+1543     @db_api.retry_if_session_inactive()
+1544     def delete_disassociated_floatingips(self, context, network_id):
+1545         fip_objs = l3_obj.FloatingIP.get_objects(
+1546             context,
+1547             floating_network_id=network_id, router_id=None, fixed_port_id=None)
+1548 
+1549         for fip in fip_objs:
+1550             self.delete_floatingip(context, fip.id)
+1551 
+1552     @db_api.retry_if_session_inactive()
+1553     def get_floatingips_count(self, context, filters=None):
+1554         filters = filters or {}
+1555         return l3_obj.FloatingIP.count(context, **filters)
+1556 
+1557     def prevent_l3_port_deletion(self, context, port_id):
+1558         """Checks to make sure a port is allowed to be deleted.
+1559 
+1560         Raises an exception if this is not the case.  This should be called by
+1561         any plugin when the API requests the deletion of a port, since some
+1562         ports for L3 are not intended to be deleted directly via a DELETE
+1563         to /ports, but rather via other API calls that perform the proper
+1564         deletion checks.
+1565         """
+1566         try:
+1567             port = self._core_plugin.get_port(context, port_id)
+1568         except n_exc.PortNotFound:
+1569             # non-existent ports don't need to be protected from deletion
+1570             return
+1571         if port['device_owner'] not in self.router_device_owners:
+1572             return
+1573         # Raise port in use only if the port has IP addresses
+1574         # Otherwise it's a stale port that can be removed
+1575         fixed_ips = port['fixed_ips']
+1576         if not fixed_ips:
+1577             LOG.debug("Port %(port_id)s has owner %(port_owner)s, but "
+1578                       "no IP address, so it can be deleted",
+1579                       {'port_id': port['id'],
+1580                        'port_owner': port['device_owner']})
+1581             return
+1582         # NOTE(kevinbenton): we also check to make sure that the
+1583         # router still exists. It's possible for HA router interfaces
+1584         # to remain after the router is deleted if they encounter an
+1585         # error during deletion.
+1586         # Elevated context in case router is owned by another tenant
+1587         if port['device_owner'] == DEVICE_OWNER_FLOATINGIP:
+1588             if not l3_obj.FloatingIP.objects_exist(
+1589                     context, id=port['device_id']):
+1590                 LOG.debug("Floating IP %(f_id)s corresponding to port "
+1591                           "%(port_id)s no longer exists, allowing deletion.",
+1592                           {'f_id': port['device_id'], 'port_id': port['id']})
+1593                 return
+1594         elif not l3_obj.Router.objects_exist(context.elevated(),
+1595                                              id=port['device_id']):
+1596             LOG.debug("Router %(router_id)s corresponding to port "
+1597                       "%(port_id)s no longer exists, allowing deletion.",
+1598                       {'router_id': port['device_id'],
+1599                        'port_id': port['id']})
+1600             return
+1601 
+1602         reason = _('has device owner %s') % port['device_owner']
+1603         raise n_exc.ServicePortInUse(port_id=port['id'],
+1604                                      reason=reason)
+1605 
+1606     @db_api.retry_if_session_inactive()
+1607     def disassociate_floatingips(self, context, port_id, do_notify=True):
+1608         """Disassociate all floating IPs linked to specific port.
+1609 
+1610         @param port_id: ID of the port to disassociate floating IPs.
+1611         @param do_notify: whether we should notify routers right away.
+1612                           This parameter is ignored.
+1613         @return: set of router-ids that require notification updates
+1614         """
+1615         with db_api.CONTEXT_WRITER.using(context):
+1616             floating_ip_objs = l3_obj.FloatingIP.get_objects(
+1617                 context, fixed_port_id=port_id)
+1618             router_ids = {fip.router_id for fip in floating_ip_objs}
+1619             old_fips = {fip.id: fip.to_dict() for fip in floating_ip_objs}
+1620             values = {'fixed_port_id': None,
+1621                       'fixed_ip_address': None,
+1622                       'router_id': None}
+1623             l3_obj.FloatingIP.update_objects(
+1624                 context, values, fixed_port_id=port_id)
+1625             for fip in floating_ip_objs:
+1626                 registry.notify(resources.FLOATING_IP, events.PRECOMMIT_UPDATE,
+1627                                 self, context=context,
+1628                                 floatingip={l3_apidef.FLOATINGIP: values},
+1629                                 floatingip_db=fip,
+1630                                 old_floatingip=old_fips[fip.id],
+1631                                 router_ids=router_ids)
+1632 
+1633         for fip in floating_ip_objs:
+1634             assoc_result = {
+1635                 'fixed_ip_address': None,
+1636                 'fixed_port_id': None,
+1637                 'router_id': None,
+1638                 'floating_ip_address': fip.floating_ip_address,
+1639                 'floating_network_id': fip.floating_network_id,
+1640                 'floating_ip_id': fip.id,
+1641                 'context': context,
+1642                 'router_ids': router_ids,
+1643                 'association_event': False,
+1644             }
+1645             # Process DNS record removal after committing the transaction
+1646             if self._is_dns_integration_supported:
+1647                 self._process_dns_floatingip_delete(context, fip.to_dict())
+1648             registry.notify(resources.FLOATING_IP, events.AFTER_UPDATE, self,
+1649                             **assoc_result)
+1650         for fip in old_fips.values():
+1651             LOG.info(FIP_ASSOC_MSG,
+1652                      {'fip_id': fip['id'],
+1653                       'ext_ip': fip['floating_ip_address'],
+1654                       'port_id': fip['fixed_port_id'],
+1655                       'assoc': 'disassociated'})
+1656         return router_ids
+1657 
+1658     def _get_floatingips_by_port_id(self, context, port_id):
+1659         """Helper function to retrieve the fips associated with a port_id."""
+1660         return l3_obj.FloatingIP.get_objects(context, fixed_port_id=port_id)
+1661 
+1662     def _build_routers_list(self, context, routers, gw_ports):
+1663         """Subclasses can override this to add extra gateway info"""
+1664         return routers
+1665 
+1666     def _make_router_dict_with_gw_port(self, router, fields):
+1667         result = self._make_router_dict(router, fields)
+1668         if router.get('gw_port'):
+1669             result['gw_port'] = self._core_plugin._make_port_dict(
+1670                 router['gw_port'])
+1671         return result
+1672 
+1673     def _get_sync_routers(self, context, router_ids=None, active=None):
+1674         """Query routers and their gw ports for l3 agent.
+1675 
+1676         Query routers with the router_ids. The gateway ports, if any,
+1677         will be queried too.
+1678         l3 agent has an option to deal with only one router id. In addition,
+1679         when we need to notify the agent the data about only one router
+1680         (when modification of router, its interfaces, gw_port and floatingips),
+1681         we will have router_ids.
+1682         @param router_ids: the list of router ids which we want to query.
+1683                            if it is None, all of routers will be queried.
+1684         @return: a list of dicted routers with dicted gw_port populated if any
+1685         """
+1686         filters = {'id': router_ids} if router_ids else {}
+1687         if active is not None:
+1688             filters['admin_state_up'] = [active]
+1689         router_dicts = model_query.get_collection(
+1690             context, l3_models.Router, self._make_router_dict_with_gw_port,
+1691             filters=filters)
+1692         if not router_dicts:
+1693             return []
+1694         gw_ports = dict((r['gw_port']['id'], r['gw_port'])
+1695                         for r in router_dicts
+1696                         if r.get('gw_port'))
+1697         return self._build_routers_list(context, router_dicts, gw_ports)
+1698 
+1699     def _make_floatingip_dict_with_scope(self, floatingip_obj, scope_id):
+1700         d = self._make_floatingip_dict(floatingip_obj)
+1701         d['fixed_ip_address_scope'] = scope_id
+1702         return d
+1703 
+1704     def _get_sync_floating_ips(self, context, router_ids):
+1705         """Query floating_ips that relate to list of router_ids with scope.
+1706 
+1707         This is different than the regular get_floatingips in that it finds the
+1708         address scope of the fixed IP.  The router needs to know this to
+1709         distinguish it from other scopes.
+1710 
+1711         There are a few redirections to go through to discover the address
+1712         scope from the floating ip.
+1713         """
+1714         if not router_ids:
+1715             return []
+1716 
+1717         return [
+1718             self._make_floatingip_dict_with_scope(*scoped_fip)
+1719             for scoped_fip in l3_obj.FloatingIP.get_scoped_floating_ips(
+1720                 context, router_ids)
+1721         ]
+1722 
+1723     def _get_sync_interfaces(self, context, router_ids, device_owners=None):
+1724         """Query router interfaces that relate to list of router_ids."""
+1725         device_owners = device_owners or [DEVICE_OWNER_ROUTER_INTF,
+1726                                           DEVICE_OWNER_HA_REPLICATED_INT]
+1727         if not router_ids:
+1728             return []
+1729         # TODO(lujinluo): Need Port as synthetic field
+1730         objs = l3_obj.RouterPort.get_objects(
+1731             context, router_id=router_ids, port_type=list(device_owners))
+1732 
+1733         interfaces = [self._core_plugin._make_port_dict(rp.db_obj.port)
+1734                       for rp in objs]
+1735         return interfaces
+1736 
+1737     @staticmethod
+1738     def _each_port_having_fixed_ips(ports):
+1739         for port in ports or []:
+1740             fixed_ips = port.get('fixed_ips', [])
+1741             if not fixed_ips:
+1742                 # Skip ports without IPs, which can occur if a subnet
+1743                 # attached to a router is deleted
+1744                 LOG.info("Skipping port %s as no IP is configure on "
+1745                          "it",
+1746                          port['id'])
+1747                 continue
+1748             yield port
+1749 
+1750     def _get_subnets_by_network_list(self, context, network_ids):
+1751         if not network_ids:
+1752             return {}
+1753 
+1754         query = context.session.query(models_v2.Subnet,
+1755                                       models_v2.SubnetPool.address_scope_id)
+1756         query = query.outerjoin(
+1757             models_v2.SubnetPool,
+1758             models_v2.Subnet.subnetpool_id == models_v2.SubnetPool.id)
+1759         query = query.filter(models_v2.Subnet.network_id.in_(network_ids))
+1760 
+1761         fields = ['id', 'cidr', 'gateway_ip', 'dns_nameservers',
+1762                   'network_id', 'ipv6_ra_mode', 'subnetpool_id']
+1763 
+1764         def make_subnet_dict_with_scope(row):
+1765             subnet_db, address_scope_id = row
+1766             subnet = self._core_plugin._make_subnet_dict(
+1767                 subnet_db, fields, context=context)
+1768             subnet['address_scope_id'] = address_scope_id
+1769             return subnet
+1770 
+1771         subnets_by_network = dict((id, []) for id in network_ids)
+1772         for subnet in (make_subnet_dict_with_scope(row) for row in query):
+1773             subnets_by_network[subnet['network_id']].append(subnet)
+1774         return subnets_by_network
+1775 
+1776     def _get_mtus_by_network_list(self, context, network_ids):
+1777         if not network_ids:
+1778             return {}
+1779         filters = {'id': network_ids}
+1780         fields = ['id', 'mtu']
+1781         networks = self._core_plugin.get_networks(context, filters=filters,
+1782                                                   fields=fields)
+1783         mtus_by_network = dict((network['id'], network.get('mtu', 0))
+1784                                for network in networks)
+1785         return mtus_by_network
+1786 
+1787     def _populate_mtu_and_subnets_for_ports(self, context, ports):
+1788         """Populate ports with subnets.
+1789 
+1790         These ports already have fixed_ips populated.
+1791         """
+1792         network_ids = [p['network_id']
+1793                        for p in self._each_port_having_fixed_ips(ports)]
+1794 
+1795         mtus_by_network = self._get_mtus_by_network_list(context, network_ids)
+1796         subnets_by_network = self._get_subnets_by_network_list(
+1797             context, network_ids)
+1798 
+1799         for port in self._each_port_having_fixed_ips(ports):
+1800 
+1801             port['subnets'] = []
+1802             port['extra_subnets'] = []
+1803             port['address_scopes'] = {constants.IP_VERSION_4: None,
+1804                                       constants.IP_VERSION_6: None}
+1805 
+1806             scopes = {}
+1807             for subnet in subnets_by_network[port['network_id']]:
+1808                 scope = subnet['address_scope_id']
+1809                 cidr = netaddr.IPNetwork(subnet['cidr'])
+1810                 scopes[cidr.version] = scope
+1811 
+1812                 # If this subnet is used by the port (has a matching entry
+1813                 # in the port's fixed_ips), then add this subnet to the
+1814                 # port's subnets list, and populate the fixed_ips entry
+1815                 # entry with the subnet's prefix length.
+1816                 subnet_info = {'id': subnet['id'],
+1817                                'cidr': subnet['cidr'],
+1818                                'gateway_ip': subnet['gateway_ip'],
+1819                                'dns_nameservers': subnet['dns_nameservers'],
+1820                                'ipv6_ra_mode': subnet['ipv6_ra_mode'],
+1821                                'subnetpool_id': subnet['subnetpool_id']}
+1822                 for fixed_ip in port['fixed_ips']:
+1823                     if fixed_ip['subnet_id'] == subnet['id']:
+1824                         port['subnets'].append(subnet_info)
+1825                         prefixlen = cidr.prefixlen
+1826                         fixed_ip['prefixlen'] = prefixlen
+1827                         break
+1828                 else:
+1829                     # This subnet is not used by the port.
+1830                     port['extra_subnets'].append(subnet_info)
+1831 
+1832             port['address_scopes'].update(scopes)
+1833             port['mtu'] = mtus_by_network.get(port['network_id'], 0)
+1834 
+1835     def _process_floating_ips(self, context, routers_dict, floating_ips):
+1836         for floating_ip in floating_ips:
+1837             router = routers_dict.get(floating_ip['router_id'])
+1838             if router:
+1839                 router_floatingips = router.get(constants.FLOATINGIP_KEY,
+1840                                                 [])
+1841                 router_floatingips.append(floating_ip)
+1842                 router[constants.FLOATINGIP_KEY] = router_floatingips
+1843 
+1844     def _process_interfaces(self, routers_dict, interfaces):
+1845         for interface in interfaces:
+1846             router = routers_dict.get(interface['device_id'])
+1847             if router:
+1848                 router_interfaces = router.get(constants.INTERFACE_KEY, [])
+1849                 router_interfaces.append(interface)
+1850                 router[constants.INTERFACE_KEY] = router_interfaces
+1851 
+1852     def _get_router_info_list(self, context, router_ids=None, active=None,
+1853                               device_owners=None):
+1854         """Query routers and their related floating_ips, interfaces."""
+1855         with db_api.CONTEXT_WRITER.using(context):
+1856             routers = self._get_sync_routers(context,
+1857                                              router_ids=router_ids,
+1858                                              active=active)
+1859             router_ids = [router['id'] for router in routers]
+1860             interfaces = self._get_sync_interfaces(
+1861                 context, router_ids, device_owners)
+1862             floating_ips = self._get_sync_floating_ips(context, router_ids)
+1863             return (routers, interfaces, floating_ips)
+1864 
+1865     def get_sync_data(self, context, router_ids=None, active=None):
+1866         routers, interfaces, floating_ips = self._get_router_info_list(
+1867             context, router_ids=router_ids, active=active)
+1868         ports_to_populate = [router['gw_port'] for router in routers
+1869                              if router.get('gw_port')] + interfaces
+1870         self._populate_mtu_and_subnets_for_ports(context, ports_to_populate)
+1871         routers_dict = dict((router['id'], router) for router in routers)
+1872         self._process_floating_ips(context, routers_dict, floating_ips)
+1873         self._process_interfaces(routers_dict, interfaces)
+1874         return list(routers_dict.values())
+1875 
+1876     def is_router_distributed(self, context, router_id):
+1877         """Returns if a router is distributed or not
+1878 
+1879         If DVR extension is not enabled, no router will be distributed. This
+1880         function is overridden in L3_NAT_with_dvr_db_mixin in case the DVR
+1881         extension is loaded.
+1882         """
+1883         return False
+1884 
+1885 
+1886 @registry.has_registry_receivers
+1887 class L3RpcNotifierMixin(object):
+1888     """Mixin class to add rpc notifier attribute to db_base_plugin_v2."""
+1889 
+1890     @staticmethod
+1891     @registry.receives(resources.PORT, [events.AFTER_DELETE])
+1892     def _notify_routers_callback(resource, event, trigger, **kwargs):
+1893         context = kwargs['context']
+1894         router_ids = kwargs['router_ids']
+1895         l3plugin = directory.get_plugin(plugin_constants.L3)
+1896         if l3plugin:
+1897             l3plugin.notify_routers_updated(context, router_ids)
+1898         else:
+1899             LOG.debug('%s not configured', plugin_constants.L3)
+1900 
+1901     @staticmethod
+1902     @registry.receives(resources.SUBNET, [events.AFTER_UPDATE])
+1903     def _notify_subnet_gateway_ip_update(resource, event, trigger, **kwargs):
+1904         l3plugin = directory.get_plugin(plugin_constants.L3)
+1905         if not l3plugin:
+1906             return
+1907         context = kwargs['context']
+1908         orig = kwargs['original_subnet']
+1909         updated = kwargs['subnet']
+1910         if orig['gateway_ip'] == updated['gateway_ip']:
+1911             return
+1912         network_id = updated['network_id']
+1913         subnet_id = updated['id']
+1914         query = context.session.query(models_v2.Port.device_id).filter_by(
+1915                     network_id=network_id,
+1916                     device_owner=DEVICE_OWNER_ROUTER_GW)
+1917         query = query.join(models_v2.Port.fixed_ips).filter(
+1918                     models_v2.IPAllocation.subnet_id == subnet_id)
+1919         router_ids = set(port.device_id for port in query)
+1920         for router_id in router_ids:
+1921             l3plugin.notify_router_updated(context, router_id)
+1922 
+1923     @staticmethod
+1924     @registry.receives(resources.PORT, [events.AFTER_UPDATE])
+1925     def _notify_gateway_port_ip_changed(resource, event, trigger, **kwargs):
+1926         l3plugin = directory.get_plugin(plugin_constants.L3)
+1927         if not l3plugin:
+1928             return
+1929         new_port = kwargs.get('port')
+1930         original_port = kwargs.get('original_port')
+1931 
+1932         if original_port['device_owner'] != constants.DEVICE_OWNER_ROUTER_GW:
+1933             return
+1934 
+1935         if utils.port_ip_changed(new_port, original_port):
+1936             l3plugin.notify_router_updated(kwargs['context'],
+1937                                            new_port['device_id'])
+1938 
+1939     @staticmethod
+1940     @registry.receives(resources.SUBNETPOOL_ADDRESS_SCOPE,
+1941                        [events.AFTER_UPDATE])
+1942     def _notify_subnetpool_address_scope_update(resource, event,
+1943                                                 trigger, payload=None):
+1944         context = payload.context
+1945         subnetpool_id = payload.resource_id
+1946 
+1947         router_ids = l3_obj.RouterPort.get_router_ids_by_subnetpool(
+1948             context, subnetpool_id)
+1949 
+1950         l3plugin = directory.get_plugin(plugin_constants.L3)
+1951         if l3plugin:
+1952             l3plugin.notify_routers_updated(context, router_ids)
+1953         else:
+1954             LOG.debug('%s not configured', plugin_constants.L3)
+1955 
+1956     @property
+1957     def l3_rpc_notifier(self):
+1958         if not hasattr(self, '_l3_rpc_notifier'):
+1959             self._l3_rpc_notifier = l3_rpc_agent_api.L3AgentNotifyAPI()
+1960         return self._l3_rpc_notifier
+1961 
+1962     @l3_rpc_notifier.setter
+1963     def l3_rpc_notifier(self, value):
+1964         self._l3_rpc_notifier = value
+1965 
+1966     def notify_router_updated(self, context, router_id,
+1967                               operation=None):
+1968         if router_id:
+1969             self.l3_rpc_notifier.routers_updated(
+1970                 context, [router_id], operation)
+1971 
+1972     def notify_routers_updated(self, context, router_ids,
+1973                                operation=None, data=None):
+1974         if router_ids:
+1975             self.l3_rpc_notifier.routers_updated(
+1976                 context, router_ids, operation, data)
+1977 
+1978     def notify_router_deleted(self, context, router_id):
+1979         self.l3_rpc_notifier.router_deleted(context, router_id)
+1980 
+1981 
+1982 class L3_NAT_db_mixin(L3_NAT_dbonly_mixin, L3RpcNotifierMixin):
+1983     """Mixin class to add rpc notifier methods to db_base_plugin_v2."""
+1984 
+1985     def create_router(self, context, router):
+1986         router_dict = super(L3_NAT_db_mixin, self).create_router(context,
+1987                                                                  router)
+1988         if router_dict.get('external_gateway_info'):
+1989             self.notify_router_updated(context, router_dict['id'], None)
+1990         return router_dict
+1991 
+1992     def update_router(self, context, id, router):
+1993         router_dict = super(L3_NAT_db_mixin, self).update_router(context,
+1994                                                                  id, router)
+1995         self.notify_router_updated(context, router_dict['id'], None)
+1996         return router_dict
+1997 
+1998     def delete_router(self, context, id):
+1999         super(L3_NAT_db_mixin, self).delete_router(context, id)
+2000         self.notify_router_deleted(context, id)
+2001 
+2002     def notify_router_interface_action(
+2003             self, context, router_interface_info, action):
+2004         l3_method = '%s_router_interface' % action
+2005         super(L3_NAT_db_mixin, self).notify_routers_updated(
+2006             context, [router_interface_info['id']], l3_method,
+2007             {'subnet_id': router_interface_info['subnet_id']})
+2008 
+2009         mapping = {'add': 'create', 'remove': 'delete'}
+2010         notifier = n_rpc.get_notifier('network')
+2011         router_event = 'router.interface.%s' % mapping[action]
+2012         notifier.info(context, router_event,
+2013                       {'router_interface': router_interface_info})
+2014 
+2015     def add_router_interface(self, context, router_id, interface_info=None):
+2016         router_interface_info = super(
+2017             L3_NAT_db_mixin, self).add_router_interface(
+2018                 context, router_id, interface_info)
+2019         self.notify_router_interface_action(
+2020             context, router_interface_info, 'add')
+2021         return router_interface_info
+2022 
+2023     def remove_router_interface(self, context, router_id, interface_info):
+2024         router_interface_info = super(
+2025             L3_NAT_db_mixin, self).remove_router_interface(
+2026                 context, router_id, interface_info)
+2027         self.notify_router_interface_action(
+2028             context, router_interface_info, 'remove')
+2029         return router_interface_info
+2030 
+2031     def create_floatingip(self, context, floatingip,
+2032                           initial_status=constants.FLOATINGIP_STATUS_ACTIVE):
+2033         floatingip_dict = super(L3_NAT_db_mixin, self).create_floatingip(
+2034             context, floatingip, initial_status)
+2035         router_id = floatingip_dict['router_id']
+2036         self.notify_router_updated(context, router_id, 'create_floatingip')
+2037         return floatingip_dict
+2038 
+2039     def update_floatingip(self, context, id, floatingip):
+2040         old_floatingip, floatingip = self._update_floatingip(
+2041             context, id, floatingip)
+2042         router_ids = self._floatingips_to_router_ids(
+2043             [old_floatingip, floatingip])
+2044         super(L3_NAT_db_mixin, self).notify_routers_updated(
+2045             context, router_ids, 'update_floatingip', {})
+2046         return floatingip
+2047 
+2048     def delete_floatingip(self, context, id):
+2049         floating_ip = self._delete_floatingip(context, id)
+2050         self.notify_router_updated(context, floating_ip['router_id'],
+2051                                    'delete_floatingip')
+2052 
+2053     def disassociate_floatingips(self, context, port_id, do_notify=True):
+2054         """Disassociate all floating IPs linked to specific port.
+2055 
+2056         @param port_id: ID of the port to disassociate floating IPs.
+2057         @param do_notify: whether we should notify routers right away.
+2058         @return: set of router-ids that require notification updates
+2059                  if do_notify is False, otherwise None.
+2060         """
+2061         router_ids = super(L3_NAT_db_mixin, self).disassociate_floatingips(
+2062             context, port_id, do_notify)
+2063         if do_notify:
+2064             self.notify_routers_updated(context, router_ids)
+2065             # since caller assumes that we handled notifications on its
+2066             # behalf, return nothing
+2067             return
+2068 
+2069         return router_ids
+2070 
+2071     def notify_routers_updated(self, context, router_ids):
+2072         super(L3_NAT_db_mixin, self).notify_routers_updated(
+2073             context, list(router_ids), 'disassociate_floatingips', {})
+2074 
+2075     def _migrate_router_ports(self, context, router_db, old_owner, new_owner):
+2076         """Update the model to support the dvr case of a router."""
+2077         for rp in router_db.attached_ports:
+2078             if rp.port_type == old_owner:
+2079                 rp.port_type = new_owner
+2080                 rp.port.device_owner = new_owner

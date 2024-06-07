@@ -1,0 +1,526 @@
+Based on the given code from a commit, please generate supplementary code files according to the commit message.
+####commit message
+Implements previewing qml preview for a qmlproject
+
+To run it requires either designpreview.apk installed
+on the device or apks placed in
+<QTCREATATORDIR>/share/qtcreator/android/
+Apk filename should follow designpreview_$ARCH.apk
+
+Task-number: QAA-513
+Change-Id: Ida955b0fac519112d4623166677a7ba8e9afb1f4
+
+####code 
+1 /****************************************************************************
+2 **
+3 ** Copyright (C) 2021 The Qt Company Ltd.
+4 ** Contact: https://www.qt.io/licensing/
+5 **
+6 ** This file is part of Qt Creator.
+7 **
+8 ** Commercial License Usage
+9 ** Licensees holding valid commercial Qt licenses may use this file in
+10 ** accordance with the commercial license agreement provided with the
+11 ** Software or, alternatively, in accordance with the terms contained in
+12 ** a written agreement between you and The Qt Company. For licensing terms
+13 ** and conditions see https://www.qt.io/terms-conditions. For further
+14 ** information use the contact form at https://www.qt.io/contact-us.
+15 **
+16 ** GNU General Public License Usage
+17 ** Alternatively, this file may be used under the terms of the GNU
+18 ** General Public License version 3 as published by the Free Software
+19 ** Foundation with exceptions as appearing in the file LICENSE.GPL3-EXCEPT
+20 ** included in the packaging of this file. Please review the following
+21 ** information to ensure the GNU General Public License requirements will
+22 ** be met: https://www.gnu.org/licenses/gpl-3.0.html.
+23 **
+24 ****************************************************************************/
+25 
+26 #include "androidavdmanager.h"
+27 #include "androiddevice.h"
+28 #include "androiddeviceinfo.h"
+29 #include "androidglobal.h"
+30 #include "androidmanager.h"
+31 #include "androidqmlpreviewworker.h"
+32 
+33 #include "coreplugin/icore.h"
+34 #include "projectexplorer/buildsystem.h"
+35 #include "projectexplorer/kit.h"
+36 #include "projectexplorer/project.h"
+37 #include "projectexplorer/target.h"
+38 #include "qmljs/qmljssimplereader.h"
+39 #include "qmlprojectmanager/qmlprojectconstants.h"
+40 #include "qmlprojectmanager/qmlprojectmanagerconstants.h"
+41 #include "qtsupport/baseqtversion.h"
+42 #include "qtsupport/qtkitinformation.h"
+43 
+44 #include <QThread>
+45 #include <QTemporaryDir>
+46 #include <QImageReader>
+47 #include <QtConcurrent>
+48 
+49 namespace {
+50 static Q_LOGGING_CATEGORY(lcWarning, "qtc.android.qmlpreview", QtWarningMsg)
+51 }
+52 
+53 namespace Android {
+54 namespace Internal {
+55 
+56 using namespace Utils;
+57 
+58 class ApkInfo {
+59 public:
+60     static const QStringList abis;
+61     static const char appId[];
+62     static const char uploadDir[];
+63     static const char activityId[];
+64 };
+65 
+66 const QStringList ApkInfo::abis = {ProjectExplorer::Constants::ANDROID_ABI_X86,
+67                                    ProjectExplorer::Constants::ANDROID_ABI_X86_64,
+68                                    ProjectExplorer::Constants::ANDROID_ABI_ARM64_V8A,
+69                                    ProjectExplorer::Constants::ANDROID_ABI_ARMEABI_V7A};
+70 #define APP_ID "io.qt.designviewer"
+71 const char ApkInfo::appId[] = APP_ID;
+72 const char ApkInfo::uploadDir[] = "/data/local/tmp/" APP_ID "/";
+73 const char ApkInfo::activityId[] = APP_ID "/org.qtproject.qt5.android.bindings.QtActivity";
+74 
+75 const char packageSuffix[] = ".qmlrc";
+76 
+77 static FilePath viewerApkPath(const QString &avdAbi)
+78 {
+79     if (avdAbi.isEmpty())
+80         return {};
+81 
+82     if (ApkInfo::abis.contains(avdAbi))
+83         return Core::ICore::resourcePath(QString("android/designviewer_%1.apk").arg(avdAbi));
+84     return {};
+85 }
+86 
+87 static const QList<FilePath> uniqueFolders(const FilePaths &filePaths)
+88 {
+89     QSet<FilePath> folders;
+90     for (const FilePath &file : filePaths) {
+91         folders.insert(file.parentDir());
+92     }
+93     return folders.values();
+94 }
+95 
+96 static bool shouldAdbRetry(const QString &msg)
+97 {
+98     return msg == "error: closed"
+99            || msg == "adb: device offline"
+100            || msg.contains("doesn't match this client")
+101            || msg.contains("not found")
+102            || msg.contains("Can't find service: package");
+103 };
+104 
+105 static Android::SdkToolResult runAdbCommand(const QString &dev, const QStringList &arguments)
+106 {
+107     QStringList args;
+108     if (!dev.isEmpty())
+109         args << AndroidDeviceInfo::adbSelector(dev);
+110     args << arguments;
+111 
+112     Android::SdkToolResult result = AndroidManager::runAdbCommand(args);
+113     if (result.success() || !shouldAdbRetry(result.stdErr()))
+114         return result;
+115     // On Failure we shall repeat in a separate thread
+116     qCDebug(lcWarning()) << "Retrying on:" << result.stdErr();
+117     static const int numRetries = 5;
+118     QFuture<Android::SdkToolResult> asyncResult = QtConcurrent::run([args, result] {
+119         Android::SdkToolResult res(result);
+120         for (int i = 0 ; i < numRetries && !res.success() && shouldAdbRetry(res.stdErr()); ++i) {
+121             QThread::sleep(1);
+122             res = AndroidManager::runAdbCommand(args);
+123         }
+124         return res;
+125     });
+126 
+127     while (asyncResult.isRunning()) {
+128         QCoreApplication::instance()->processEvents(QEventLoop::AllEvents, 100);
+129     }
+130     return asyncResult.result();
+131 }
+132 
+133 static Android::SdkToolResult runAdbShellCommand(const QString &dev, const QStringList &arguments)
+134 {
+135     QStringList shellCmd{"shell"};
+136     return runAdbCommand(dev, shellCmd + arguments);
+137 }
+138 
+139 static QString startAvd(const AndroidAvdManager &avd, const QString &name)
+140 {
+141     if (!avd.findAvd(name).isEmpty() || avd.startAvdAsync(name)) {
+142         QFuture<QString> asyncRes = QtConcurrent::run([avd, name] {
+143             return avd.waitForAvd(name, []{return false;});
+144         });
+145         while (asyncRes.isRunning()) {
+146             QCoreApplication::instance()->processEvents(QEventLoop::AllEvents, 100);
+147         }
+148         return asyncRes.result();
+149     }
+150     return {};
+151 }
+152 
+153 static int pidofPreview(const QString &dev)
+154 {
+155     const QStringList command{"pidof", ApkInfo::appId};
+156     SdkToolResult res = runAdbShellCommand(dev, command);
+157     return res.success() ? res.stdOut().toInt() : -1;
+158 }
+159 
+160 static bool isPreviewRunning(const QString &dev, int lastKnownPid = -1)
+161 {
+162     int pid = pidofPreview(dev);
+163     return (lastKnownPid > 1) ? lastKnownPid == pid : pid > 1;
+164 }
+165 
+166 AndroidQmlPreviewWorker::AndroidQmlPreviewWorker(ProjectExplorer::RunControl *runControl)
+167     : ProjectExplorer::RunWorker(runControl)
+168     , m_rc(runControl)
+169     , m_config(AndroidConfigurations::currentConfig())
+170 {
+171 }
+172 
+173 void AndroidQmlPreviewWorker::start()
+174 {
+175     UploadInfo transfer;
+176     bool res = ensureAvdIsRunning()
+177                && elevateAdb()
+178                && checkAndInstallPreviewApp()
+179                && prepareUpload(transfer)
+180                && uploadFiles(transfer)
+181                && runPreviewApp(transfer);
+182 
+183     if (!res) {
+184         reportFailure();
+185         return;
+186     }
+187     reportStarted();
+188 
+189     //Thread to monitor preview life
+190     QtConcurrent::run([this]() {
+191         QElapsedTimer timer;
+192         timer.start();
+193         while (runControl() && runControl()->isRunning()) {
+194             if (m_viewerPid == -1) {
+195                 m_viewerPid = pidofPreview(m_devInfo.serialNumber);
+196             } else if (timer.elapsed() > 2000) {
+197                 if (!isPreviewRunning(m_devInfo.serialNumber, m_viewerPid))
+198                     QMetaObject::invokeMethod(this, &AndroidQmlPreviewWorker::stop);
+199                 timer.restart();
+200             }
+201             QThread::msleep(100);
+202         }
+203     });
+204 }
+205 
+206 void AndroidQmlPreviewWorker::stop()
+207 {
+208     if (!isPreviewRunning(m_devInfo.serialNumber, m_viewerPid) || stopPreviewApp())
+209         appendMessage(tr("Qt Design Viewer has been stopped."), NormalMessageFormat);
+210     m_viewerPid = -1;
+211     reportStopped();
+212 }
+213 
+214 bool AndroidQmlPreviewWorker::elevateAdb()
+215 {
+216     SdkToolResult res = runAdbCommand(m_devInfo.serialNumber, {"root"});
+217     if (!res.success())
+218         appendMessage(res.stdErr(), ErrorMessageFormat);
+219     return res.success();
+220 }
+221 
+222 bool AndroidQmlPreviewWorker::unelevateAdb()
+223 {
+224     SdkToolResult res = runAdbCommand(m_devInfo.serialNumber, {"unroot"});
+225     if (!res.success())
+226         appendMessage(res.stdErr(), ErrorMessageFormat);
+227     return res.success();
+228 }
+229 
+230 bool AndroidQmlPreviewWorker::ensureAvdIsRunning()
+231 {
+232     AndroidAvdManager avdMan(m_config);
+233     QString devSN = AndroidManager::deviceSerialNumber(m_rc->target());
+234 
+235     if (devSN.isEmpty())
+236         devSN = m_devInfo.serialNumber;
+237 
+238     if (!avdMan.isAvdBooted(devSN)) {
+239         m_devInfo = {};
+240         int minTargetApi = AndroidManager::minimumSDK(m_rc->target());
+241         AndroidDeviceInfo devInfoLocal = AndroidConfigurations::showDeviceDialog(m_rc->project(),
+242                                                                                  minTargetApi,
+243                                                                                  ApkInfo::abis);
+244         if (devInfoLocal.isValid()) {
+245             appendMessage(tr("Launching AVD."), NormalMessageFormat);
+246             devInfoLocal.serialNumber = startAvd(avdMan, devInfoLocal.avdname);
+247 
+248             if (!devInfoLocal.serialNumber.isEmpty()) {
+249                 m_devInfo = devInfoLocal;
+250                 m_avdAbis = m_config.getAbis(m_config.adbToolPath(), m_devInfo.serialNumber);
+251             } else {
+252                 appendMessage(tr("Could not run AVD."), ErrorMessageFormat);
+253             }
+254             return !devInfoLocal.serialNumber.isEmpty();
+255         } else {
+256             appendMessage(tr("No valid AVD has been selected."), ErrorMessageFormat);
+257         }
+258         return false;
+259     }
+260     m_avdAbis = m_config.getAbis(m_config.adbToolPath(), m_devInfo.serialNumber);
+261     return true;
+262 }
+263 
+264 bool AndroidQmlPreviewWorker::checkAndInstallPreviewApp()
+265 {
+266     const QStringList command {"pm", "list", "packages", ApkInfo::appId};
+267     appendMessage(tr("Checking if Qt Design Viewer app is installed."), NormalMessageFormat);
+268     SdkToolResult res = runAdbShellCommand(m_devInfo.serialNumber, command);
+269     if (!res.success()) {
+270         appendMessage(res.stdErr(), ErrorMessageFormat);
+271         return false;
+272     }
+273 
+274     if (res.stdOut().isEmpty()) {
+275         if (m_avdAbis.isEmpty()) {
+276             appendMessage(tr("ABI of the selected device is unknown. Cannot install APK."),
+277                           ErrorMessageFormat);
+278             return false;
+279         }
+280         FilePath apkPath = viewerApkPath(m_avdAbis.first());
+281         if (!apkPath.exists()) {
+282             appendMessage(tr("Cannot install Qt Design Viewer APK (%1). Appropriate file was not "
+283                              "found in plugin folders.").arg(m_avdAbis.first()),
+284                           ErrorMessageFormat);
+285             return false;
+286         }
+287 
+288         appendMessage(tr("Installing Qt Design Viewer apk."), NormalMessageFormat);
+289 
+290         SdkToolResult res = runAdbCommand(m_devInfo.serialNumber, {"install", apkPath.toString()});
+291         if (!res.success()) {
+292             appendMessage(res.stdErr(), StdErrFormat);
+293 
+294             return false;
+295         }
+296     }
+297     return true;
+298 }
+299 
+300 bool AndroidQmlPreviewWorker::prepareUpload(UploadInfo &transfer)
+301 {
+302     if (m_rc->project()->id() == QmlProjectManager::Constants::QML_PROJECT_ID) {
+303         const auto bs = m_rc->target()->buildSystem();
+304         if (bs) {
+305             transfer.importPaths = bs->additionalData(QmlProjectManager::Constants::
+306                                                           customImportPaths).toStringList();
+307             transfer.projectFolder = FilePath::fromString(
+308                 bs->additionalData(QmlProjectManager::Constants::canonicalProjectDir).toString());
+309             transfer.mainQmlFile = FilePath::fromString(
+310                 bs->additionalData(QmlProjectManager::Constants::mainFilePath).toString());
+311             transfer.projectFiles = m_rc->project()->files(ProjectExplorer::Project::SourceFiles);
+312 
+313             //Add everything missing from imports folders
+314             for (const QString &path : qAsConst(transfer.importPaths) ) {
+315                 QDirIterator it((transfer.projectFolder.absoluteFilePath() + "/" + path).toDir(),
+316                                  QDirIterator::Subdirectories);
+317 
+318                 while (it.hasNext()) {
+319                     QFileInfo fi(it.next());
+320                     if (fi.isFile() && !transfer.projectFiles.contains(FilePath::fromFileInfo(fi)))
+321                         transfer.projectFiles.append(FilePath::fromFileInfo(fi));
+322                 }
+323             }
+324             return true;
+325         }
+326     } else {
+327         const FilePaths allFiles = m_rc->project()->files(m_rc->project()->SourceFiles);
+328         FilePaths filesToExport = Utils::filtered(allFiles,[](const FilePath &path) {
+329             return path.suffix() == "qmlproject";});
+330 
+331         if (filesToExport.size() > 1) {
+332             appendMessage(tr("Too many qmlproject files in project. Could not decide to pick one."),
+333                           ErrorMessageFormat);
+334         } else if (filesToExport.size() < 1) {
+335             appendMessage(tr("No qmlproject file found among project files."), ErrorMessageFormat);
+336         } else {
+337             QmlJS::SimpleReader qmlReader;
+338             QFileInfo qmlprojectFile = filesToExport.first().toFileInfo();
+339             const QmlJS::SimpleReaderNode::Ptr rootNode = qmlReader.readFile(qmlprojectFile.
+340                                                                              filePath());
+341 
+342             if (!qmlReader.errors().isEmpty() || !rootNode->isValid()) {
+343                 appendMessage(tr("Could not parse %1").arg(qmlprojectFile.fileName()),
+344                               ErrorMessageFormat);
+345                 return false;
+346             }
+347 
+348             if (rootNode->name() == QLatin1String("Project")) {
+349                 QStringList extensions{"qml", "js", "css", "ttf", "otf", "conf", "qmlproject"};
+350                 const QList<QByteArray> gfxExt = QImageReader::supportedImageFormats();
+351                 extensions += Utils::transform(gfxExt,
+352                                                [](const auto byteArray) {
+353                                                    return QString::fromLocal8Bit(byteArray);});
+354 
+355                 transfer.projectFolder = FilePath::fromString(qmlprojectFile.absolutePath());
+356                 const QVariant mainFileProperty = rootNode->property(QLatin1String("mainFile"));
+357                 if (mainFileProperty.isValid()) {
+358                     transfer.mainQmlFile = transfer.
+359                                            projectFolder.
+360                                            absoluteFilePath(FilePath::fromString(
+361                                                mainFileProperty.toString()));
+362                 }
+363 
+364                 const QVariant importPathsProperty = rootNode->
+365                                                      property(QLatin1String("importPaths"));
+366                 if (importPathsProperty.isValid())
+367                     transfer.importPaths = importPathsProperty.toStringList();
+368 
+369                 QStringList fullPathImportPaths;
+370 
+371                 QDirIterator it(qmlprojectFile.dir(), QDirIterator::Subdirectories);
+372                 while (it.hasNext()) {
+373                     QFileInfo fi(it.next());
+374                     if (extensions.contains(fi.suffix()) || fi.fileName() == "qmldir") {
+375                         transfer.projectFiles.append(FilePath::fromFileInfo(fi));
+376                     }
+377                 }
+378                 return true;
+379             }
+380             return false;
+381         }
+382     }
+383     appendMessage(tr("Could not gather information on project files."), ErrorMessageFormat);
+384     return false;
+385 }
+386 
+387 FilePath AndroidQmlPreviewWorker::createQmlrcFile(const FilePath &workFolder,
+388                                                  const QString &basename)
+389 {
+390     QtSupport::BaseQtVersion *qtVersion = QtSupport::QtKitAspect::qtVersion(m_rc->kit());
+391     FilePath rccBinary = qtVersion->rccFilePath();
+392     QtcProcess rccProcess;
+393     FilePath qrcPath = FilePath::fromString(basename);
+394     if (qrcPath.suffix() != "qrc")
+395         qrcPath = qrcPath + ".qrc";
+396     FilePath qmlrcPath = FilePath::fromString(QDir::tempPath() + "/" + basename + packageSuffix);
+397 
+398     rccProcess.setWorkingDirectory(workFolder);
+399 
+400     const QStringList arguments[2] = {{"--project", "--output", qrcPath.fileName()},
+401                                       {"--binary", "--output", qmlrcPath.path(),
+402                                        qrcPath.fileName()}};
+403     for (const auto &arguments : arguments) {
+404         rccProcess.setCommand({rccBinary, arguments});
+405         rccProcess.start();
+406         if (!rccProcess.waitForStarted()) {
+407             appendMessage(tr("Could not to create file for Qt Design Viewer \"%1\"").
+408                           arg(rccProcess.commandLine().toUserOutput()), StdErrFormat);
+409             return {};
+410         }
+411         QByteArray stdOut;
+412         QByteArray stdErr;
+413         if (!rccProcess.readDataFromProcess(30, &stdOut, &stdErr, true)) {
+414             rccProcess.stopProcess();
+415             appendMessage(tr("A timeout occurred running \"%1\"").
+416                           arg(rccProcess.commandLine().toUserOutput()), StdErrFormat);
+417             return {};
+418         }
+419         if (!stdOut.trimmed().isEmpty())
+420             appendMessage(QString::fromLocal8Bit(stdOut), StdErrFormat);
+421 
+422         if (!stdErr.trimmed().isEmpty())
+423             appendMessage(QString::fromLocal8Bit(stdErr), StdErrFormat);
+424 
+425         if (rccProcess.exitStatus() != QProcess::NormalExit) {
+426             appendMessage(tr("Crash while creating file for Qt Design Viewer \"%1\"").
+427                           arg(rccProcess.commandLine().toUserOutput()), StdErrFormat);
+428             return {};
+429         }
+430         if (rccProcess.exitCode() != 0) {
+431             appendMessage(tr("Creating file for Qt Design Viewer failed. \"%1\" (exit code %2).").
+432                           arg(rccProcess.commandLine().toUserOutput()).
+433                           arg(rccProcess.exitCode()), StdErrFormat);
+434             return {};
+435         }
+436     }
+437     return qmlrcPath;
+438 }
+439 
+440 bool AndroidQmlPreviewWorker::uploadFiles(const UploadInfo &transfer)
+441 {
+442     QTemporaryDir tmp;
+443     if (tmp.isValid()) {
+444         appendMessage(tr("Uploading files."), NormalMessageFormat);
+445 
+446         QDir dir(tmp.path());
+447         if (dir.mkpath(transfer.projectFolder.fileName())) {
+448             dir.cd(transfer.projectFolder.fileName());
+449             FilePath tmpDir = FilePath::fromString(dir.path());
+450             //Create all needed folders in temporary folder
+451             for (const FilePath &folder : uniqueFolders(transfer.projectFiles)) {
+452                 if (folder != transfer.projectFolder)
+453                     dir.mkpath(folder.relativePath(transfer.projectFolder).toString());
+454             }
+455             //copy all project files to already existing folders
+456             for (const FilePath &file : transfer.projectFiles)
+457                 file.copyFile(tmpDir.absoluteFilePath(file.relativeChildPath(transfer.
+458                                                                              projectFolder)));
+459 
+460             FilePath qresPath = createQmlrcFile(tmpDir, transfer.mainQmlFile.baseName());
+461             if (!qresPath.exists())
+462                 return false;
+463 
+464             runAdbShellCommand(m_devInfo.serialNumber, {"mkdir", "-p", ApkInfo::uploadDir});
+465 
+466             SdkToolResult res = runAdbCommand(m_devInfo.serialNumber,
+467                                               {"push", qresPath.absoluteFilePath().toString(),
+468                                                ApkInfo::uploadDir});
+469             if (!res.success()) {
+470                 appendMessage(res.stdOut(), ErrorMessageFormat);
+471                 appendMessage(res.stdErr(), ErrorMessageFormat);
+472             }
+473             return res.success();
+474         }
+475     }
+476     return false;
+477 }
+478 
+479 bool AndroidQmlPreviewWorker::runPreviewApp(const UploadInfo &transfer)
+480 {
+481     stopPreviewApp();
+482     appendMessage(tr("Starting Qt Design Viewer."), NormalMessageFormat);
+483     QDir destDir(ApkInfo::uploadDir);
+484     const QStringList command{"am", "start",
+485                               "-n", ApkInfo::activityId,
+486                               "-e", "extraappparams",
+487                               QString::fromLatin1(
+488                                   destDir.filePath(transfer.mainQmlFile.baseName() + packageSuffix).
+489                                   toUtf8().
+490                                   toBase64())};
+491     SdkToolResult res = runAdbShellCommand(m_devInfo.serialNumber, command);
+492     if (!res.success()) {
+493         appendMessage(res.stdErr(), ErrorMessageFormat);
+494         return res.success();
+495     }
+496     appendMessage(tr("Qt Design Viewer is running."), NormalMessageFormat);
+497     m_viewerPid = pidofPreview(m_devInfo.serialNumber);
+498     return true;
+499 }
+500 
+501 bool AndroidQmlPreviewWorker::stopPreviewApp()
+502 {
+503     const QStringList command{"am", "force-stop", ApkInfo::appId};
+504     SdkToolResult res = runAdbShellCommand(m_devInfo.serialNumber, command);
+505     if (!res.success()) {
+506         appendMessage(res.stdErr(), ErrorMessageFormat);
+507         return res.success();
+508     }
+509     return true;
+510 }
+511 
+512 }
+513 }

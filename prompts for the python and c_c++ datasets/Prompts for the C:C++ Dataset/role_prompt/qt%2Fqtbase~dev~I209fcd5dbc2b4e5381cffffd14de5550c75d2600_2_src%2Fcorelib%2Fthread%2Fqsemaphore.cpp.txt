@@ -1,0 +1,575 @@
+I want you to act as a code reviewer of Qt Base in Qt. Please review the code below to detect security defects. If any are found, please describe the security defect in detail and indicate the corresponding line number of code and solution. If none are found, please state '''No security defects are detected in the code'''.
+
+1 /****************************************************************************
+2 **
+3 ** Copyright (C) 2017 The Qt Company Ltd.
+4 ** Copyright (C) 2017 Intel Corporation.
+5 ** Contact: https://www.qt.io/licensing/
+6 **
+7 ** This file is part of the QtCore module of the Qt Toolkit.
+8 **
+9 ** $QT_BEGIN_LICENSE:LGPL$
+10 ** Commercial License Usage
+11 ** Licensees holding valid commercial Qt licenses may use this file in
+12 ** accordance with the commercial license agreement provided with the
+13 ** Software or, alternatively, in accordance with the terms contained in
+14 ** a written agreement between you and The Qt Company. For licensing terms
+15 ** and conditions see https://www.qt.io/terms-conditions. For further
+16 ** information use the contact form at https://www.qt.io/contact-us.
+17 **
+18 ** GNU Lesser General Public License Usage
+19 ** Alternatively, this file may be used under the terms of the GNU Lesser
+20 ** General Public License version 3 as published by the Free Software
+21 ** Foundation and appearing in the file LICENSE.LGPL3 included in the
+22 ** packaging of this file. Please review the following information to
+23 ** ensure the GNU Lesser General Public License version 3 requirements
+24 ** will be met: https://www.gnu.org/licenses/lgpl-3.0.html.
+25 **
+26 ** GNU General Public License Usage
+27 ** Alternatively, this file may be used under the terms of the GNU
+28 ** General Public License version 2.0 or (at your option) the GNU General
+29 ** Public license version 3 or any later version approved by the KDE Free
+30 ** Qt Foundation. The licenses are as published by the Free Software
+31 ** Foundation and appearing in the file LICENSE.GPL2 and LICENSE.GPL3
+32 ** included in the packaging of this file. Please review the following
+33 ** information to ensure the GNU General Public License requirements will
+34 ** be met: https://www.gnu.org/licenses/gpl-2.0.html and
+35 ** https://www.gnu.org/licenses/gpl-3.0.html.
+36 **
+37 ** $QT_END_LICENSE$
+38 **
+39 ****************************************************************************/
+40 
+41 #include "qsemaphore.h"
+42 
+43 #ifndef QT_NO_THREAD
+44 #include "qmutex.h"
+45 #include "qfutex_p.h"
+46 #include "qwaitcondition.h"
+47 #include "qdeadlinetimer.h"
+48 #include "qdatetime.h"
+49 
+50 QT_BEGIN_NAMESPACE
+51 
+52 using namespace QtFutex;
+53 
+54 /*!
+55     \class QSemaphore
+56     \inmodule QtCore
+57     \brief The QSemaphore class provides a general counting semaphore.
+58 
+59     \threadsafe
+60 
+61     \ingroup thread
+62 
+63     A semaphore is a generalization of a mutex. While a mutex can
+64     only be locked once, it's possible to acquire a semaphore
+65     multiple times. Semaphores are typically used to protect a
+66     certain number of identical resources.
+67 
+68     Semaphores support two fundamental operations, acquire() and
+69     release():
+70 
+71     \list
+72     \li acquire(\e{n}) tries to acquire \e n resources. If there aren't
+73        that many resources available, the call will block until this
+74        is the case.
+75     \li release(\e{n}) releases \e n resources.
+76     \endlist
+77 
+78     There's also a tryAcquire() function that returns immediately if
+79     it cannot acquire the resources, and an available() function that
+80     returns the number of available resources at any time.
+81 
+82     Example:
+83 
+84     \snippet code/src_corelib_thread_qsemaphore.cpp 0
+85 
+86     A typical application of semaphores is for controlling access to
+87     a circular buffer shared by a producer thread and a consumer
+88     thread. The \l{Semaphores Example} shows how
+89     to use QSemaphore to solve that problem.
+90 
+91     A non-computing example of a semaphore would be dining at a
+92     restaurant. A semaphore is initialized with the number of chairs
+93     in the restaurant. As people arrive, they want a seat. As seats
+94     are filled, available() is decremented. As people leave, the
+95     available() is incremented, allowing more people to enter. If a
+96     party of 10 people want to be seated, but there are only 9 seats,
+97     those 10 people will wait, but a party of 4 people would be
+98     seated (taking the available seats to 5, making the party of 10
+99     people wait longer).
+100 
+101     \sa QSemaphoreReleaser, QMutex, QWaitCondition, QThread, {Semaphores Example}
+102 */
+103 
+104 /*
+105     QSemaphore futex operation
+106 
+107     QSemaphore stores a 32-bit integer with the counter of currently available
+108     tokens (value between 0 and INT_MAX). When a thread attempts to acquire n
+109     tokens and the counter is larger than that, we perform a compare-and-swap
+110     with the new count. If that succeeds, the acquisition worked; if not, we
+111     loop again because the counter changed. If there were not enough tokens,
+112     we'll perform a futex-wait.
+113 
+114     Before we do, we set the high bit in the futex to indicate that semaphore
+115     is contended: that is, there's a thread waiting for more tokens. On
+116     release() for n tokens, we perform a fetch-and-add of n and then check if
+117     that high bit was set. If it was, then we clear that bit and perform a
+118     futex-wake on the semaphore to indicate the waiting threads can wake up and
+119     acquire tokens. Which ones get woken up is unspecified.
+120 
+121     If the system has the ability to wake up a precise number of threads, has
+122     Linux's FUTEX_WAKE_OP functionality, and is 64-bit, we'll use the high word
+123     to indicate whether there's a thread waiting for more than one token. So
+124     when releasing n tokens on those systems, we tell the kernel to wake up n
+125     single-token threads and all of the multi-token ones, then clear that wait
+126     bit. Which threads get woken up is unspecified, but it's likely
+127     single-token threads will get woken up first.
+128  */
+129 static const quint32 futexContendedBit = 1U << 31;
+130 static const quintptr futexMultiWaiterBit = quintptr(futexContendedBit) << 1;
+131 
+132 static int futexAvailCounter(quintptr v)
+133 {
+134     // the low 31 bits
+135     return int(v & (futexContendedBit - 1));
+136 }
+137 
+138 static QBasicAtomicInteger<quint32> *futexLow32(QBasicAtomicInteger<quintptr> *ptr)
+139 {
+140     auto result = reinterpret_cast<QBasicAtomicInteger<quint32> *>(ptr);
+141 #if Q_BYTE_ORDER == Q_BIG_ENDIAN && QT_POINTER_SIZE > 4
+142     ++result;
+143 #endif
+144     return result;
+145 }
+146 
+147 static QBasicAtomicInteger<quint32> *futexHigh32(QBasicAtomicInteger<quintptr> *ptr)
+148 {
+149     auto result = reinterpret_cast<QBasicAtomicInteger<quint32> *>(ptr);
+150 #if Q_BYTE_ORDER == Q_LITTLE_ENDIAN && QT_POINTER_SIZE > 4
+151     ++result;
+152 #endif
+153     return result;
+154 }
+155 
+156 template <bool IsTimed> bool futexSemaphoreTryAcquire(QBasicAtomicInteger<quintptr> &u, int n, int timeout)
+157 {
+158     QDeadlineTimer timer(IsTimed ? QDeadlineTimer(timeout) : QDeadlineTimer());
+159     quintptr curValue = u.loadAcquire();
+160     int remainingTime = timeout;
+161     forever {
+162         int available = futexAvailCounter(curValue);
+163         if (available >= n) {
+164             // try to acquire
+165             quintptr newValue = curValue - quint32(n);
+166             if (u.testAndSetOrdered(curValue, newValue, curValue))
+167                 return true;        // succeeded!
+168             continue;
+169         }
+170 
+171         // not enough tokens available, put us to wait
+172         if (remainingTime == 0)
+173             return false;
+174 
+175         // set the contended and multi-wait bits bit
+176         quintptr bitsToSet = futexContendedBit;
+177         if (n > 1)
+178             bitsToSet |= futexMultiWaiterBit;
+179         u.fetchAndOrRelaxed(bitsToSet);
+180         curValue |= bitsToSet;
+181         auto ptr = futexLow32(&u);
+182 
+183 #ifdef FUTEX_OP
+184         if (n > 1 && sizeof(curValue) > sizeof(int)) {
+185             curValue = 1;
+186             ptr = futexHigh32(&u);
+187         }
+188 #endif
+189 
+190         if (IsTimed && remainingTime > 0) {
+191             bool timedout = !futexWait(*ptr, curValue, remainingTime);
+192             if (timedout)
+193                 return false;
+194         } else {
+195             futexWait(*ptr, curValue);
+196         }
+197 
+198         curValue = u.loadAcquire();
+199         if (IsTimed)
+200             remainingTime = int(timer.remainingTime());
+201     }
+202 }
+203 
+204 class QSemaphorePrivate {
+205 public:
+206     inline QSemaphorePrivate(int n) : avail(n) { }
+207 
+208     QMutex mutex;
+209     QWaitCondition cond;
+210 
+211     int avail;
+212 };
+213 
+214 /*!
+215     Creates a new semaphore and initializes the number of resources
+216     it guards to \a n (by default, 0).
+217 
+218     \sa release(), available()
+219 */
+220 QSemaphore::QSemaphore(int n)
+221 {
+222     Q_ASSERT_X(n >= 0, "QSemaphore", "parameter 'n' must be non-negative");
+223     if (futexAvailable())
+224         u.store(n);
+225     else
+226         d = new QSemaphorePrivate(n);
+227 }
+228 
+229 /*!
+230     Destroys the semaphore.
+231 
+232     \warning Destroying a semaphore that is in use may result in
+233     undefined behavior.
+234 */
+235 QSemaphore::~QSemaphore()
+236 {
+237     if (!futexAvailable())
+238         delete d;
+239 }
+240 
+241 /*!
+242     Tries to acquire \c n resources guarded by the semaphore. If \a n
+243     > available(), this call will block until enough resources are
+244     available.
+245 
+246     \sa release(), available(), tryAcquire()
+247 */
+248 void QSemaphore::acquire(int n)
+249 {
+250     Q_ASSERT_X(n >= 0, "QSemaphore::acquire", "parameter 'n' must be non-negative");
+251 
+252     if (futexAvailable()) {
+253         futexSemaphoreTryAcquire<false>(u, n, -1);
+254         return;
+255     }
+256 
+257     QMutexLocker locker(&d->mutex);
+258     while (n > d->avail)
+259         d->cond.wait(locker.mutex());
+260     d->avail -= n;
+261 }
+262 
+263 /*!
+264     Releases \a n resources guarded by the semaphore.
+265 
+266     This function can be used to "create" resources as well. For
+267     example:
+268 
+269     \snippet code/src_corelib_thread_qsemaphore.cpp 1
+270 
+271     QSemaphoreReleaser is a \l{http://en.cppreference.com/w/cpp/language/raii}{RAII}
+272     wrapper around this function.
+273 
+274     \sa acquire(), available(), QSemaphoreReleaser
+275 */
+276 void QSemaphore::release(int n)
+277 {
+278     Q_ASSERT_X(n >= 0, "QSemaphore::release", "parameter 'n' must be non-negative");
+279 
+280     if (futexAvailable()) {
+281         quintptr prevValue = u.fetchAndAddRelease(n);
+282         if (prevValue & futexContendedBit) {
+283 #ifdef FUTEX_OP
+284             if (sizeof(u) == sizeof(int)) {
+285                 /*
+286                    On 32-bit systems, all waiters are waiting on the same address,
+287                    so we'll wake them all and ask the kernel to clear the high bit.
+288 
+289                    atomic {
+290                       int oldval = u;
+291                       u = oldval & ~(1 << 31);
+292                       futexWake(u, INT_MAX);
+293                       if (oldval == 0)       // impossible condition
+294                           futexWake(u, INT_MAX);
+295                    }
+296                 */
+297                 quint32 op = FUTEX_OP_ANDN | FUTEX_OP_OPARG_SHIFT;
+298                 quint32 oparg = 31;
+299                 quint32 cmp = FUTEX_OP_CMP_EQ;
+300                 quint32 cmparg = 0;
+301                 futexWakeOp(u, n, INT_MAX, u, FUTEX_OP(op, oparg, cmp, cmparg));
+302             } else {
+303                 /*
+304                    On 64-bit systems, the single-token waiters wait on the low half
+305                    and the multi-token waiters wait on the upper half. So we ask
+306                    the kernel to wake up n single-token waiters and all multi-token
+307                    waiters (if any), then clear the multi-token wait bit.
+308 
+309                    That means we must clear the contention bit ourselves. See
+310                    below for handling the race.
+311 
+312                    atomic {
+313                       int oldval = *upper;
+314                       *upper = oldval & ~1;
+315                       futexWake(lower, n);
+316                       if (oldval != 0)
+317                           futexWake(upper, INT_MAX);
+318                    }
+319                 */
+320                 quint32 op = FUTEX_OP_ANDN;
+321                 quint32 oparg = 1;
+322                 quint32 cmp = FUTEX_OP_CMP_NE;
+323                 quint32 cmparg = 0;
+324                 futexLow32(&u)->fetchAndAndRelease(futexContendedBit - 1);
+325                 futexWakeOp(*futexLow32(&u), n, INT_MAX, *futexHigh32(&u), FUTEX_OP(op, oparg, cmp, cmparg));
+326             }
+327 #else 
+328             // Unset the bit and wake everyone. There are two possibibilies
+329             // under which a thread can set the bit between the AND and the
+330             // futexWake:
+331             // 1) it did see the new counter value, but it wasn't enough for
+332             //    its acquisition anyway, so it has to wait;
+333             // 2) it did not see the new counter value, in which case its
+334             //    futexWait will fail.
+335             u.fetchAndAndRelease(futexContendedBit - 1);
+336             futexWakeAll(u);
+337 #endif
+338         }
+339         return;
+340     }
+341 
+342     QMutexLocker locker(&d->mutex);
+343     d->avail += n;
+344     d->cond.wakeAll();
+345 }
+346 
+347 /*!
+348     Returns the number of resources currently available to the
+349     semaphore. This number can never be negative.
+350 
+351     \sa acquire(), release()
+352 */
+353 int QSemaphore::available() const
+354 {
+355     if (futexAvailable())
+356         return futexAvailCounter(u.load());
+357 
+358     QMutexLocker locker(&d->mutex);
+359     return d->avail;
+360 }
+361 
+362 /*!
+363     Tries to acquire \c n resources guarded by the semaphore and
+364     returns \c true on success. If available() < \a n, this call
+365     immediately returns \c false without acquiring any resources.
+366 
+367     Example:
+368 
+369     \snippet code/src_corelib_thread_qsemaphore.cpp 2
+370 
+371     \sa acquire()
+372 */
+373 bool QSemaphore::tryAcquire(int n)
+374 {
+375     Q_ASSERT_X(n >= 0, "QSemaphore::tryAcquire", "parameter 'n' must be non-negative");
+376 
+377     if (futexAvailable())
+378         return futexSemaphoreTryAcquire<false>(u, n, 0);
+379 
+380     QMutexLocker locker(&d->mutex);
+381     if (n > d->avail)
+382         return false;
+383     d->avail -= n;
+384     return true;
+385 }
+386 
+387 /*!
+388     Tries to acquire \c n resources guarded by the semaphore and
+389     returns \c true on success. If available() < \a n, this call will
+390     wait for at most \a timeout milliseconds for resources to become
+391     available.
+392 
+393     Note: Passing a negative number as the \a timeout is equivalent to
+394     calling acquire(), i.e. this function will wait forever for
+395     resources to become available if \a timeout is negative.
+396 
+397     Example:
+398 
+399     \snippet code/src_corelib_thread_qsemaphore.cpp 3
+400 
+401     \sa acquire()
+402 */
+403 bool QSemaphore::tryAcquire(int n, int timeout)
+404 {
+405     Q_ASSERT_X(n >= 0, "QSemaphore::tryAcquire", "parameter 'n' must be non-negative");
+406     if (futexAvailable())
+407         return futexSemaphoreTryAcquire<true>(u, n, timeout < 0 ? -1 : timeout);
+408 
+409     QMutexLocker locker(&d->mutex);
+410     QDeadlineTimer timer(timeout);
+411     qint64 remainingTime = timeout;
+412     while (n > d->avail && remainingTime > 0) {
+413         if (!d->cond.wait(locker.mutex(), remainingTime))
+414             return false;
+415         remainingTime = timer.remainingTime();
+416     }
+417     if (n > d->avail)
+418         return false;
+419     d->avail -= n;
+420     return true;
+421 
+422 
+423 }
+424 
+425 /*!
+426     \class QSemaphoreReleaser
+427     \brief The QSemaphoreReleaser class provides exception-safe deferral of a QSemaphore::release() call
+428     \since 5.10
+429     \ingroup thread
+430     \inmodule QtCore
+431 
+432     \reentrant
+433 
+434     QSemaphoreReleaser can be used wherever you would otherwise use
+435     QSemaphore::release(). Constructing a QSemaphoreReleaser defers the
+436     release() call on the semaphore until the QSemaphoreReleaser is
+437     destroyed (see
+438     \l{http://en.cppreference.com/w/cpp/language/raii}{RAII pattern}).
+439 
+440     You can use this to reliably release a semaphore to avoid dead-lock
+441     in the face of exceptions or early returns:
+442 
+443     \code
+444     // ... do something that may throw or return early
+445     sem.release();
+446     \endcode
+447 
+448     If an early return is taken or an exception is thrown before the
+449     \c{sem.release()} call is reached, the semaphore is not released,
+450     possibly preventing the thread waiting in the corresponding
+451     \c{sem.acquire()} call from ever continuing execution.
+452 
+453     When using RAII instead:
+454 
+455     \code
+456     const QSemaphoreReleaser releaser(sem);
+457     // ... do something that may throw or early return
+458     // implicitly calls sem.release() here and at every other return in between
+459     \endcode
+460 
+461     this can no longer happen, because the compiler will make sure that
+462     the QSemaphoreReleaser destructor is always called, and therefore
+463     the semaphore is always released.
+464 
+465     QSemaphoreReleaser is move-enabled and can therefore be returned
+466     from functions to transfer responsibility for releasing a semaphore
+467     out of a function or a scope:
+468 
+469     \code
+470     { // some scope
+471         QSemaphoreReleaser releaser; // does nothing
+472         // ...
+473         if (someCondition) {
+474             releaser = QSemaphoreReleaser(sem);
+475             // ...
+476         }
+477         // ...
+478     } // conditionally calls sem.release(), depending on someCondition
+479     \endcode
+480 
+481     A QSemaphoreReleaser can be canceled by a call to cancel(). A canceled
+482     semaphore releaser will no longer call QSemaphore::release() in its
+483     destructor.
+484 
+485     \sa QMutexLocker
+486 */
+487 
+488 /*!
+489     \fn QSemaphoreReleaser::QSemaphoreReleaser()
+490 
+491     Default constructor. Creates a QSemaphoreReleaser that does nothing.
+492 */
+493 
+494 /*!
+495     \fn QSemaphoreReleaser::QSemaphoreReleaser(QSemaphore &sem, int n)
+496 
+497     Constructor. Stores the arguments and calls \a{sem}.release(\a{n})
+498     in the destructor.
+499 */
+500 
+501 /*!
+502     \fn QSemaphoreReleaser::QSemaphoreReleaser(QSemaphore *sem, int n)
+503 
+504     Constructor. Stores the arguments and calls \a{sem}->release(\a{n})
+505     in the destructor.
+506 */
+507 
+508 /*!
+509     \fn QSemaphoreReleaser::QSemaphoreReleaser(QSemaphoreReleaser &&other)
+510 
+511     Move constructor. Takes over responsibility to call QSemaphore::release()
+512     from \a other, which in turn is canceled.
+513 
+514     \sa cancel()
+515 */
+516 
+517 /*!
+518     \fn QSemaphoreReleaser::operator=(QSemaphoreReleaser &&other)
+519 
+520     Move assignment operator. Takes over responsibility to call QSemaphore::release()
+521     from \a other, which in turn is canceled.
+522 
+523     If this semaphore releaser had the responsibility to call some QSemaphore::release()
+524     itself, it performs the call before taking over from \a other.
+525 
+526     \sa cancel()
+527 */
+528 
+529 /*!
+530     \fn QSemaphoreReleaser::~QSemaphoreReleaser()
+531 
+532     Unless canceled, calls QSemaphore::release() with the arguments provided
+533     to the constructor, or by the last move assignment.
+534 */
+535 
+536 /*!
+537     \fn QSemaphoreReleaser::swap(QSemaphoreReleaser &other)
+538 
+539     Exchanges the responsibilites of \c{*this} and \a other.
+540 
+541     Unlike move assignment, neither of the two objects ever releases its
+542     semaphore, if any, as a consequence of swapping.
+543 
+544     Therefore this function is very fast and never fails.
+545 */
+546 
+547 /*!
+548     \fn QSemaphoreReleaser::semaphore() const
+549 
+550     Returns a pointer to the QSemaphore object provided to the constructor,
+551     or by the last move assignment, if any. Otherwise, returns \c nullptr.
+552 */
+553 
+554 /*!
+555     \fn QSemaphoreReleaser::cancel()
+556 
+557     Cancels this QSemaphoreReleaser such that the destructor will no longer
+558     call \c{semaphore()->release()}. Returns the value of semaphore()
+559     before this call. After this call, semaphore() will return \c nullptr.
+560 
+561     To enable again, assign a new QSemaphoreReleaser:
+562 
+563     \code
+564     releaser.cancel(); // avoid releasing old semaphore()
+565     releaser = QSemaphoreReleaser(sem, 42);
+566     // now will call sem.release(42) when 'releaser' is destroyed
+567     \endcode
+568 */
+569 
+570 
+571 QT_END_NAMESPACE
+572 
+573 #endif // QT_NO_THREAD

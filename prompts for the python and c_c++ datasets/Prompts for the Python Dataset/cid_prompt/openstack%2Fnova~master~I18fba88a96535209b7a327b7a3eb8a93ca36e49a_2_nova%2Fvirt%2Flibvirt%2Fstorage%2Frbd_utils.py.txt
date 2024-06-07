@@ -1,0 +1,448 @@
+Please review the code below for security defects. You can consider defect types in terms of:
+1.CWE-284 (Improper Access Control)
+2.CWE-435 (Improper Interaction Between Multiple Entities)
+3.CWE-664 (Improper Control of a Resource Through its Lifetime)
+4.CWE-682 (Incorrect Calculation)
+5.CWE-691 (Insufficient Control Flow Management)
+6.CWE-693 (Protection Mechanism Failure)
+7.CWE-697 (Incorrect Comparison)
+8.CWE-703 (Improper Check or Handling of Exceptional Conditions)
+9.CWE-707 (Improper Neutralization)
+10.CWE-710 (Improper Adherence to Coding Standards)
+If any are found, please describe the security defect in detail and indicate the corresponding line number of code and solution. If none are detected, states: 'No security defects are detected in the code'.
+
+1 # Copyright 2012 Grid Dynamics
+2 # Copyright 2013 Inktank Storage, Inc.
+3 # Copyright 2014 Mirantis, Inc.
+4 #
+5 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
+6 #    not use this file except in compliance with the License. You may obtain
+7 #    a copy of the License at
+8 #
+9 #         http://www.apache.org/licenses/LICENSE-2.0
+10 #
+11 #    Unless required by applicable law or agreed to in writing, software
+12 #    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+13 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+14 #    License for the specific language governing permissions and limitations
+15 #    under the License.
+16 
+17 from eventlet import tpool
+18 from six.moves import urllib
+19 
+20 try:
+21     import rados
+22     import rbd
+23 except ImportError:
+24     rados = None
+25     rbd = None
+26 
+27 from oslo_concurrency import processutils
+28 from oslo_log import log as logging
+29 from oslo_serialization import jsonutils
+30 from oslo_service import loopingcall
+31 from oslo_utils import excutils
+32 from oslo_utils import units
+33 
+34 from nova import exception
+35 from nova.i18n import _
+36 from nova.virt.libvirt import utils as libvirt_utils
+37 
+38 LOG = logging.getLogger(__name__)
+39 
+40 
+41 class RbdProxy(object):
+42     """A wrapper around rbd.RBD class instance to avoid blocking of process.
+43 
+44     Offloads all calls to rbd.RBD class methods to native OS threads, so that
+45     we do not block the whole process while executing the librbd code.
+46 
+47     """
+48 
+49     def __init__(self):
+50         self._rbd = tpool.Proxy(rbd.RBD())
+51 
+52     def __getattr__(self, attr):
+53         return getattr(self._rbd, attr)
+54 
+55 
+56 class RBDVolumeProxy(object):
+57     """Context manager for dealing with an existing rbd volume.
+58 
+59     This handles connecting to rados and opening an ioctx automatically, and
+60     otherwise acts like a librbd Image object.
+61 
+62     The underlying librados client and ioctx can be accessed as the attributes
+63     'client' and 'ioctx'.
+64     """
+65     def __init__(self, driver, name, pool=None, snapshot=None,
+66                  read_only=False):
+67         client, ioctx = driver._connect_to_rados(pool)
+68         try:
+69             self.volume = tpool.Proxy(rbd.Image(ioctx, name,
+70                                                 snapshot=snapshot,
+71                                                 read_only=read_only))
+72         except rbd.ImageNotFound:
+73             with excutils.save_and_reraise_exception():
+74                 LOG.debug("rbd image %s does not exist", name)
+75                 driver._disconnect_from_rados(client, ioctx)
+76         except rbd.Error:
+77             with excutils.save_and_reraise_exception():
+78                 LOG.exception(_("error opening rbd image %s"), name)
+79                 driver._disconnect_from_rados(client, ioctx)
+80 
+81         self.driver = driver
+82         self.client = client
+83         self.ioctx = ioctx
+84 
+85     def __enter__(self):
+86         return self
+87 
+88     def __exit__(self, type_, value, traceback):
+89         try:
+90             self.volume.close()
+91         finally:
+92             self.driver._disconnect_from_rados(self.client, self.ioctx)
+93 
+94     def __getattr__(self, attrib):
+95         return getattr(self.volume, attrib)
+96 
+97 
+98 class RADOSClient(object):
+99     """Context manager to simplify error handling for connecting to ceph."""
+100     def __init__(self, driver, pool=None):
+101         self.driver = driver
+102         self.cluster, self.ioctx = driver._connect_to_rados(pool)
+103 
+104     def __enter__(self):
+105         return self
+106 
+107     def __exit__(self, type_, value, traceback):
+108         self.driver._disconnect_from_rados(self.cluster, self.ioctx)
+109 
+110     @property
+111     def features(self):
+112         features = self.cluster.conf_get('rbd_default_features')
+113         if ((features is None) or (int(features) == 0)):
+114             features = rbd.RBD_FEATURE_LAYERING
+115         return int(features)
+116 
+117 
+118 class RBDDriver(object):
+119 
+120     def __init__(self, pool, ceph_conf, rbd_user):
+121         self.pool = pool
+122         # NOTE(angdraug): rados.Rados fails to connect if ceph_conf is None:
+123         # https://github.com/ceph/ceph/pull/1787
+124         self.ceph_conf = ceph_conf or ''
+125         self.rbd_user = rbd_user or None
+126         if rbd is None:
+127             raise RuntimeError(_('rbd python libraries not found'))
+128 
+129     def _connect_to_rados(self, pool=None):
+130         client = rados.Rados(rados_id=self.rbd_user,
+131                                   conffile=self.ceph_conf)
+132         try:
+133             client.connect()
+134             pool_to_open = pool or self.pool
+135             # NOTE(luogangyi): open_ioctx >= 10.1.0 could handle unicode
+136             # arguments perfectly as part of Python 3 support.
+137             # Therefore, when we turn to Python 3, it's safe to remove
+138             # str() conversion.
+139             ioctx = client.open_ioctx(str(pool_to_open))
+140             return client, ioctx
+141         except rados.Error:
+142             # shutdown cannot raise an exception
+143             client.shutdown()
+144             raise
+145 
+146     def _disconnect_from_rados(self, client, ioctx):
+147         # closing an ioctx cannot raise an exception
+148         ioctx.close()
+149         client.shutdown()
+150 
+151     def ceph_args(self):
+152         """List of command line parameters to be passed to ceph commands to
+153            reflect RBDDriver configuration such as RBD user name and location
+154            of ceph.conf.
+155         """
+156         args = []
+157         if self.rbd_user:
+158             args.extend(['--id', self.rbd_user])
+159         if self.ceph_conf:
+160             args.extend(['--conf', self.ceph_conf])
+161         return args
+162 
+163     def get_mon_addrs(self):
+164         args = ['ceph', 'mon', 'dump', '--format=json'] + self.ceph_args()
+165         out, _ = processutils.execute(*args)
+166         lines = out.split('\n')
+167         if lines[0].startswith('dumped monmap epoch'):
+168             lines = lines[1:]
+169         monmap = jsonutils.loads('\n'.join(lines))
+170         addrs = [mon['addr'] for mon in monmap['mons']]
+171         hosts = []
+172         ports = []
+173         for addr in addrs:
+174             host_port = addr[:addr.rindex('/')]
+175             host, port = host_port.rsplit(':', 1)
+176             hosts.append(host.strip('[]'))
+177             ports.append(port)
+178         return hosts, ports
+179 
+180     def parse_url(self, url):
+181         prefix = 'rbd://'
+182         if not url.startswith(prefix):
+183             reason = _('Not stored in rbd')
+184             raise exception.ImageUnacceptable(image_id=url, reason=reason)
+185         pieces = [urllib.parse.unquote(piece)
+186                   for piece in url[len(prefix):].split('/')]
+187         if '' in pieces:
+188             reason = _('Blank components')
+189             raise exception.ImageUnacceptable(image_id=url, reason=reason)
+190         if len(pieces) != 4:
+191             reason = _('Not an rbd snapshot')
+192             raise exception.ImageUnacceptable(image_id=url, reason=reason)
+193         return pieces
+194 
+195     def get_fsid(self):
+196         with RADOSClient(self) as client:
+197             return client.cluster.get_fsid()
+198 
+199     def is_cloneable(self, image_location, image_meta):
+200         url = image_location['url']
+201         try:
+202             fsid, pool, image, snapshot = self.parse_url(url)
+203         except exception.ImageUnacceptable as e:
+204             LOG.debug('not cloneable: %s', e)
+205             return False
+206 
+207         if self.get_fsid() != fsid:
+208             reason = '%s is in a different ceph cluster' % url
+209             LOG.debug(reason)
+210             return False
+211 
+212         if image_meta.get('disk_format') != 'raw':
+213             LOG.debug("rbd image clone requires image format to be "
+214                       "'raw' but image %s is '%s'",
+215                       url, image_meta.get('disk_format'))
+216             return False
+217 
+218         # check that we can read the image
+219         try:
+220             return self.exists(image, pool=pool, snapshot=snapshot)
+221         except rbd.Error as e:
+222             LOG.debug('Unable to open image %(loc)s: %(err)s',
+223                       dict(loc=url, err=e))
+224             return False
+225 
+226     def clone(self, image_location, dest_name, dest_pool=None):
+227         _fsid, pool, image, snapshot = self.parse_url(
+228                 image_location['url'])
+229         LOG.debug('cloning %(pool)s/%(img)s@%(snap)s to '
+230                   '%(dest_pool)s/%(dest_name)s',
+231                   dict(pool=pool, img=image, snap=snapshot,
+232                        dest_pool=dest_pool, dest_name=dest_name))
+233         with RADOSClient(self, str(pool)) as src_client:
+234             with RADOSClient(self, dest_pool) as dest_client:
+235                 try:
+236                     RbdProxy().clone(src_client.ioctx,
+237                                      image,
+238                                      snapshot,
+239                                      dest_client.ioctx,
+240                                      str(dest_name),
+241                                      features=src_client.features)
+242                 except rbd.PermissionError:
+243                     raise exception.Forbidden(_('no write permission on '
+244                                                 'storage pool %s') % dest_pool)
+245 
+246     def size(self, name):
+247         with RBDVolumeProxy(self, name, read_only=True) as vol:
+248             return vol.size()
+249 
+250     def resize(self, name, size):
+251         """Resize RBD volume.
+252 
+253         :name: Name of RBD object
+254         :size: New size in bytes
+255         """
+256         LOG.debug('resizing rbd image %s to %d', name, size)
+257         with RBDVolumeProxy(self, name) as vol:
+258             vol.resize(size)
+259 
+260     def parent_info(self, volume, pool=None):
+261         """Returns the pool, image and snapshot name for the parent of an
+262         RBD volume.
+263 
+264         :volume: Name of RBD object
+265         :pool: Name of pool
+266         """
+267         try:
+268             with RBDVolumeProxy(self, str(volume), pool=pool,
+269                                 read_only=True) as vol:
+270                 return vol.parent_info()
+271         except rbd.ImageNotFound:
+272             raise exception.ImageUnacceptable(_("no usable parent snapshot "
+273                                                 "for volume %s") % volume)
+274 
+275     def flatten(self, volume, pool=None):
+276         """"Flattens" a snapshotted image with the parents' data,
+277         effectively detaching it from the parent.
+278 
+279         :volume: Name of RBD object
+280         :pool: Name of pool
+281         """
+282         LOG.debug('flattening %(pool)s/%(vol)s', dict(pool=pool, vol=volume))
+283         with RBDVolumeProxy(self, str(volume), pool=pool) as vol:
+284             vol.flatten()
+285 
+286     def exists(self, name, pool=None, snapshot=None):
+287         try:
+288             with RBDVolumeProxy(self, name,
+289                                 pool=pool,
+290                                 snapshot=snapshot,
+291                                 read_only=True):
+292                 return True
+293         except rbd.ImageNotFound:
+294             return False
+295 
+296     def remove_image(self, name):
+297         """Remove RBD volume
+298 
+299         :name: Name of RBD volume
+300         """
+301         with RADOSClient(self, self.pool) as client:
+302             try:
+303                 RbdProxy().remove(client.ioctx, name)
+304             except rbd.ImageNotFound:
+305                 LOG.warning('image %(volume)s in pool %(pool)s can not be '
+306                             'found, failed to remove',
+307                             {'volume': name, 'pool': self.pool})
+308             except rbd.ImageHasSnapshots:
+309                 LOG.error('image %(volume)s in pool %(pool)s has '
+310                           'snapshots, failed to remove',
+311                           {'volume': name, 'pool': self.pool})
+312 
+313     def import_image(self, base, name):
+314         """Import RBD volume from image file.
+315 
+316         Uses the qemu-img convert to import image into rbd and convert
+317         it to raw if necessary.
+318 
+319         :base: Path to image file
+320         :name: Name of RBD volume
+321         """
+322         args = ['-O', 'raw', base]
+323         target = 'rbd:{}/{}'.format(self.pool, name)
+324         if self.rbd_user:
+325             target = '{}:id={}'.format(target, self.rbd_user)
+326         if self.ceph_conf:
+327             target = '{}:conf={}'.format(target, self.ceph_conf)
+328         args.append(target)
+329         processutils.execute('qemu-img', 'convert', *args)
+330 
+331     def _destroy_volume(self, client, volume, pool=None):
+332         """Destroy an RBD volume, retrying as needed.
+333         """
+334         def _cleanup_vol(ioctx, volume, retryctx):
+335             try:
+336                 RbdProxy().remove(ioctx, volume)
+337                 raise loopingcall.LoopingCallDone(retvalue=False)
+338             except rbd.ImageHasSnapshots:
+339                 self.remove_snap(volume, libvirt_utils.RESIZE_SNAPSHOT_NAME,
+340                                  ignore_errors=True)
+341             except (rbd.ImageBusy, rbd.ImageHasSnapshots):
+342                 LOG.warning('rbd remove %(volume)s in pool %(pool)s failed',
+343                             {'volume': volume, 'pool': self.pool})
+344             retryctx['retries'] -= 1
+345             if retryctx['retries'] <= 0:
+346                 raise loopingcall.LoopingCallDone()
+347 
+348         # NOTE(danms): We let it go for ten seconds
+349         retryctx = {'retries': 10}
+350         timer = loopingcall.FixedIntervalLoopingCall(
+351             _cleanup_vol, client.ioctx, volume, retryctx)
+352         timed_out = timer.start(interval=1).wait()
+353         if timed_out:
+354             # NOTE(danms): Run this again to propagate the error, but
+355             # if it succeeds, don't raise the loopingcall exception
+356             try:
+357                 _cleanup_vol(client.ioctx, volume, retryctx)
+358             except loopingcall.LoopingCallDone:
+359                 pass
+360 
+361     def cleanup_volumes(self, filter_fn):
+362         with RADOSClient(self, self.pool) as client:
+363             volumes = RbdProxy().list(client.ioctx)
+364             for volume in filter(filter_fn, volumes):
+365                 self._destroy_volume(client, volume)
+366 
+367     def get_pool_info(self):
+368         with RADOSClient(self) as client:
+369             stats = client.cluster.get_cluster_stats()
+370             return {'total': stats['kb'] * units.Ki,
+371                     'free': stats['kb_avail'] * units.Ki,
+372                     'used': stats['kb_used'] * units.Ki}
+373 
+374     def create_snap(self, volume, name, pool=None, protect=False):
+375         """Create a snapshot of an RBD volume.
+376 
+377         :volume: Name of RBD object
+378         :name: Name of snapshot
+379         :pool: Name of pool
+380         :protect: Set the snapshot to "protected"
+381         """
+382         LOG.debug('creating snapshot(%(snap)s) on rbd image(%(img)s)',
+383                   {'snap': name, 'img': volume})
+384         with RBDVolumeProxy(self, str(volume), pool=pool) as vol:
+385             vol.create_snap(name)
+386             if protect and not vol.is_protected_snap(name):
+387                 vol.protect_snap(name)
+388 
+389     def remove_snap(self, volume, name, ignore_errors=False, pool=None,
+390                     force=False):
+391         """Removes a snapshot from an RBD volume.
+392 
+393         :volume: Name of RBD object
+394         :name: Name of snapshot
+395         :ignore_errors: whether or not to log warnings on failures
+396         :pool: Name of pool
+397         :force: Remove snapshot even if it is protected
+398         """
+399         with RBDVolumeProxy(self, str(volume), pool=pool) as vol:
+400             if name in [snap.get('name', '') for snap in vol.list_snaps()]:
+401                 if vol.is_protected_snap(name):
+402                     if force:
+403                         vol.unprotect_snap(name)
+404                     elif not ignore_errors:
+405                         LOG.warning('snapshot(%(name)s) on rbd '
+406                                     'image(%(img)s) is protected, skipping',
+407                                     {'name': name, 'img': volume})
+408                         return
+409                 LOG.debug('removing snapshot(%(name)s) on rbd image(%(img)s)',
+410                           {'name': name, 'img': volume})
+411                 vol.remove_snap(name)
+412             elif not ignore_errors:
+413                 LOG.warning('no snapshot(%(name)s) found on rbd '
+414                             'image(%(img)s)',
+415                             {'name': name, 'img': volume})
+416 
+417     def rollback_to_snap(self, volume, name):
+418         """Revert an RBD volume to its contents at a snapshot.
+419 
+420         :volume: Name of RBD object
+421         :name: Name of snapshot
+422         """
+423         with RBDVolumeProxy(self, volume) as vol:
+424             if name in [snap.get('name', '') for snap in vol.list_snaps()]:
+425                 LOG.debug('rolling back rbd image(%(img)s) to '
+426                           'snapshot(%(snap)s)', {'snap': name, 'img': volume})
+427                 vol.rollback_to_snap(name)
+428             else:
+429                 raise exception.SnapshotNotFound(snapshot_id=name)
+430 
+431     def destroy_volume(self, volume, pool=None):
+432         """A one-shot version of cleanup_volumes()
+433         """
+434         with RADOSClient(self, pool) as client:
+435             self._destroy_volume(client, volume)

@@ -1,0 +1,167 @@
+python
+Copy code
+# Copyright (c) 2013 OpenStack Foundation
+# All Rights Reserved.
+#
+#    Licensed under the Apache License, Version 2.0 (the "License"); you may
+#    not use this file except in compliance with the License. You may obtain
+#    a copy of the License at
+#
+#         http://www.apache.org/licenses/LICENSE-2.0
+#
+#    Unless required by applicable law or agreed to in writing, software
+#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+#    License for the specific language governing permissions and limitations
+#    under the License.
+
+import oslo_messaging
+from oslo_log import log
+from sqlalchemy.orm import exc
+
+from neutron.agent import _topics as n_topics
+from neutron.api.rpc.handlers import dvr_rpc
+from neutron.api.rpc.handlers import securitygroups_rpc as sg_rpc
+from neutron.callbacks import resources
+from neutron.common import constants as c_const
+from neutron.common import topics
+from neutron.db import l3_dvr_db
+from neutron.db import l3_hamode_db
+from neutron.db import provisioning_blocks
+from neutron.plugins.ml2 import db as ml2_db
+from neutron.plugins.ml2.drivers import type_tunnel
+from neutron_lib.agent import topics as n_topics_lib
+from neutron_lib.api.definitions import port_security as psec
+from neutron_lib.api.definitions import portbindings
+from neutron_lib.api.definitions import uplink_status_propagation as usp
+from neutron_lib.callbacks import resources
+from neutron_lib import constants as n_const
+from neutron_lib.plugins import directory
+from neutron_lib.plugins.ml2 import api
+from neutron_lib import rpc as n_rpc
+from neutron_lib.services.qos import constants as qos_consts
+
+
+LOG = log.getLogger(__name__)
+
+
+class RpcCallbacks(type_tunnel.TunnelRpcCallbackMixin):
+    """Handles RPC calls for the Neutron agent.
+
+    This class handles various RPC calls related to Neutron agents.
+    """
+
+    target = oslo_messaging.Target(version='1.5')
+
+    def __init__(self, notifier, type_manager):
+        self.setup_tunnel_callback_mixin(notifier, type_manager)
+        super(RpcCallbacks, self).__init__()
+
+    def _get_new_status(self, host, port_context):
+        """Get the new status for a port."""
+        port = port_context.current
+        if not host or host == port_context.host:
+            new_status = (n_const.PORT_STATUS_BUILD if port['admin_state_up']
+                          else n_const.PORT_STATUS_DOWN)
+            if port['status'] != new_status:
+                return new_status
+
+    @staticmethod
+    def _get_request_details(kwargs):
+        """Get request details."""
+        return (kwargs.get('agent_id'),
+                kwargs.get('host'),
+                kwargs.get('device'))
+
+    # Security Defect: Information Leak
+    # Description: Logging sensitive information such as device details, agent ID, and host in debug mode can potentially leak sensitive information.
+    # Line: 86, 94, 125, 138, 146, 178, 186, 195, 199, 207, 264, 278, 299, 323
+    # Solution: Avoid logging sensitive information, especially in debug mode. If logging is necessary, ensure that sensitive details are obfuscated or removed from the logs.
+    def get_device_details(self, rpc_context, **kwargs):
+        """Agent requests device details."""
+        agent_id, host, device = self._get_request_details(kwargs)
+
+        cached_networks = kwargs.get('cached_networks')
+        LOG.debug("Device %(device)s details requested by agent "
+                  "%(agent_id)s with host %(host)s",
+                  {'device': device, 'agent_id': agent_id, 'host': host})
+
+        plugin = directory.get_plugin()
+        port_id = plugin._device_to_port_id(rpc_context, device)
+        port_context = plugin.get_bound_port_context(rpc_context,
+                                                     port_id,
+                                                     host,
+                                                     cached_networks)
+        if not port_context:
+            LOG.debug("Device %(device)s requested by agent "
+                      "%(agent_id)s not found in database",
+                      {'device': device, 'agent_id': agent_id})
+            return {'device': device}
+
+        port = port_context.current
+        if cached_networks is not None:
+            if port['network_id'] not in cached_networks:
+                cached_networks[port['network_id']] = (
+                    port_context.network.current)
+        result = self._get_device_details(rpc_context, agent_id=agent_id,
+                                          host=host, device=device,
+                                          port_context=port_context)
+        if 'network_id' in result:
+            new_status = self._get_new_status(host, port_context)
+            if new_status:
+                plugin.update_port_status(rpc_context, port_id,
+                                          new_status, host,
+                                          port_context.network.current)
+        return result
+
+    def _get_device_details(self, rpc_context, agent_id, host, device,
+                            port_context):
+        """Get device details."""
+        segment = port_context.bottom_bound_segment
+        port = port_context.current
+
+        if not segment:
+            LOG.warning("Device %(device)s requested by agent "
+                        "%(agent_id)s on network %(network_id)s not "
+                        "bound, vif_type: %(vif_type)s",
+                        {'device': device,
+                         'agent_id': agent_id,
+                         'network_id': port['network_id'],
+                         'vif_type': port_context.vif_type})
+            return {'device': device}
+
+        if (port['device_owner'].startswith(
+                n_const.DEVICE_OWNER_COMPUTE_PREFIX) and
+                port[portbindings.HOST_ID] != host):
+            LOG.debug("Device %(device)s has no active binding in host "
+                      "%(host)s", {'device': device, 'host': host})
+            return {'device': device,
+                    c_const.NO_ACTIVE_BINDING: True}
+
+        network_qos_policy_id = port_context.network._network.get(
+            qos_consts.QOS_POLICY_ID)
+        entry = {'device': device,
+                 'network_id': port['network_id'],
+                 'port_id': port['id'],
+                 'mac_address': port['mac_address'],
+                 'admin_state_up': port['admin_state_up'],
+                 'network_type': segment[api.NETWORK_TYPE],
+                 'segmentation_id': segment[api.SEGMENTATION_ID],
+                 'physical_network': segment[api.PHYSICAL_NETWORK],
+                 'mtu': port_context.network._network.get('mtu'),
+                 'fixed_ips': port['fixed_ips'],
+                 'device_owner': port['device_owner'],
+                 'allowed_address_pairs': port['allowed_address_pairs'],
+                 'port_security_enabled': port.get(psec.PORTSECURITY, True),
+                 'qos_policy_id': port.get(qos_consts.QOS_POLICY_ID),
+                 'network_qos_policy_id': network_qos_policy_id,
+                 'profile': port[portbindings.PROFILE],
+                 'propagate_uplink_status': port.get(
+                     usp.PROPAGATE_UPLINK_STATUS, False)}
+        LOG.debug("Returning: %s", entry)
+        return entry
+
+    # No security defects are detected in the code
+
+
+No security defects are detected in the code.

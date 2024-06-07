@@ -1,0 +1,891 @@
+Based on the given code from a commit, please generate supplementary code files according to the commit message.
+####commit message
+forkfd: use SA_SIGINFO to pass extra information to chained handlers
+
+This existed in QProcess before forkfd, but was lost in the port to it
+(commit 1814142b7a11befab315bf3f9d91c4ffbf56ef3e). The original QProcess
+fix was done in 97279d05822a70da1fb3dab083d823a5f5a008fe.
+
+Task-number: QTBUG-57584
+Change-Id: Ibc5c715fda334a75bd2efffd14a425871f3162b5
+
+####code 
+1 /****************************************************************************
+2 **
+3 ** Copyright (C) 2016 Intel Corporation.
+4 ** Copyright (C) 2015 Klarälvdalens Datakonsult AB, a KDAB Group company, info@kdab.com
+5 **
+6 ** Permission is hereby granted, free of charge, to any person obtaining a copy
+7 ** of this software and associated documentation files (the "Software"), to deal
+8 ** in the Software without restriction, including without limitation the rights
+9 ** to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+10 ** copies of the Software, and to permit persons to whom the Software is
+11 ** furnished to do so, subject to the following conditions:
+12 **
+13 ** The above copyright notice and this permission notice shall be included in
+14 ** all copies or substantial portions of the Software.
+15 **
+16 ** THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+17 ** IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+18 ** FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+19 ** AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+20 ** LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+21 ** OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+22 ** THE SOFTWARE.
+23 **
+24 ****************************************************************************/
+25 
+26 #ifndef _GNU_SOURCE
+27 #  define _GNU_SOURCE
+28 #endif
+29 
+30 #include "forkfd.h"
+31 
+32 #include <sys/types.h>
+33 #if defined(__OpenBSD__) || defined(__NetBSD__)
+34 #  include <sys/param.h>
+35 #endif
+36 #include <sys/time.h>
+37 #include <sys/resource.h>
+38 #include <sys/wait.h>
+39 #include <assert.h>
+40 #include <errno.h>
+41 #include <pthread.h>
+42 #include <signal.h>
+43 #include <stdlib.h>
+44 #include <string.h>
+45 #include <time.h>
+46 #include <unistd.h>
+47 
+48 #ifdef __linux__
+49 #  define HAVE_WAIT4    1
+50 #  if defined(__BIONIC__) || (defined(__GLIBC__) && (__GLIBC__ << 8) + __GLIBC_MINOR__ >= 0x207 && \
+51        (!defined(__UCLIBC__) || ((__UCLIBC_MAJOR__ << 16) + (__UCLIBC_MINOR__ << 8) + __UCLIBC_SUBLEVEL__ > 0x90201)))
+52 #    include <sys/eventfd.h>
+53 #    define HAVE_EVENTFD  1
+54 #  endif
+55 #  if defined(__BIONIC__) || (defined(__GLIBC__) && (__GLIBC__ << 8) + __GLIBC_MINOR__ >= 0x209 && \
+56        (!defined(__UCLIBC__) || ((__UCLIBC_MAJOR__ << 16) + (__UCLIBC_MINOR__ << 8) + __UCLIBC_SUBLEVEL__ > 0x90201)))
+57 #    define HAVE_PIPE2    1
+58 #  endif
+59 #endif
+60 #if defined(__FreeBSD__) && __FreeBSD__ >= 9
+61 #  include <sys/procdesc.h>
+62 #endif
+63 
+64 #if _POSIX_VERSION-0 >= 200809L || _XOPEN_VERSION-0 >= 500
+65 #  define HAVE_WAITID   1
+66 #endif
+67 #if !defined(WEXITED) || !defined(WNOWAIT)
+68 #  undef HAVE_WAITID
+69 #endif
+70 
+71 #if (defined(__FreeBSD__) && defined(__FreeBSD_version) && __FreeBSD_version >= 1000032) || \
+72     (defined(__OpenBSD__) && OpenBSD >= 201505) || \
+73     (defined(__NetBSD__) && __NetBSD_Version__ >= 600000000)
+74 #  define HAVE_PIPE2    1
+75 #endif
+76 #if defined(__FreeBSD__) || defined(__DragonFly__) || defined(__FreeBSD_kernel__) || \
+77     defined(__OpenBSD__) || defined(__NetBSD__) || defined(__APPLE__)
+78 #  define HAVE_WAIT4    1
+79 #endif
+80 
+81 #if defined(__APPLE__)
+82 /* Up until OS X 10.7, waitid(P_ALL, ...) will return success, but will not
+83  * fill in the details of the dead child. That means waitid is not useful to us.
+84  * Therefore, we only enable waitid() support if we're targetting OS X 10.8 or
+85  * later.
+86  */
+87 #  include <Availability.h>
+88 #  include <AvailabilityMacros.h>
+89 #  if MAC_OS_X_VERSION_MIN_REQUIRED <= 1070
+90 #    define HAVE_BROKEN_WAITID 1
+91 #  endif
+92 #endif
+93 
+94 #ifndef FFD_ATOMIC_RELAXED
+95 #  include "forkfd_gcc.h"
+96 #endif
+97 
+98 #define CHILDREN_IN_SMALL_ARRAY     16
+99 #define CHILDREN_IN_BIG_ARRAY       256
+100 #define sizeofarray(array)          (sizeof(array)/sizeof(array[0]))
+101 #define EINTR_LOOP(ret, call) \
+102     do {                      \
+103         ret = call;           \
+104     } while (ret == -1 && errno == EINTR)
+105 
+106 struct pipe_payload
+107 {
+108     struct forkfd_info info;
+109     struct rusage rusage;
+110 };
+111 
+112 typedef struct process_info
+113 {
+114     ffd_atomic_int pid;
+115     int deathPipe;
+116 } ProcessInfo;
+117 
+118 struct BigArray;
+119 typedef struct Header
+120 {
+121     ffd_atomic_pointer(struct BigArray) nextArray;
+122     ffd_atomic_int busyCount;
+123 } Header;
+124 
+125 typedef struct BigArray
+126 {
+127     Header header;
+128     ProcessInfo entries[CHILDREN_IN_BIG_ARRAY];
+129 } BigArray;
+130 
+131 typedef struct SmallArray
+132 {
+133     Header header;
+134     ProcessInfo entries[CHILDREN_IN_SMALL_ARRAY];
+135 } SmallArray;
+136 static SmallArray children;
+137 
+138 static struct sigaction old_sigaction;
+139 static pthread_once_t forkfd_initialization = PTHREAD_ONCE_INIT;
+140 static ffd_atomic_int forkfd_status = FFD_ATOMIC_INIT(0);
+141 
+142 #ifdef HAVE_BROKEN_WAITID
+143 static int waitid_works = 0;
+144 #else
+145 static const int waitid_works = 1;
+146 #endif
+147 
+148 static ProcessInfo *tryAllocateInSection(Header *header, ProcessInfo entries[], int maxCount)
+149 {
+150     /* we use ACQUIRE here because the signal handler might have released the PID */
+151     int busyCount = ffd_atomic_add_fetch(&header->busyCount, 1, FFD_ATOMIC_ACQUIRE);
+152     if (busyCount <= maxCount) {
+153         /* there's an available entry in this section, find it and take it */
+154         int i;
+155         for (i = 0; i < maxCount; ++i) {
+156             /* if the PID is 0, it's free; mark it as used by swapping it with -1 */
+157             int expected_pid = 0;
+158             if (ffd_atomic_compare_exchange(&entries[i].pid, &expected_pid,
+159                                             -1, FFD_ATOMIC_RELAXED, FFD_ATOMIC_RELAXED))
+160                 return &entries[i];
+161         }
+162     }
+163 
+164     /* there isn't an available entry, undo our increment */
+165     (void)ffd_atomic_add_fetch(&header->busyCount, -1, FFD_ATOMIC_RELAXED);
+166     return NULL;
+167 }
+168 
+169 static ProcessInfo *allocateInfo(Header **header)
+170 {
+171     Header *currentHeader = &children.header;
+172 
+173     /* try to find an available entry in the small array first */
+174     ProcessInfo *info =
+175             tryAllocateInSection(currentHeader, children.entries, sizeofarray(children.entries));
+176 
+177     /* go on to the next arrays */
+178     while (info == NULL) {
+179         BigArray *array = ffd_atomic_load(&currentHeader->nextArray, FFD_ATOMIC_ACQUIRE);
+180         if (array == NULL) {
+181             /* allocate an array and try to use it */
+182             BigArray *allocatedArray = (BigArray *)calloc(1, sizeof(BigArray));
+183             if (allocatedArray == NULL)
+184                 return NULL;
+185 
+186             if (ffd_atomic_compare_exchange(&currentHeader->nextArray, &array, allocatedArray,
+187                                              FFD_ATOMIC_RELEASE, FFD_ATOMIC_ACQUIRE)) {
+188                 /* success */
+189                 array = allocatedArray;
+190             } else {
+191                 /* failed, the atomic updated 'array' */
+192                 free(allocatedArray);
+193             }
+194         }
+195 
+196         currentHeader = &array->header;
+197         info = tryAllocateInSection(currentHeader, array->entries, sizeofarray(array->entries));
+198     }
+199 
+200     *header = currentHeader;
+201     return info;
+202 }
+203 
+204 #ifdef HAVE_WAITID
+205 static int isChildReady(pid_t pid, siginfo_t *info)
+206 {
+207     info->si_pid = 0;
+208     return waitid(P_PID, pid, info, WEXITED | WNOHANG | WNOWAIT) == 0 && info->si_pid == pid;
+209 }
+210 #endif
+211 
+212 static void convertStatusToForkfdInfo(int status, struct forkfd_info *info)
+213 {
+214     if (WIFEXITED(status)) {
+215         info->code = CLD_EXITED;
+216         info->status = WEXITSTATUS(status);
+217     } else if (WIFSIGNALED(status)) {
+218         info->code = CLD_KILLED;
+219 #  ifdef WCOREDUMP
+220         if (WCOREDUMP(status))
+221             info->code = CLD_DUMPED;
+222 #  endif
+223         info->status = WTERMSIG(status);
+224     }
+225 }
+226 
+227 static int tryReaping(pid_t pid, struct pipe_payload *payload)
+228 {
+229     /* reap the child */
+230 #if defined(HAVE_WAIT4)
+231     int status;
+232     if (wait4(pid, &status, WNOHANG, &payload->rusage) <= 0)
+233         return 0;
+234     convertStatusToForkfdInfo(status, &payload->info);
+235 #else
+236 #  if defined(HAVE_WAITID)
+237     if (waitid_works) {
+238         /* we have waitid(2), which gets us some payload values on some systems */
+239         siginfo_t info;
+240         info.si_pid = 0;
+241         int ret = waitid(P_PID, pid, &info, WEXITED | WNOHANG) == 0 && info.si_pid == pid;
+242         if (!ret)
+243             return ret;
+244 
+245         payload->info.code = info.si_code;
+246         payload->info.status = info.si_status;
+247 #    ifdef __linux__
+248         payload->rusage.ru_utime.tv_sec = info.si_utime / CLOCKS_PER_SEC;
+249         payload->rusage.ru_utime.tv_usec = info.si_utime % CLOCKS_PER_SEC;
+250         payload->rusage.ru_stime.tv_sec = info.si_stime / CLOCKS_PER_SEC;
+251         payload->rusage.ru_stime.tv_usec = info.si_stime % CLOCKS_PER_SEC;
+252 #    endif
+253         return 1;
+254     }
+255 #  endif // HAVE_WAITID
+256     int status;
+257     if (waitpid(pid, &status, WNOHANG) <= 0)
+258         return 0;     // child did not change state
+259     convertStatusToForkfdInfo(status, &payload->info);
+260 #endif // !HAVE_WAIT4
+261 
+262     return 1;
+263 }
+264 
+265 static void freeInfo(Header *header, ProcessInfo *entry)
+266 {
+267     entry->deathPipe = -1;
+268     entry->pid = 0;
+269 
+270     (void)ffd_atomic_add_fetch(&header->busyCount, -1, FFD_ATOMIC_RELEASE);
+271     assert(header->busyCount >= 0);
+272 }
+273 
+274 static void notifyAndFreeInfo(Header *header, ProcessInfo *entry,
+275                               const struct pipe_payload *payload)
+276 {
+277     ssize_t ret;
+278     EINTR_LOOP(ret, write(entry->deathPipe, payload, sizeof(*payload)));
+279     EINTR_LOOP(ret, close(entry->deathPipe));
+280 
+281     freeInfo(header, entry);
+282 }
+283 
+284 static void sigchld_handler(int signum, siginfo_t *handler_info, void *handler_context)
+285 {
+286     /*
+287      * This is a signal handler, so we need to be careful about which functions
+288      * we can call. See the full, official listing in the POSIX.1-2008
+289      * specification at:
+290      *   http://pubs.opengroup.org/onlinepubs/9699919799/functions/V2_chap02.html#tag_15_04_03
+291      *
+292      * The handler_info and handler_context parameters may not be valid, if
+293      * we're a chained handler from another handler that did not use
+294      * SA_SIGINFO. Therefore, we must obtain the siginfo ourselves directly by
+295      * calling waitid.
+296      *
+297      * But we pass them anyway. Let's call the chained handler first, while
+298      * those two arguments have a chance of being correct.
+299      */
+300     if (old_sigaction.sa_flags & SA_SIGINFO)
+301         old_sigaction.sa_sigaction(signum, handler_info, handler_context);
+302     else if (old_sigaction.sa_handler != SIG_IGN && old_sigaction.sa_handler != SIG_DFL)
+303         old_sigaction.sa_handler(signum);
+304 
+305     if (ffd_atomic_load(&forkfd_status, FFD_ATOMIC_RELAXED) == 1) {
+306         /* is this one of our children? */
+307         BigArray *array;
+308         siginfo_t info;
+309         struct pipe_payload payload;
+310         int i;
+311 
+312         memset(&info, 0, sizeof info);
+313         memset(&payload, 0, sizeof payload);
+314 
+315 #ifdef HAVE_WAITID
+316         if (!waitid_works)
+317             goto search_arrays;
+318 
+319         /* be optimistic: try to see if we can get the child that exited */
+320 search_next_child:
+321         /* waitid returns -1 ECHILD if there are no further children at all;
+322          * it returns 0 and sets si_pid to 0 if there are children but they are not ready
+323          * to be waited (we're passing WNOHANG). We should not get EINTR because
+324          * we're passing WNOHANG and we should definitely not get EINVAL or anything else.
+325          * That means we can actually ignore the return code and only inspect si_pid.
+326          */
+327         info.si_pid = 0;
+328         waitid(P_ALL, 0, &info, WNOHANG | WNOWAIT | WEXITED);
+329         if (info.si_pid == 0) {
+330             /* there are no further un-waited-for children, so we can just exit.
+331              */
+332             return;
+333         }
+334 
+335         for (i = 0; i < (int)sizeofarray(children.entries); ++i) {
+336             /* acquire the child first: swap the PID with -1 to indicate it's busy */
+337             int pid = info.si_pid;
+338             if (ffd_atomic_compare_exchange(&children.entries[i].pid, &pid, -1,
+339                                             FFD_ATOMIC_ACQUIRE, FFD_ATOMIC_RELAXED)) {
+340                 /* this is our child, send notification and free up this entry */
+341                 /* ### FIXME: what if tryReaping returns false? */
+342                 if (tryReaping(pid, &payload))
+343                     notifyAndFreeInfo(&children.header, &children.entries[i], &payload);
+344                 goto search_next_child;
+345             }
+346         }
+347 
+348         /* try the arrays */
+349         array = ffd_atomic_load(&children.header.nextArray, FFD_ATOMIC_ACQUIRE);
+350         while (array != NULL) {
+351             for (i = 0; i < (int)sizeofarray(array->entries); ++i) {
+352                 int pid = info.si_pid;
+353                 if (ffd_atomic_compare_exchange(&array->entries[i].pid, &pid, -1,
+354                                                 FFD_ATOMIC_ACQUIRE, FFD_ATOMIC_RELAXED)) {
+355                     /* this is our child, send notification and free up this entry */
+356                     /* ### FIXME: what if tryReaping returns false? */
+357                     if (tryReaping(pid, &payload))
+358                         notifyAndFreeInfo(&array->header, &array->entries[i], &payload);
+359                     goto search_next_child;
+360                 }
+361             }
+362 
+363             array = ffd_atomic_load(&array->header.nextArray, FFD_ATOMIC_ACQUIRE);
+364         }
+365 
+366         /* if we got here, we couldn't find this child in our list. That means this child
+367          * belongs to one of the chained SIGCHLD handlers. However, there might be another
+368          * child that exited and does belong to us, so we need to check each one individually.
+369          */
+370 
+371 search_arrays:
+372 #endif
+373 
+374         for (i = 0; i < (int)sizeofarray(children.entries); ++i) {
+375             int pid = ffd_atomic_load(&children.entries[i].pid, FFD_ATOMIC_ACQUIRE);
+376             if (pid <= 0)
+377                 continue;
+378 #ifdef HAVE_WAITID
+379             if (waitid_works) {
+380                 /* The child might have been reaped by the block above in another thread,
+381                  * so first check if it's ready and, if it is, lock it */
+382                 if (!isChildReady(pid, &info) ||
+383                         !ffd_atomic_compare_exchange(&children.entries[i].pid, &pid, -1,
+384                                                      FFD_ATOMIC_RELAXED, FFD_ATOMIC_RELAXED))
+385                     continue;
+386             }
+387 #endif
+388             if (tryReaping(pid, &payload)) {
+389                 /* this is our child, send notification and free up this entry */
+390                 notifyAndFreeInfo(&children.header, &children.entries[i], &payload);
+391             }
+392         }
+393 
+394         /* try the arrays */
+395         array = ffd_atomic_load(&children.header.nextArray, FFD_ATOMIC_ACQUIRE);
+396         while (array != NULL) {
+397             for (i = 0; i < (int)sizeofarray(array->entries); ++i) {
+398                 int pid = ffd_atomic_load(&array->entries[i].pid, FFD_ATOMIC_ACQUIRE);
+399                 if (pid <= 0)
+400                     continue;
+401 #ifdef HAVE_WAITID
+402                 if (waitid_works) {
+403                     /* The child might have been reaped by the block above in another thread,
+404                      * so first check if it's ready and, if it is, lock it */
+405                     if (!isChildReady(pid, &info) ||
+406                             !ffd_atomic_compare_exchange(&array->entries[i].pid, &pid, -1,
+407                                                          FFD_ATOMIC_RELAXED, FFD_ATOMIC_RELAXED))
+408                         continue;
+409                 }
+410 #endif
+411                 if (tryReaping(pid, &payload)) {
+412                     /* this is our child, send notification and free up this entry */
+413                     notifyAndFreeInfo(&array->header, &array->entries[i], &payload);
+414                 }
+415             }
+416 
+417             array = ffd_atomic_load(&array->header.nextArray, FFD_ATOMIC_ACQUIRE);
+418         }
+419     }
+420 }
+421 
+422 static void ignore_sigpipe()
+423 {
+424 #ifdef O_NOSIGPIPE
+425     static ffd_atomic_int done = FFD_ATOMIC_INIT(0);
+426     if (ffd_atomic_load(&done, FFD_ATOMIC_RELAXED))
+427         return;
+428 #endif
+429 
+430     struct sigaction action;
+431     memset(&action, 0, sizeof action);
+432     sigemptyset(&action.sa_mask);
+433     action.sa_handler = SIG_IGN;
+434     action.sa_flags = 0;
+435     sigaction(SIGPIPE, &action, NULL);
+436 
+437 #ifdef O_NOSIGPIPE
+438     ffd_atomic_store(&done, 1, FFD_ATOMIC_RELAXED);
+439 #endif
+440 }
+441 
+442 static void forkfd_initialize()
+443 {
+444 #if defined(HAVE_BROKEN_WAITID)
+445     pid_t pid = fork();
+446     if (pid == 0) {
+447         _exit(0);
+448     } else if (pid > 0) {
+449         siginfo_t info;
+450         waitid(P_ALL, 0, &info, WNOWAIT | WEXITED);
+451         waitid_works = (info.si_pid != 0);
+452         info.si_pid = 0;
+453 
+454         // now really reap the child
+455         waitid(P_PID, pid, &info, WEXITED);
+456         waitid_works = waitid_works && (info.si_pid != 0);
+457     }
+458 #endif
+459 
+460     /* install our signal handler */
+461     struct sigaction action;
+462     memset(&action, 0, sizeof action);
+463     sigemptyset(&action.sa_mask);
+464     action.sa_flags = SA_NOCLDSTOP | SA_SIGINFO;
+465     action.sa_sigaction = sigchld_handler;
+466 
+467     /* ### RACE CONDITION
+468      * The sigaction function does a memcpy from an internal buffer
+469      * to old_sigaction, which we use in the SIGCHLD handler. If a
+470      * SIGCHLD is delivered before or during that memcpy, the handler will
+471      * see an inconsistent state.
+472      *
+473      * There is no solution. pthread_sigmask doesn't work here because the
+474      * signal could be delivered to another thread.
+475      */
+476     sigaction(SIGCHLD, &action, &old_sigaction);
+477 
+478 #ifndef O_NOSIGPIPE
+479     /* disable SIGPIPE too */
+480     ignore_sigpipe();
+481 #endif
+482 
+483 #ifndef __GNUC__
+484     atexit(cleanup);
+485 #endif
+486 
+487     ffd_atomic_store(&forkfd_status, 1, FFD_ATOMIC_RELAXED);
+488 }
+489 
+490 #ifdef __GNUC__
+491 __attribute((destructor, unused)) static void cleanup();
+492 #endif
+493 
+494 static void cleanup()
+495 {
+496     BigArray *array;
+497     /* This function is not thread-safe!
+498      * It must only be called when the process is shutting down.
+499      * At shutdown, we expect no one to be calling forkfd(), so we don't
+500      * need to be thread-safe with what is done there.
+501      *
+502      * But SIGCHLD might be delivered to any thread, including this one.
+503      * There's no way to prevent that. The correct solution would be to
+504      * cooperatively delete. We don't do that.
+505      */
+506     if (ffd_atomic_load(&forkfd_status, FFD_ATOMIC_RELAXED) == 0)
+507         return;
+508 
+509     /* notify the handler that we're no longer in operation */
+510     ffd_atomic_store(&forkfd_status, 0, FFD_ATOMIC_RELAXED);
+511 
+512     /* free any arrays we might have */
+513     array = children.header.nextArray;
+514     while (array != NULL) {
+515         BigArray *next = array->header.nextArray;
+516         free(array);
+517         array = next;
+518     }
+519 }
+520 
+521 static int create_pipe(int filedes[], int flags)
+522 {
+523     int ret = -1;
+524 #ifdef HAVE_PIPE2
+525     /* use pipe2(2) whenever possible, since it can thread-safely create a
+526      * cloexec pair of pipes. Without it, we have a race condition setting
+527      * FD_CLOEXEC
+528      */
+529 
+530 #  ifdef O_NOSIGPIPE
+531     /* try first with O_NOSIGPIPE */
+532     ret = pipe2(filedes, O_CLOEXEC | O_NOSIGPIPE);
+533     if (ret == -1) {
+534         /* O_NOSIGPIPE not supported, ignore SIGPIPE */
+535         ignore_sigpipe();
+536     }
+537 #  endif
+538     if (ret == -1)
+539         ret = pipe2(filedes, O_CLOEXEC);
+540     if (ret == -1)
+541         return ret;
+542 
+543     if ((flags & FFD_CLOEXEC) == 0)
+544         fcntl(filedes[0], F_SETFD, 0);
+545 #else
+546     ret = pipe(filedes);
+547     if (ret == -1)
+548         return ret;
+549 
+550     fcntl(filedes[1], F_SETFD, FD_CLOEXEC);
+551     if (flags & FFD_CLOEXEC)
+552         fcntl(filedes[0], F_SETFD, FD_CLOEXEC);
+553 #endif
+554     if (flags & FFD_NONBLOCK)
+555         fcntl(filedes[0], F_SETFL, fcntl(filedes[0], F_GETFL) | O_NONBLOCK);
+556     return ret;
+557 }
+558 
+559 #if defined(FORKFD_NO_SPAWNFD) && defined(__FreeBSD__) && __FreeBSD__ >= 9
+560 #  if __FreeBSD__ == 9
+561 /* PROCDESC is an optional feature in the kernel and wasn't enabled
+562  * by default on FreeBSD 9. So we need to check for it at runtime. */
+563 static ffd_atomic_int system_has_forkfd = FFD_ATOMIC_INIT(1);
+564 #  else
+565 /* On FreeBSD 10, PROCDESC was enabled by default. On v11, it's not an option
+566  * anymore and can't be disabled. */
+567 static const int system_has_forkfd = 1;
+568 #  endif
+569 
+570 static int system_forkfd(int flags, pid_t *ppid)
+571 {
+572     int ret;
+573     pid_t pid;
+574     pid = pdfork(&ret, PD_DAEMON);
+575     if (__builtin_expect(pid == -1, 0)) {
+576 #  if __FreeBSD__ == 9
+577         if (errno == ENOSYS) {
+578             /* PROCDESC wasn't compiled into the kernel: don't try it again. */
+579             ffd_atomic_store(&system_has_forkfd, 0, FFD_ATOMIC_RELAXED);
+580         }
+581 #  endif
+582         return -1;
+583     }
+584     if (pid == 0) {
+585         /* child process */
+586         return FFD_CHILD_PROCESS;
+587     }
+588 
+589     /* parent process */
+590     if (flags & FFD_CLOEXEC)
+591         fcntl(ret, F_SETFD, FD_CLOEXEC);
+592     if (flags & FFD_NONBLOCK)
+593         fcntl(ret, F_SETFL, fcntl(ret, F_GETFL) | O_NONBLOCK);
+594     if (ppid)
+595         *ppid = pid;
+596     return ret;
+597 }
+598 #else
+599 static const int system_has_forkfd = 0;
+600 static int system_forkfd(int flags, pid_t *ppid)
+601 {
+602     (void)flags;
+603     (void)ppid;
+604     return -1;
+605 }
+606 #endif
+607 
+608 #ifndef FORKFD_NO_FORKFD
+609 /**
+610  * @brief forkfd returns a file descriptor representing a child process
+611  * @return a file descriptor, or -1 in case of failure
+612  *
+613  * forkfd() creates a file descriptor that can be used to be notified of when a
+614  * child process exits. This file descriptor can be monitored using select(2),
+615  * poll(2) or similar mechanisms.
+616  *
+617  * The @a flags parameter can contain the following values ORed to change the
+618  * behaviour of forkfd():
+619  *
+620  * @li @c FFD_NONBLOCK Set the O_NONBLOCK file status flag on the new open file
+621  * descriptor. Using this flag saves extra calls to fnctl(2) to achieve the same
+622  * result.
+623  *
+624  * @li @c FFD_CLOEXEC Set the close-on-exec (FD_CLOEXEC) flag on the new file
+625  * descriptor. You probably want to set this flag, since forkfd() does not work
+626  * if the original parent process dies.
+627  *
+628  * The file descriptor returned by forkfd() supports the following operations:
+629  *
+630  * @li read(2) When the child process exits, then the buffer supplied to
+631  * read(2) is used to return information about the status of the child in the
+632  * form of one @c siginfo_t structure. The buffer must be at least
+633  * sizeof(siginfo_t) bytes. The return value of read(2) is the total number of
+634  * bytes read.
+635  *
+636  * @li poll(2), select(2) (and similar) The file descriptor is readable (the
+637  * select(2) readfds argument; the poll(2) POLLIN flag) if the child has exited
+638  * or signalled via SIGCHLD.
+639  *
+640  * @li close(2) When the file descriptor is no longer required it should be closed.
+641  */
+642 int forkfd(int flags, pid_t *ppid)
+643 {
+644     Header *header;
+645     ProcessInfo *info;
+646     pid_t pid;
+647     int fd = -1;
+648     int death_pipe[2];
+649     int sync_pipe[2];
+650     int ret;
+651 #ifdef __linux__
+652     int efd;
+653 #endif
+654 
+655     if (system_has_forkfd) {
+656         ret = system_forkfd(flags, ppid);
+657         if (system_has_forkfd)
+658             return ret;
+659     }
+660 
+661     (void) pthread_once(&forkfd_initialization, forkfd_initialize);
+662 
+663     info = allocateInfo(&header);
+664     if (info == NULL) {
+665         errno = ENOMEM;
+666         return -1;
+667     }
+668 
+669     /* create the pipes before we fork */
+670     if (create_pipe(death_pipe, flags) == -1)
+671         goto err_free; /* failed to create the pipes, pass errno */
+672 
+673 #ifdef HAVE_EVENTFD
+674     /* try using an eventfd, which consumes less resources */
+675     efd = eventfd(0, EFD_CLOEXEC);
+676     if (efd == -1)
+677 #endif
+678     {
+679         /* try a pipe */
+680         if (create_pipe(sync_pipe, FFD_CLOEXEC) == -1) {
+681             /* failed both at eventfd and pipe; fail and pass errno */
+682             goto err_close;
+683         }
+684     }
+685 
+686     /* now fork */
+687     pid = fork();
+688     if (pid == -1)
+689         goto err_close2; /* failed to fork, pass errno */
+690     if (ppid)
+691         *ppid = pid;
+692 
+693     /*
+694      * We need to store the child's PID in the info structure, so
+695      * the SIGCHLD handler knows that this child is present and it
+696      * knows the writing end of the pipe to pass information on.
+697      * However, the child process could exit before we stored the
+698      * information (or the handler could run for other children exiting).
+699      * We prevent that from happening by blocking the child process in
+700      * a read(2) until we're finished storing the information.
+701      */
+702     if (pid == 0) {
+703         /* this is the child process */
+704         /* first, wait for the all clear */
+705 #ifdef HAVE_EVENTFD
+706         if (efd != -1) {
+707             eventfd_t val64;
+708             EINTR_LOOP(ret, eventfd_read(efd, &val64));
+709             EINTR_LOOP(ret, close(efd));
+710         } else
+711 #endif
+712         {
+713             char c;
+714             EINTR_LOOP(ret, close(sync_pipe[1]));
+715             EINTR_LOOP(ret, read(sync_pipe[0], &c, sizeof c));
+716             EINTR_LOOP(ret, close(sync_pipe[0]));
+717         }
+718 
+719         /* now close the pipes and return to the caller */
+720         EINTR_LOOP(ret, close(death_pipe[0]));
+721         EINTR_LOOP(ret, close(death_pipe[1]));
+722         fd = FFD_CHILD_PROCESS;
+723     } else {
+724         /* parent process */
+725         info->deathPipe = death_pipe[1];
+726         fd = death_pipe[0];
+727         ffd_atomic_store(&info->pid, pid, FFD_ATOMIC_RELEASE);
+728 
+729         /* release the child */
+730 #ifdef HAVE_EVENTFD
+731         if (efd != -1) {
+732             eventfd_t val64 = 42;
+733             EINTR_LOOP(ret, eventfd_write(efd, val64));
+734             EINTR_LOOP(ret, close(efd));
+735         } else
+736 #endif
+737         {
+738             /*
+739              * Usually, closing would be enough to make read(2) return and the child process
+740              * continue. We need to write here: another thread could be calling forkfd at the
+741              * same time, which means auxpipe[1] might be open in another child process.
+742              */
+743             EINTR_LOOP(ret, close(sync_pipe[0]));
+744             EINTR_LOOP(ret, write(sync_pipe[1], "", 1));
+745             EINTR_LOOP(ret, close(sync_pipe[1]));
+746         }
+747     }
+748 
+749     return fd;
+750 
+751 err_close2:
+752 #ifdef HAVE_EVENTFD
+753     if (efd != -1) {
+754         EINTR_LOOP(ret, close(efd));
+755     } else
+756 #endif
+757     {
+758         EINTR_LOOP(ret, close(sync_pipe[0]));
+759         EINTR_LOOP(ret, close(sync_pipe[1]));
+760     }
+761 err_close:
+762     EINTR_LOOP(ret, close(death_pipe[0]));
+763     EINTR_LOOP(ret, close(death_pipe[1]));
+764 err_free:
+765     /* free the info pointer */
+766     freeInfo(header, info);
+767     return -1;
+768 }
+769 #endif // FORKFD_NO_FORKFD
+770 
+771 #if _POSIX_SPAWN > 0 && !defined(FORKFD_NO_SPAWNFD)
+772 int spawnfd(int flags, pid_t *ppid, const char *path, const posix_spawn_file_actions_t *file_actions,
+773             posix_spawnattr_t *attrp, char *const argv[], char *const envp[])
+774 {
+775     Header *header;
+776     ProcessInfo *info;
+777     struct pipe_payload payload;
+778     pid_t pid;
+779     int death_pipe[2];
+780     int ret = -1;
+781     /* we can only do work if we have a way to start the child in stopped mode;
+782      * otherwise, we have a major race condition. */
+783 
+784     assert(!system_has_forkfd);
+785 
+786     (void) pthread_once(&forkfd_initialization, forkfd_initialize);
+787 
+788     info = allocateInfo(&header);
+789     if (info == NULL) {
+790         errno = ENOMEM;
+791         goto out;
+792     }
+793 
+794     /* create the pipe before we spawn */
+795     if (create_pipe(death_pipe, flags) == -1)
+796         goto err_free; /* failed to create the pipes, pass errno */
+797 
+798     /* start the process */
+799     if (flags & FFD_SPAWN_SEARCH_PATH) {
+800         /* use posix_spawnp */
+801         if (posix_spawnp(&pid, path, file_actions, attrp, argv, envp) != 0)
+802             goto err_close;
+803     } else {
+804         if (posix_spawn(&pid, path, file_actions, attrp, argv, envp) != 0)
+805             goto err_close;
+806     }
+807 
+808     if (ppid)
+809         *ppid = pid;
+810 
+811     /* Store the child's PID in the info structure.
+812      */
+813     info->deathPipe = death_pipe[1];
+814     ffd_atomic_store(&info->pid, pid, FFD_ATOMIC_RELEASE);
+815 
+816     /* check if the child has already exited */
+817     if (tryReaping(pid, &payload))
+818         notifyAndFreeInfo(header, info, &payload);
+819 
+820     ret = death_pipe[0];
+821     return ret;
+822 
+823 err_close:
+824     EINTR_LOOP(ret, close(death_pipe[0]));
+825     EINTR_LOOP(ret, close(death_pipe[1]));
+826 
+827 err_free:
+828     /* free the info pointer */
+829     freeInfo(header, info);
+830 
+831 out:
+832     return -1;
+833 }
+834 #endif // _POSIX_SPAWN && !FORKFD_NO_SPAWNFD
+835 
+836 
+837 int forkfd_wait(int ffd, forkfd_info *info, struct rusage *rusage)
+838 {
+839     struct pipe_payload payload;
+840     int ret;
+841 
+842     if (system_has_forkfd) {
+843 #if defined(__FreeBSD__) && __FreeBSD__ >= 9
+844         pid_t pid;
+845         int status;
+846         int options = WEXITED;
+847 
+848         ret = pdgetpid(ffd, &pid);
+849         if (ret == -1)
+850             return ret;
+851         ret = fcntl(ffd, F_GETFL);
+852         if (ret == -1)
+853             return ret;
+854         options |= (ret & O_NONBLOCK) ? WNOHANG : 0;
+855         ret = wait4(pid, &status, options, rusage);
+856         if (ret != -1 && info)
+857             convertStatusToForkfdInfo(status, info);
+858         return ret == -1 ? -1 : 0;
+859 #endif
+860     }
+861 
+862     ret = read(ffd, &payload, sizeof(payload));
+863     if (ret == -1)
+864         return ret;     /* pass errno, probably EINTR, EBADF or EWOULDBLOCK */
+865 
+866     assert(ret == sizeof(payload));
+867     if (info)
+868         *info = payload.info;
+869     if (rusage)
+870         *rusage = payload.rusage;
+871 
+872     return 0;           /* success */
+873 }
+874 
+875 
+876 int forkfd_close(int ffd)
+877 {
+878     return close(ffd);
+879 }

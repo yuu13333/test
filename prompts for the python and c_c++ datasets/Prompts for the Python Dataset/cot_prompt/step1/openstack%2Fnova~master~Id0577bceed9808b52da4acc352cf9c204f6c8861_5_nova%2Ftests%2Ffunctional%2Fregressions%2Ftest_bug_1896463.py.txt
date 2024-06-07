@@ -1,0 +1,245 @@
+Based on the given code from a commit, please generate supplementary code files according to the commit message.
+####commit message
+Reproduce bug 1896463 in func env
+
+There is a race condition between the rebuild and the
+_update_available_resource periodic task on the compute. This patch adds
+a reproducer functional test. Unfortunately it needs some injected sleep
+to make the race happen in a stable way. This is suboptimal but only
+adds 3 seconds of slowness to the test execution.
+
+Change-Id: Id0577bceed9808b52da4acc352cf9c204f6c8861
+Related-Bug: #1896463
+
+####code 
+1 # Licensed under the Apache License, Version 2.0 (the "License");
+2 # you may not use this file except in compliance with the License.
+3 # You may obtain a copy of the License at
+4 #
+5 #    http://www.apache.org/licenses/LICENSE-2.0
+6 #
+7 # Unless required by applicable law or agreed to in writing, software
+8 # distributed under the License is distributed on an "AS IS" BASIS,
+9 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+10 # See the License for the specific language governing permissions and
+11 # limitations under the License.
+12 
+13 import copy
+14 import fixtures
+15 import time
+16 
+17 from oslo_config import cfg
+18 
+19 from nova import context
+20 from nova import objects
+21 from nova import test
+22 from nova.tests import fixtures as nova_fixtures
+23 from nova.tests.functional import fixtures as func_fixtures
+24 from nova.tests.functional import integrated_helpers
+25 from nova import utils
+26 from nova.virt import fake
+27 
+28 
+29 CONF = cfg.CONF
+30 
+31 
+32 class TestEvacuateResourceTrackerRace(
+33     test.TestCase, integrated_helpers.InstanceHelperMixin,
+34 ):
+35     """Demonstrate bug #1896463.
+36 
+37     Trigger a race condition between an almost finished evacuation that is
+38     dropping the migration context, and the _update_available_resource()
+39     periodic task that already loaded the instance list but haven't loaded the
+40     migration list yet. The result is that the PCI allocation made by the
+41     evacuation is deleted by the overlapping periodic task run and the instance
+42     will not have PCI allocation after the evacuation.
+43     """
+44 
+45     def setUp(self):
+46         super().setUp()
+47         self.neutron = self.useFixture(nova_fixtures.NeutronFixture(self))
+48         self.glance = self.useFixture(nova_fixtures.GlanceFixture(self))
+49         self.placement = self.useFixture(func_fixtures.PlacementFixture()).api
+50 
+51         self.api_fixture = self.useFixture(nova_fixtures.OSAPIFixture(
+52             api_version='v2.1'))
+53 
+54         self.admin_api = self.api_fixture.admin_api
+55         self.admin_api.microversion = 'latest'
+56         self.api = self.admin_api
+57 
+58         self.start_service('conductor')
+59         self.start_service('scheduler')
+60 
+61         self.flags(compute_driver='fake.FakeDriverWithPciResources')
+62         self.useFixture(
+63             fake.FakeDriverWithPciResources.
+64                 FakeDriverWithPciResourcesConfigFixture())
+65 
+66         self.compute1 = self._start_compute('host1')
+67         self.compute1_id = self._get_compute_node_id_by_host('host1')
+68         self.compute1_service_id = self.admin_api.get_services(
+69             host='host1', binary='nova-compute')[0]['id']
+70 
+71         self.compute2 = self._start_compute('host2')
+72         self.compute2_id = self._get_compute_node_id_by_host('host2')
+73         self.compute2_service_id = self.admin_api.get_services(
+74             host='host2', binary='nova-compute')[0]['id']
+75 
+76         # add extra ports and the related network to the neutron fixture
+77         # specifically for these tests. It cannot be added globally in the
+78         # fixture init as it adds a second network that makes auto allocation
+79         # based test to fail due to ambiguous networks.
+80         self.neutron._ports[self.neutron.sriov_port['id']] = \
+81             copy.deepcopy(self.neutron.sriov_port)
+82         self.neutron._networks[
+83             self.neutron.network_2['id']] = self.neutron.network_2
+84         self.neutron._subnets[
+85             self.neutron.subnet_2['id']] = self.neutron.subnet_2
+86 
+87         self.ctxt = context.get_admin_context()
+88 
+89     def _get_compute_node_id_by_host(self, host):
+90         # we specifically need the integer id of the node not the UUID so we
+91         # need to use the old microversion
+92         with utils.temporary_mutation(self.admin_api, microversion='2.52'):
+93             hypers = self.admin_api.api_get(
+94                 'os-hypervisors').body['hypervisors']
+95             for hyper in hypers:
+96                 if hyper['hypervisor_hostname'] == host:
+97                     return hyper['id']
+98 
+99             self.fail('Hypervisor with hostname=%s not found' % host)
+100 
+101     def _assert_pci_device_allocated(
+102             self, instance_uuid, compute_node_id, num=1):
+103         """Assert that a given number of PCI devices are allocated to the
+104         instance on the given host.
+105         """
+106 
+107         devices = objects.PciDeviceList.get_by_instance_uuid(
+108             self.ctxt, instance_uuid)
+109         devices_on_host = [dev for dev in devices
+110                            if dev.compute_node_id == compute_node_id]
+111         self.assertEqual(num, len(devices_on_host))
+112 
+113     def test_evacuate_races_with_update_available_resource(self):
+114         # Create a server with a direct port to have PCI allocation
+115         server = self._create_server(
+116             name='test-server-for-bug-1896463',
+117             networks=[{'port': self.neutron.sriov_port['id']}],
+118             host='host1'
+119         )
+120 
+121         self._assert_pci_device_allocated(server['id'], self.compute1_id)
+122         self._assert_pci_device_allocated(
+123             server['id'], self.compute2_id, num=0)
+124 
+125         # stop and force down the compute the instance is on to allow
+126         # evacuation
+127         self.compute1.stop()
+128         self.admin_api.put_service(
+129             self.compute1_service_id, {'forced_down': 'true'})
+130 
+131         # Inject some sleeps both in the Instance.drop_migration_context and
+132         # the MigrationList.get_in_progress_and_error code to make them
+133         # overlap.
+134         # We want to create the following execution scenario:
+135         # 1) The evacuation makes a move claim on the dest including the PCI
+136         #    claim. This means there is a migration context. But the evacuation
+137         #    is not complete yet so the instance.host does not point to the
+138         #    dest host.
+139         # 2) The dest resource tracker starts an _update_available_resource()
+140         #    periodic task and this task loads the list of instances on its
+141         #    host from the DB. Our instance is not in this list due to #1.
+142         # 3) The evacuation finishes, the instance.host is set to the dest host
+143         #    and the migration context is deleted.
+144         # 4) The periodic task now loads the list of in-progress migration from
+145         #    the DB to check for incoming our outgoing migrations. However due
+146         #    to #3 our instance is not in this list either.
+147         # 5) The periodic task cleans up every lingering PCI claim that is not
+148         #    connected to any instance collected above from the instance list
+149         #    and from the migration list. As our instance is not in either of
+150         #    the lists, the resource tracker  cleans up the PCI allocation for
+151         #    the already finished evacuation of our instance.
+152         #
+153         # Unfortunately we cannot reproduce the above situation without sleeps.
+154         # We need that the evac starts first then the periodic starts, but not
+155         # finishes, then evac finishes, then periodic finishes. If I trigger
+156         # and run the whole periodic in a wrapper of drop_migration_context
+157         # then I could not reproduce the situation described at #4). In general
+158         # it is not
+159         #
+160         #   evac
+161         #    |
+162         #    |
+163         #    |     periodic
+164         #    |        |
+165         #    |        |
+166         #    |        x
+167         #    |
+168         #    |
+169         #    x
+170         #
+171         # but
+172         #
+173         #   evac
+174         #    |
+175         #    |
+176         #    |     periodic
+177         #    |        |
+178         #    |        |
+179         #    |        |
+180         #    x        |
+181         #             |
+182         #             x
+183         #
+184         # what is needed need.
+185         #
+186         # Starting the periodic from the test in a separate thread at
+187         # drop_migration_context() might work but that is an extra complexity
+188         # in the test code. Also it might need a sleep still to make the
+189         # reproduction stable but only one sleep instead of two.
+190         orig_drop = objects.Instance.drop_migration_context
+191 
+192         def slow_drop(*args, **kwargs):
+193             time.sleep(1)
+194             return orig_drop(*args, **kwargs)
+195 
+196         self.useFixture(
+197             fixtures.MockPatch(
+198                 'nova.objects.instance.Instance.drop_migration_context',
+199                 new=slow_drop))
+200 
+201         orig_get_mig = objects.MigrationList.get_in_progress_and_error
+202 
+203         def slow_get_mig(*args, **kwargs):
+204             time.sleep(2)
+205             return orig_get_mig(*args, **kwargs)
+206 
+207         self.useFixture(
+208             fixtures.MockPatch(
+209                 'nova.objects.migration.MigrationList.'
+210                 'get_in_progress_and_error',
+211                 new=slow_get_mig))
+212 
+213         self.admin_api.post_server_action(server['id'], {'evacuate': {}})
+214         # we trigger the _update_available_resource periodic to overlap with
+215         # the already started evacuation
+216         self._run_periodics()
+217 
+218         self._wait_for_server_parameter(
+219             server, {'OS-EXT-SRV-ATTR:host': 'host2', 'status': 'ACTIVE'})
+220 
+221         self._assert_pci_device_allocated(server['id'], self.compute1_id)
+222 
+223         # This is bug #1896463 as the PCI allocation was deleted by the racing
+224         # _update_available_resource periodic task.
+225         self._assert_pci_device_allocated(
+226             server['id'], self.compute2_id, num=0)
+227 
+228         # FIXME(gibi): When this bug is fixed (or if you remove the sleeps
+229         # above to avoid the race condition) then we expect that the PCI
+230         # allocation exists on the destination host too.
+231         # self._assert_pci_device_allocated(server['id'], self.compute2_id)

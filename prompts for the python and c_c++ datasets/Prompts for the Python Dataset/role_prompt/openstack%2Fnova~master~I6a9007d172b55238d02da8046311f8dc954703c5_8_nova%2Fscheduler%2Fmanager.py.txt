@@ -1,0 +1,211 @@
+I want you to act as a code reviewer of Nova in OpenStack. Please review the code below to detect security defects. If any are found, please describe the security defect in detail and indicate the corresponding line number of code and solution. If none are found, please state '''No security defects are detected in the code'''.
+
+1 # Copyright (c) 2010 OpenStack Foundation
+2 # Copyright 2010 United States Government as represented by the
+3 # Administrator of the National Aeronautics and Space Administration.
+4 # All Rights Reserved.
+5 #
+6 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
+7 #    not use this file except in compliance with the License. You may obtain
+8 #    a copy of the License at
+9 #
+10 #         http://www.apache.org/licenses/LICENSE-2.0
+11 #
+12 #    Unless required by applicable law or agreed to in writing, software
+13 #    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+14 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+15 #    License for the specific language governing permissions and limitations
+16 #    under the License.
+17 
+18 """
+19 Scheduler Service
+20 """
+21 
+22 import collections
+23 
+24 from oslo_log import log as logging
+25 import oslo_messaging as messaging
+26 from oslo_serialization import jsonutils
+27 from oslo_service import periodic_task
+28 from stevedore import driver
+29 
+30 import nova.conf
+31 from nova import exception
+32 from nova.i18n import _LI
+33 from nova import manager
+34 from nova import objects
+35 from nova.objects import host_mapping as host_mapping_obj
+36 from nova import quota
+37 from nova.scheduler import client as scheduler_client
+38 from nova.scheduler import utils
+39 
+40 
+41 LOG = logging.getLogger(__name__)
+42 
+43 CONF = nova.conf.CONF
+44 
+45 QUOTAS = quota.QUOTAS
+46 
+47 
+48 class SchedulerManager(manager.Manager):
+49     """Chooses a host to run instances on."""
+50 
+51     target = messaging.Target(version='4.5')
+52 
+53     _sentinel = object()
+54 
+55     def __init__(self, scheduler_driver=None, *args, **kwargs):
+56         client = scheduler_client.SchedulerClient()
+57         self.placement_client = client.reportclient
+58         if not scheduler_driver:
+59             scheduler_driver = CONF.scheduler.driver
+60         self.driver = driver.DriverManager(
+61                 "nova.scheduler.driver",
+62                 scheduler_driver,
+63                 invoke_on_load=True).driver
+64         super(SchedulerManager, self).__init__(service_name='scheduler',
+65                                                *args, **kwargs)
+66 
+67     @periodic_task.periodic_task(
+68         spacing=CONF.scheduler.discover_hosts_in_cells_interval,
+69         run_immediately=True)
+70     def _discover_hosts_in_cells(self, context):
+71         host_mappings = host_mapping_obj.discover_hosts(context)
+72         if host_mappings:
+73             LOG.info(_LI('Discovered %(count)i new hosts: %(hosts)s'),
+74                      {'count': len(host_mappings),
+75                       'hosts': ','.join(['%s:%s' % (hm.cell_mapping.name,
+76                                                     hm.host)
+77                                          for hm in host_mappings])})
+78 
+79     @periodic_task.periodic_task(spacing=CONF.scheduler.periodic_task_interval,
+80                                  run_immediately=True)
+81     def _run_periodic_tasks(self, context):
+82         self.driver.run_periodic_tasks(context)
+83 
+84     def reset(self):
+85         # NOTE(tssurya): This is a SIGHUP handler which will reset the cells
+86         # and enabled cells caches in the host manager. So every time an
+87         # existing cell is disabled or enabled or a new cell is created, a
+88         # SIGHUP signal has to be sent to the scheduler for proper scheduling.
+89         LOG.debug('Refreshing the cells and enabled_cells caches.')
+90         self.driver.host_manager.cells = None
+91         self.driver.host_manager.enabled_cells = None
+92         LOG.debug("The cells and enabled_cells caches have been refreshed.")
+93 
+94     @messaging.expected_exceptions(exception.NoValidHost)
+95     def select_destinations(self, ctxt, request_spec=None,
+96             filter_properties=None, spec_obj=_sentinel, instance_uuids=None,
+97             return_objects=False, return_alternates=False):
+98         """Returns destinations(s) best suited for this RequestSpec.
+99 
+100         Starting in Queens, this method returns a list of lists of Selection
+101         objects, with one list for each requested instance. Each instance's
+102         list will have its first element be the Selection object representing
+103         the chosen host for the instance, and if return_alternates is True,
+104         zero or more alternate objects that could also satisfy the request. The
+105         number of alternates is determined by the configuration option
+106         `CONF.scheduler.max_attempts`.
+107 
+108         The ability of a calling method to handle this format of returned
+109         destinations is indicated by a True value in the parameter
+110         `return_objects`. However, there may still be some older conductors in
+111         a deployment that have not been updated to Queens, and in that case
+112         return_objects will be False, and the result will be a list of dicts
+113         with 'host', 'nodename' and 'limits' as keys. When return_objects is
+114         False, the value of return_alternates has no effect. The reason there
+115         are two kwarg parameters return_objects and return_alternates is so we
+116         can differentiate between callers that understand the Selection object
+117         format but *don't* want to get alternate hosts, as is the case with the
+118         conductors that handle certain move operations.
+119         """
+120         LOG.debug("Starting to schedule for instances: %s", instance_uuids)
+121 
+122         # TODO(sbauza): Change the method signature to only accept a spec_obj
+123         # argument once API v5 is provided.
+124         if spec_obj is self._sentinel:
+125             spec_obj = objects.RequestSpec.from_primitives(ctxt,
+126                                                            request_spec,
+127                                                            filter_properties)
+128         resources = utils.resources_from_request_spec(spec_obj)
+129         alloc_reqs_by_rp_uuid, provider_summaries, allocation_request_version \
+130             = None, None, None
+131         if self.driver.USES_ALLOCATION_CANDIDATES:
+132             res = self.placement_client.get_allocation_candidates(ctxt,
+133                                                                   resources)
+134             if res is None:
+135                 # We have to handle the case that we failed to connect to the
+136                 # Placement service and the safe_connect decorator on
+137                 # get_allocation_candidates returns None.
+138                 alloc_reqs, provider_summaries, allocation_request_version = (
+139                         None, None, None)
+140             else:
+141                 (alloc_reqs, provider_summaries,
+142                             allocation_request_version) = res
+143             if not alloc_reqs:
+144                 LOG.debug("Got no allocation candidates from the Placement "
+145                           "API. This may be a temporary occurrence as compute "
+146                           "nodes start up and begin reporting inventory to "
+147                           "the Placement service.")
+148                 raise exception.NoValidHost(reason="")
+149             else:
+150                 # Build a dict of lists of allocation requests, keyed by
+151                 # provider UUID, so that when we attempt to claim resources for
+152                 # a host, we can grab an allocation request easily
+153                 alloc_reqs_by_rp_uuid = collections.defaultdict(list)
+154                 for ar in alloc_reqs:
+155                     for rp_uuid in ar['allocations']:
+156                         alloc_reqs_by_rp_uuid[rp_uuid].append(ar)
+157 
+158         # Only return alternates if both return_objects and return_alternates
+159         # are True.
+160         return_alternates = return_alternates and return_objects
+161         selections = self.driver.select_destinations(ctxt, spec_obj,
+162                 instance_uuids, alloc_reqs_by_rp_uuid, provider_summaries,
+163                 allocation_request_version, return_alternates)
+164         # If `return_objects` is False, we need to convert the selections to
+165         # the older format, which is a list of host state dicts.
+166         if not return_objects:
+167             selection_dicts = [sel[0].to_dict() for sel in selections]
+168             return jsonutils.to_primitive(selection_dicts)
+169         return selections
+170 
+171     def update_aggregates(self, ctxt, aggregates):
+172         """Updates HostManager internal aggregates information.
+173 
+174         :param aggregates: Aggregate(s) to update
+175         :type aggregates: :class:`nova.objects.Aggregate`
+176                           or :class:`nova.objects.AggregateList`
+177         """
+178         # NOTE(sbauza): We're dropping the user context now as we don't need it
+179         self.driver.host_manager.update_aggregates(aggregates)
+180 
+181     def delete_aggregate(self, ctxt, aggregate):
+182         """Deletes HostManager internal information about a specific aggregate.
+183 
+184         :param aggregate: Aggregate to delete
+185         :type aggregate: :class:`nova.objects.Aggregate`
+186         """
+187         # NOTE(sbauza): We're dropping the user context now as we don't need it
+188         self.driver.host_manager.delete_aggregate(aggregate)
+189 
+190     def update_instance_info(self, context, host_name, instance_info):
+191         """Receives information about changes to a host's instances, and
+192         updates the driver's HostManager with that information.
+193         """
+194         self.driver.host_manager.update_instance_info(context, host_name,
+195                                                       instance_info)
+196 
+197     def delete_instance_info(self, context, host_name, instance_uuid):
+198         """Receives information about the deletion of one of a host's
+199         instances, and updates the driver's HostManager with that information.
+200         """
+201         self.driver.host_manager.delete_instance_info(context, host_name,
+202                                                       instance_uuid)
+203 
+204     def sync_instance_info(self, context, host_name, instance_uuids):
+205         """Receives a sync request from a host, and passes it on to the
+206         driver's HostManager.
+207         """
+208         self.driver.host_manager.sync_instance_info(context, host_name,
+209                                                     instance_uuids)

@@ -1,0 +1,1128 @@
+Based on the given code from a commit, please generate supplementary code files according to the commit message.
+####commit message
+tests: Add helpers for suspend, resume and reboot of server
+
+We will use this in a later test, but a current test that could have
+benefited from these is reworked now to validate the approach.
+
+Change-Id: I03bcd6753ed776d2ee216dcdca48514e5da8c43e
+Signed-off-by: Stephen Finucane <stephenfin@redhat.com>
+
+####code 
+1 # Copyright 2011 Justin Santa Barbara
+2 # All Rights Reserved.
+3 #
+4 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
+5 #    not use this file except in compliance with the License. You may obtain
+6 #    a copy of the License at
+7 #
+8 #         http://www.apache.org/licenses/LICENSE-2.0
+9 #
+10 #    Unless required by applicable law or agreed to in writing, software
+11 #    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+12 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+13 #    License for the specific language governing permissions and limitations
+14 #    under the License.
+15 
+16 """
+17 Provides common functionality for integrated unit tests
+18 """
+19 
+20 import collections
+21 import random
+22 import string
+23 import time
+24 
+25 from oslo_concurrency import lockutils
+26 from oslo_log import log as logging
+27 import oslo_messaging as messaging
+28 
+29 from nova.compute import instance_actions
+30 from nova.compute import rpcapi as compute_rpcapi
+31 from nova.compute import utils as compute_utils
+32 import nova.conf
+33 from nova import context
+34 from nova.db import api as db
+35 import nova.image.glance
+36 from nova import objects
+37 from nova.objects import base as objects_base
+38 from nova import rpc
+39 from nova import test
+40 from nova.tests import fixtures as nova_fixtures
+41 from nova.tests.functional.api import client as api_client
+42 from nova.tests.functional import fixtures as func_fixtures
+43 from nova.tests.unit import cast_as_call
+44 from nova.tests.unit import fake_notifier
+45 import nova.tests.unit.image.fake
+46 from nova.tests.unit import policy_fixture
+47 from nova import utils
+48 
+49 
+50 CONF = nova.conf.CONF
+51 LOG = logging.getLogger(__name__)
+52 
+53 
+54 def generate_random_alphanumeric(length):
+55     """Creates a random alphanumeric string of specified length."""
+56     return ''.join(random.choice(string.ascii_uppercase + string.digits)
+57                    for _x in range(length))
+58 
+59 
+60 def generate_random_numeric(length):
+61     """Creates a random numeric string of specified length."""
+62     return ''.join(random.choice(string.digits)
+63                    for _x in range(length))
+64 
+65 
+66 def generate_new_element(items, prefix, numeric=False):
+67     """Creates a random string with prefix, that is not in 'items' list."""
+68     while True:
+69         if numeric:
+70             candidate = prefix + generate_random_numeric(8)
+71         else:
+72             candidate = prefix + generate_random_alphanumeric(8)
+73         if candidate not in items:
+74             return candidate
+75         LOG.debug("Random collision on %s", candidate)
+76 
+77 
+78 class StubComputeRPCAPI(compute_rpcapi.ComputeAPI):
+79     """Stub ComputeAPI that allows us to pin the RPC version of a host. Used to
+80     simulate rolling upgrade situations where either source, dest or conductor
+81     are pinned.
+82     """
+83 
+84     def __init__(self, version):
+85         self.version = version
+86 
+87     @property
+88     def router(self):
+89         with lockutils.lock('compute-rpcapi-router'):
+90             target = messaging.Target(topic='compute', version='5.0')
+91             version_cap = self.version
+92             serializer = objects_base.NovaObjectSerializer()
+93             rpc.get_client(target, version_cap, serializer)
+94             default_client = self.get_client(target, version_cap, serializer)
+95             return rpc.ClientRouter(default_client)
+96 
+97 
+98 class InstanceHelperMixin:
+99 
+100     def _wait_for_server_parameter(
+101             self, server, expected_params, max_retries=10, api=None):
+102         api = api or getattr(self, 'admin_api', self.api)
+103 
+104         retry_count = 0
+105         while True:
+106             server = api.get_server(server['id'])
+107             if all([server[attr] == expected_params[attr]
+108                     for attr in expected_params]):
+109                 break
+110             retry_count += 1
+111             if retry_count == max_retries:
+112                 self.fail('Wait for state change failed, '
+113                           'expected_params=%s, server=%s' % (
+114                               expected_params, server))
+115             time.sleep(0.5)
+116 
+117         return server
+118 
+119     def _wait_for_state_change(self, server, expected_status, max_retries=10):
+120         return self._wait_for_server_parameter(
+121             server, {'status': expected_status}, max_retries)
+122 
+123     def _wait_until_deleted(self, server):
+124         initially_in_error = server.get('status') == 'ERROR'
+125         try:
+126             for i in range(40):
+127                 server = self.api.get_server(server['id'])
+128                 if not initially_in_error and server['status'] == 'ERROR':
+129                     self.fail('Server went to error state instead of'
+130                               'disappearing.')
+131                 time.sleep(0.5)
+132 
+133             self.fail('Server failed to delete.')
+134         except api_client.OpenStackApiNotFoundException:
+135             return
+136 
+137     def _wait_for_action_fail_completion(
+138             self, server, expected_action, event_name):
+139         """Polls instance action events for the given instance, action and
+140         action event name until it finds the action event with an error
+141         result.
+142         """
+143         return self._wait_for_instance_action_event(
+144             server, expected_action, event_name, event_result='error')
+145 
+146     def _wait_for_instance_action_event(
+147             self, server, action_name, event_name, event_result):
+148         """Polls the instance action events for the given instance, action,
+149         event, and event result until it finds the event.
+150         """
+151         api = getattr(self, 'admin_api', self.api)
+152 
+153         actions = []
+154         events = []
+155         for attempt in range(10):
+156             actions = api.get_instance_actions(server['id'])
+157             # The API returns the newest event first
+158             for action in actions:
+159                 if action['action'] != action_name:
+160                     continue
+161 
+162                 events = api.get_instance_action_details(server['id'],
+163                         action['request_id'])['events']
+164 
+165                 # Look for the action event being in error state.
+166                 for event in events:
+167                     result = event['result']
+168                     if (event['event'] == event_name and
+169                             result is not None and
+170                             result.lower() == event_result.lower()):
+171                         return event
+172 
+173             # We didn't find the completion event yet, so wait a bit.
+174             time.sleep(0.5)
+175 
+176         self.fail(
+177             'Timed out waiting for %s instance action event. Current instance '
+178             'actions: %s. Events in the last matching action: %s'
+179             % (event_name, actions, events))
+180 
+181     def _assert_resize_migrate_action_fail(self, server, action, error_in_tb):
+182         """Waits for the conductor_migrate_server action event to fail for
+183         the given action and asserts the error is in the event traceback.
+184 
+185         :param server: API response dict of the server being resized/migrated
+186         :param action: Either "resize" or "migrate" instance action.
+187         :param error_in_tb: Some expected part of the error event traceback.
+188         :returns: The instance action event dict from the API response
+189         """
+190         event = self._wait_for_action_fail_completion(
+191             server, action, 'conductor_migrate_server')
+192         self.assertIn(error_in_tb, event['traceback'])
+193         return event
+194 
+195     def _wait_for_migration_status(self, server, expected_statuses):
+196         """Waits for a migration record with the given statuses to be found
+197         for the given server, else the test fails. The migration record, if
+198         found, is returned.
+199         """
+200         api = getattr(self, 'admin_api', self.api)
+201 
+202         statuses = [status.lower() for status in expected_statuses]
+203         for attempt in range(10):
+204             migrations = api.api_get('/os-migrations').body['migrations']
+205             for migration in migrations:
+206                 if (migration['instance_uuid'] == server['id'] and
+207                         migration['status'].lower() in statuses):
+208                     return migration
+209             time.sleep(0.5)
+210         self.fail('Timed out waiting for migration with status "%s" for '
+211                   'instance: %s' % (expected_statuses, server['id']))
+212 
+213     def _wait_for_log(self, log_line):
+214         for i in range(10):
+215             if log_line in self.stdlog.logger.output:
+216                 return
+217             time.sleep(0.5)
+218 
+219         self.fail('The line "%(log_line)s" did not appear in the log')
+220 
+221     def _wait_for_assert(self, assert_func, max_retries=10, sleep=0.5):
+222         """Waits and retries the assert_func either until it does not raise
+223         AssertionError any more or until the max_retries run out.
+224         """
+225         last_error = None
+226         for i in range(max_retries):
+227             try:
+228                 return assert_func()
+229             except AssertionError as e:
+230                 last_error = e
+231 
+232             time.sleep(sleep)
+233 
+234         raise last_error
+235 
+236     def _create_aggregate(self, name, availability_zone=None):
+237         """Creates a host aggregate with the given name and optional AZ
+238 
+239         :param name: The name of the host aggregate
+240         :param availability_zone: Optional availability zone that the aggregate
+241             represents
+242         :returns: The id value of the created aggregate
+243         """
+244         api = getattr(self, 'admin_api', self.api)
+245         body = {
+246             'aggregate': {
+247                 'name': name, 'availability_zone': availability_zone
+248             }
+249         }
+250         return api.post_aggregate(body)['id']
+251 
+252     def _build_flavor(self, id=None, name=None, memory_mb=2048, vcpu=2,
+253                       disk=10, ephemeral=10, swap=0, rxtx_factor=1.0,
+254                       is_public=True):
+255         """Build a request for the flavor create API.
+256 
+257         :param id: An ID for the flavor.
+258         :param name: A name for the flavor.
+259         :param memory_mb: The flavor memory.
+260         :param vcpu: The flavor vcpus.
+261         :param disk: The flavor disk.
+262         :param ephemeral: The flavor ephemeral.
+263         :param swap: The flavor swap.
+264         :param rxtx_factor: (DEPRECATED) The flavor RX-TX factor.
+265         :param is_public: Whether the flavor is public or not.
+266         :returns: The generated request body.
+267         """
+268         if not name:
+269             name = ''.join(
+270                 random.choice(string.ascii_lowercase) for i in range(20))
+271 
+272         return {
+273             "flavor": {
+274                 "id": id,
+275                 "name": name,
+276                 "ram": memory_mb,
+277                 "vcpus": vcpu,
+278                 "disk": disk,
+279                 "OS-FLV-EXT-DATA:ephemeral": ephemeral,
+280                 "swap": swap,
+281                 "rxtx_factor": rxtx_factor,
+282                 "os-flavor-access:is_public": is_public,
+283             }
+284         }
+285 
+286     def _create_flavor(self, id=None, name=None, memory_mb=2048, vcpu=2,
+287                        disk=10, ephemeral=10, swap=0, rxtx_factor=1.0,
+288                        is_public=True, extra_spec=None):
+289         """Build and submit a request to the flavor create API.
+290 
+291         :param id: An ID for the flavor.
+292         :param name: A name for the flavor.
+293         :param memory_mb: The flavor memory.
+294         :param vcpu: The flavor vcpus.
+295         :param disk: The flavor disk.
+296         :param ephemeral: The flavor ephemeral.
+297         :param swap: The flavor swap.
+298         :param rxtx_factor: (DEPRECATED) The flavor RX-TX factor.
+299         :param is_public: Whether the flavor is public or not.
+300         :returns: The ID of the created flavor.
+301         """
+302         body = self._build_flavor(
+303             id, name, memory_mb, vcpu, disk, ephemeral, swap, rxtx_factor,
+304             is_public)
+305         flavor = self.api_fixture.admin_api.post_flavor(body)
+306 
+307         if extra_spec is not None:
+308             spec = {"extra_specs": extra_spec}
+309             self.api_fixture.admin_api.post_extra_spec(flavor['id'], spec)
+310 
+311         return flavor['id']
+312 
+313     def _build_server(self, name=None, image_uuid=None, flavor_id=None,
+314                       networks=None, az=None, host=None):
+315         """Build a request for the server create API.
+316 
+317         :param name: A name for the server.
+318         :param image_uuid: The ID of an existing image.
+319         :param flavor_id: The ID of an existing flavor.
+320         :param networks: A dict of networks to attach or a string of 'none' or
+321             'auto'.
+322         :param az: The name of the availability zone the instance should
+323             request.
+324         :param host: The host to boot the instance on. Requires API
+325             microversion 2.74 or greater.
+326         :returns: The generated request body.
+327         """
+328         if not name:
+329             name = ''.join(
+330                 random.choice(string.ascii_lowercase) for i in range(20))
+331 
+332         if image_uuid is None:  # we need to handle ''
+333             # NOTE(takashin): In API version 2.36, image APIs were deprecated.
+334             # In API version 2.36 or greater, self.api.get_images() returns
+335             # a 404 error. In that case, 'image_uuid' should be specified.
+336             with utils.temporary_mutation(self.api, microversion='2.35'):
+337                 image_uuid = self.api.get_images()[0]['id']
+338 
+339         if not flavor_id:
+340             # Set a valid flavorId
+341             flavor_id = self.api.get_flavors()[0]['id']
+342 
+343         server = {
+344             'name': name,
+345             'imageRef': image_uuid,
+346             'flavorRef': 'http://fake.server/%s' % flavor_id,
+347         }
+348 
+349         if networks is not None:
+350             server['networks'] = networks
+351 
+352         if az is not None:
+353             server['availability_zone'] = az
+354 
+355         # This requires at least microversion 2.74 to work
+356         if host is not None:
+357             server['host'] = host
+358 
+359         return server
+360 
+361     def _create_server(self, name=None, image_uuid=None, flavor_id=None,
+362                        networks=None, az=None, host=None,
+363                        expected_state='ACTIVE', api=None):
+364         """Build and submit a request to the server create API.
+365 
+366         :param name: A name for the server.
+367         :param image_uuid: The ID of an existing image.
+368         :param flavor_id: The ID of an existing flavor.
+369         :param networks: A dict of networks to attach or a string of 'none' or
+370             'auto'.
+371         :param az: The name of the availability zone the instance should
+372             request.
+373         :param host: The host to boot the instance on. Requires API
+374             microversion 2.74 or greater.
+375         :param expected_state: The expected end state.
+376         :param api: An API client to create the server with; defaults to
+377             'self.api'
+378         :returns: The response from the API containing the created server.
+379         """
+380         # if forcing the server onto a host, we have to use the admin API
+381         if not api:
+382             api = self.api if not az else getattr(self, 'admin_api', self.api)
+383 
+384         body = self._build_server(
+385             name, image_uuid, flavor_id, networks, az, host)
+386 
+387         server = api.post_server({'server': body})
+388 
+389         return self._wait_for_state_change(server, expected_state)
+390 
+391     def _delete_server(self, server):
+392         """Delete a server."""
+393         self.api.delete_server(server['id'])
+394         self._wait_until_deleted(server)
+395 
+396     def _confirm_resize(self, server):
+397         self.api.post_server_action(server['id'], {'confirmResize': None})
+398         server = self._wait_for_state_change(server, 'ACTIVE')
+399         self._wait_for_instance_action_event(
+400             server, instance_actions.CONFIRM_RESIZE,
+401             'compute_confirm_resize', 'success')
+402         return server
+403 
+404     def _revert_resize(self, server):
+405         # NOTE(sbauza): This method requires the caller to setup a fake
+406         # notifier by stubbing it.
+407         self.api.post_server_action(server['id'], {'revertResize': None})
+408         server = self._wait_for_state_change(server, 'ACTIVE')
+409         self._wait_for_migration_status(server, ['reverted'])
+410         # Note that the migration status is changed to "reverted" in the
+411         # dest host revert_resize method but the allocations are cleaned up
+412         # in the source host finish_revert_resize method so we need to wait
+413         # for the finish_revert_resize method to complete.
+414         fake_notifier.wait_for_versioned_notifications(
+415             'instance.resize_revert.end')
+416         return server
+417 
+418     def _resize_server(self, server, flavor_id):
+419         self.api.post_server_action(
+420             server['id'], {'resize': {'flavorRef': flavor_id}})
+421         return self._wait_for_state_change(server, 'VERIFY_RESIZE')
+422 
+423     def _live_migrate(self, server, migration_final_status):
+424         self.api.post_server_action(
+425             server['id'],
+426             {'os-migrateLive': {'host': None, 'block_migration': 'auto'}})
+427         self._wait_for_state_change(server, 'ACTIVE')
+428         self._wait_for_migration_status(server, [migration_final_status])
+429 
+430     def _suspend_server(self, server):
+431         self.api.post_server_action(server['id'], {'suspend': {}})
+432         server = self._wait_for_state_change(server, 'SUSPENDED')
+433         return server
+434 
+435     def _resume_server(self, server):
+436         self.api.post_server_action(server['id'], {'resume': {}})
+437         server = self._wait_for_state_change(server, 'ACTIVE')
+438         return server
+439 
+440     def _reboot_server(self, server, hard=False):
+441         self.api.post_server_action(
+442             server['id'],
+443             {'reboot': {'type': 'HARD' if hard else 'SOFT'}},
+444         )
+445         server = self._wait_for_state_change(server, 'ACTIVE')
+446         return server
+447 
+448 
+449 class PlacementHelperMixin:
+450     """A helper mixin for interacting with placement."""
+451 
+452     def _get_all_resource_classes(self):
+453         resp = self.placement_api.get(
+454             '/resource_classes', version='1.2'
+455         ).body['resource_classes']
+456         return [d['name'] for d in resp]
+457 
+458     def _get_all_providers(self):
+459         return self.placement_api.get(
+460             '/resource_providers', version='1.14'
+461         ).body['resource_providers']
+462 
+463     def _get_all_rp_uuids_in_a_tree(self, in_tree_rp_uuid):
+464         rps = self.placement_api.get(
+465             '/resource_providers?in_tree=%s' % in_tree_rp_uuid,
+466             version='1.20',
+467         ).body['resource_providers']
+468         return [rp['uuid'] for rp in rps]
+469 
+470     def _post_resource_provider(self, rp_name):
+471         return self.placement_api.post(
+472             '/resource_providers', version='1.20', body={'name': rp_name}
+473         ).body
+474 
+475     def _get_resource_provider_by_uuid(self, rp_uuid):
+476         return self.placement_api.get(
+477             '/resource_providers/%s' % rp_uuid, version='1.15',
+478         ).body
+479 
+480     def _get_provider_uuid_by_name(self, name):
+481         return self.placement_api.get(
+482             '/resource_providers?name=%s' % name,
+483         ).body['resource_providers'][0]['uuid']
+484 
+485     def _get_provider_usages(self, provider_uuid):
+486         return self.placement_api.get(
+487             '/resource_providers/%s/usages' % provider_uuid
+488         ).body['usages']
+489 
+490     # TODO(stephenfin): Rename to '_get_provider_allocations'
+491     def _get_allocations_by_provider_uuid(self, rp_uuid):
+492         return self.placement_api.get(
+493             '/resource_providers/%s/allocations' % rp_uuid
+494         ).body['allocations']
+495 
+496     def _get_provider_traits(self, rp_uuid):
+497         """Get traits for the specified provider.
+498 
+499         :param rp_uuid: UUID of the resource provider to update
+500         :returns: Dict object with the results.
+501         """
+502         return self.placement_api.get(
+503             '/resource_providers/%s/traits' % rp_uuid, version='1.6'
+504         ).body['traits']
+505 
+506     def _set_provider_traits(self, rp_uuid, traits):
+507         """Set traits for the specified provider.
+508 
+509         This will overwrite any existing traits.
+510 
+511         :param rp_uuid: UUID of the resource provider to update.
+512         :param traits: List of trait strings to set on the provider.
+513         :returns: APIResponse object with the results.
+514         """
+515         provider = self.placement_api.get(
+516             '/resource_providers/%s' % rp_uuid
+517         ).body
+518         return self.placement_api.put(
+519             '/resource_providers/%s/traits' % rp_uuid,
+520             {
+521                 'resource_provider_generation': provider['generation'],
+522                 'traits': traits
+523             },
+524             version='1.6',
+525         )
+526 
+527     def _get_provider_inventory(self, rp_uuid):
+528         return self.placement_api.get(
+529             '/resource_providers/%s/inventories' % rp_uuid
+530         ).body['inventories']
+531 
+532     # TODO(stephenfin): Rename '_set_provider_inventory'
+533     def _set_inventory(self, rp_uuid, inv_body):
+534         """This will set the inventory for a given resource provider.
+535 
+536         :param rp_uuid: UUID of the resource provider to update
+537         :param inv_body: inventory to set on the provider
+538         :returns: APIResponse object with the results
+539         """
+540         return self.placement_api.post(
+541             '/resource_providers/%s/inventories' % rp_uuid,
+542             version='1.15', body=inv_body
+543         ).body
+544 
+545     # TODO(stephenfin): Rename '_update_provider_inventory'
+546     def _update_inventory(self, rp_uuid, inv_body):
+547         """This will update the inventory for a given resource provider.
+548 
+549         :param rp_uuid: UUID of the resource provider to update
+550         :param inv_body: inventory to set on the provider
+551         :returns: APIResponse object with the results
+552         """
+553         return self.placement_api.put(
+554             '/resource_providers/%s/inventories' % rp_uuid, body=inv_body,
+555         ).body
+556 
+557     def _get_provider_aggregates(self, rp_uuid):
+558         return self.placement_api.get(
+559             '/resource_providers/%s/aggregates' % rp_uuid, version='1.1'
+560         ).body['aggregates']
+561 
+562     # TODO(stephenfin): Rename '_set_provider_aggregates'
+563     def _set_aggregate(self, rp_uuid, agg_id):
+564         provider = self.placement_api.get(
+565             '/resource_providers/%s' % rp_uuid
+566         ).body
+567         return self.placement_api.put(
+568             '/resource_providers/%s/aggregates' % rp_uuid,
+569             body={
+570                 'aggregates': [agg_id],
+571                 'resource_provider_generation': provider['generation'],
+572             },
+573             version='1.19',
+574         ).body
+575 
+576     def _get_all_traits(self):
+577         return self.placement_api.get('/traits', version='1.6').body['traits']
+578 
+579     def _create_trait(self, trait):
+580         return self.placement_api.put('/traits/%s' % trait, {}, version='1.6')
+581 
+582     def _delete_trait(self, trait):
+583         return self.placement_api.delete('/traits/%s' % trait, version='1.6')
+584 
+585     def assertRequestMatchesUsage(self, requested_resources, root_rp_uuid):
+586         # It matches the usages of the whole tree against the request
+587         rp_uuids = self._get_all_rp_uuids_in_a_tree(root_rp_uuid)
+588         # NOTE(gibi): flattening the placement usages means we cannot
+589         # verify the structure here. However I don't see any way to define this
+590         # function for nested and non-nested trees in a generic way.
+591         total_usage = collections.defaultdict(int)
+592         for rp in rp_uuids:
+593             usage = self._get_provider_usages(rp)
+594             for rc, amount in usage.items():
+595                 total_usage[rc] += amount
+596         # Cannot simply do an assertEqual(expected, actual) as usages always
+597         # contain every RC even if the usage is 0 and the flavor could also
+598         # contain explicit 0 request for some resources.
+599         # So if the flavor contains an explicit 0 resource request (e.g. in
+600         # case of ironic resources:VCPU=0) then this code needs to assert that
+601         # such resource has 0 usage in the tree. In the other hand if the usage
+602         # contains 0 value for some resources that the flavor does not request
+603         # then that is totally fine.
+604         for rc, value in requested_resources.items():
+605             self.assertIn(
+606                 rc, total_usage,
+607                 'The requested resource class not found in the total_usage of '
+608                 'the RP tree')
+609             self.assertEqual(
+610                 value,
+611                 total_usage[rc],
+612                 'The requested resource amount does not match with the total '
+613                 'resource usage of the RP tree')
+614         for rc, value in total_usage.items():
+615             if value != 0:
+616                 self.assertEqual(
+617                     requested_resources[rc],
+618                     value,
+619                     'The requested resource amount does not match with the '
+620                     'total resource usage of the RP tree')
+621 
+622     def assertFlavorMatchesUsage(self, root_rp_uuid, *flavors):
+623         resources = collections.defaultdict(int)
+624         for flavor in flavors:
+625             res = self._resources_from_flavor(flavor)
+626             for rc, value in res.items():
+627                 resources[rc] += value
+628         self.assertRequestMatchesUsage(resources, root_rp_uuid)
+629 
+630     def _resources_from_flavor(self, flavor):
+631         resources = collections.defaultdict(int)
+632         resources['VCPU'] = flavor['vcpus']
+633         resources['MEMORY_MB'] = flavor['ram']
+634         resources['DISK_GB'] = flavor['disk']
+635         for key, value in flavor['extra_specs'].items():
+636             if key.startswith('resources'):
+637                 resources[key.split(':')[1]] += value
+638         return resources
+639 
+640     def assertFlavorMatchesAllocation(
+641         self, flavor, consumer_uuid, root_rp_uuid,
+642     ):
+643         # NOTE(gibi): This function does not handle sharing RPs today.
+644         expected_rps = self._get_all_rp_uuids_in_a_tree(root_rp_uuid)
+645         allocations = self._get_allocations_by_server_uuid(consumer_uuid)
+646         # NOTE(gibi): flattening the placement allocation means we cannot
+647         # verify the structure here. However I don't see any way to define this
+648         # function for nested and non-nested trees in a generic way.
+649         total_allocation = collections.defaultdict(int)
+650         for rp, alloc in allocations.items():
+651             self.assertIn(
+652                 rp, expected_rps,
+653                 'Unexpected, out of tree RP in the allocation')
+654             for rc, value in alloc['resources'].items():
+655                 total_allocation[rc] += value
+656 
+657         self.assertEqual(
+658             self._resources_from_flavor(flavor),
+659             total_allocation,
+660             'The resources requested in the flavor does not match with total '
+661             'allocation in the RP tree')
+662 
+663     def get_migration_uuid_for_instance(self, instance_uuid):
+664         # NOTE(danms): This is too much introspection for a test like this, but
+665         # we can't see the migration uuid from the API, so we just encapsulate
+666         # the peek behind the curtains here to keep it out of the tests.
+667         # TODO(danms): Get the migration uuid from the API once it is exposed
+668         ctxt = context.get_admin_context()
+669         migrations = db.migration_get_all_by_filters(
+670             ctxt, {'instance_uuid': instance_uuid})
+671         self.assertEqual(
+672             1, len(migrations),
+673             'Test expected a single migration but found %i' % len(migrations))
+674         return migrations[0].uuid
+675 
+676 
+677 class PlacementInstanceHelperMixin(InstanceHelperMixin, PlacementHelperMixin):
+678     """A placement-aware variant of InstanceHelperMixin."""
+679 
+680     # TODO(stephenfin): Rename to '_get_server_allocations'
+681     def _get_allocations_by_server_uuid(self, server_uuid):
+682         return self.placement_api.get(
+683             '/allocations/%s' % server_uuid
+684         ).body['allocations']
+685 
+686     def _wait_for_server_allocations(self, consumer_id, max_retries=20):
+687         retry_count = 0
+688         while True:
+689             alloc = self._get_allocations_by_server_uuid(consumer_id)
+690             if alloc:
+691                 break
+692             retry_count += 1
+693             if retry_count == max_retries:
+694                 self.fail('Wait for server allocations failed, '
+695                           'server=%s' % (consumer_id))
+696             time.sleep(0.5)
+697         return alloc
+698 
+699     def _get_provider_uuid_by_host(self, host):
+700         # NOTE(gibi): the compute node id is the same as the compute node
+701         # provider uuid on that compute
+702         return self.admin_api.api_get(
+703             'os-hypervisors?hypervisor_hostname_pattern=%s' % host
+704         ).body['hypervisors'][0]['id']
+705 
+706     # TODO(stephenfin): Rename to '_create_server_and_check_allocations'
+707     def _boot_and_check_allocations(
+708         self, flavor, source_hostname, networks='none',
+709     ):
+710         """Boot an instance and check that the resource allocation is correct
+711 
+712         After booting an instance on the given host with a given flavor it
+713         asserts that both the providers usages and resource allocations match
+714         with the resources requested in the flavor. It also asserts that
+715         running the periodic update_available_resource call does not change the
+716         resource state.
+717 
+718         :param flavor: the flavor the instance will be booted with
+719         :param source_hostname: the name of the host the instance will be
+720                                 booted on
+721         :param networks: list of network dicts passed to the server create API
+722             or "none" or "auto"
+723         :return: the API representation of the booted instance
+724         """
+725         server_req = self._build_server(
+726             image_uuid='155d900f-4e14-4e4c-a73d-069cbf4541e6',
+727             flavor_id=flavor['id'],
+728             networks=networks,
+729         )
+730         server_req['availability_zone'] = 'nova:%s' % source_hostname
+731         LOG.info('booting on %s', source_hostname)
+732         created_server = self.api.post_server({'server': server_req})
+733         server = self._wait_for_state_change(created_server, 'ACTIVE')
+734 
+735         # Verify that our source host is what the server ended up on
+736         self.assertEqual(source_hostname, server['OS-EXT-SRV-ATTR:host'])
+737 
+738         source_rp_uuid = self._get_provider_uuid_by_host(source_hostname)
+739 
+740         # Before we run periodics, make sure that we have allocations/usages
+741         # only on the source host
+742         self.assertFlavorMatchesUsage(source_rp_uuid, flavor)
+743 
+744         # Check that the other providers has no usage
+745         for rp_uuid in [self._get_provider_uuid_by_host(hostname)
+746                         for hostname in self.computes.keys()
+747                         if hostname != source_hostname]:
+748             self.assertRequestMatchesUsage(
+749                 {'VCPU': 0, 'MEMORY_MB': 0, 'DISK_GB': 0}, rp_uuid)
+750 
+751         # Check that the server only allocates resource from the host it is
+752         # booted on
+753         self.assertFlavorMatchesAllocation(
+754             flavor, server['id'], source_rp_uuid)
+755         self._run_periodics()
+756 
+757         # After running the periodics but before we start any other operation,
+758         # we should have exactly the same allocation/usage information as
+759         # before running the periodics
+760 
+761         # Check usages on the selected host after boot
+762         self.assertFlavorMatchesUsage(source_rp_uuid, flavor)
+763 
+764         # Check that the server only allocates resource from the host it is
+765         # booted on
+766         self.assertFlavorMatchesAllocation(
+767             flavor, server['id'], source_rp_uuid)
+768 
+769         # Check that the other providers has no usage
+770         for rp_uuid in [self._get_provider_uuid_by_host(hostname)
+771                         for hostname in self.computes.keys()
+772                         if hostname != source_hostname]:
+773             self.assertRequestMatchesUsage(
+774                 {'VCPU': 0, 'MEMORY_MB': 0, 'DISK_GB': 0}, rp_uuid)
+775 
+776         return server
+777 
+778     # TODO(stephenfin): Rename to '_delete_server_and_check_allocations'
+779     def _delete_and_check_allocations(self, server):
+780         """Delete the instance and asserts that the allocations are cleaned
+781 
+782         If the server was moved (resized or live migrated), also checks that
+783         migration-based allocations are also cleaned up.
+784 
+785         :param server: The API representation of the instance to be deleted
+786         :returns: The uuid of the migration record associated with the resize
+787             or cold migrate operation
+788         """
+789         # First check to see if there is a related migration record so we can
+790         # assert its allocations (if any) are not leaked.
+791         with utils.temporary_mutation(self.admin_api, microversion='2.59'):
+792             migrations = self.admin_api.api_get(
+793                 '/os-migrations?instance_uuid=%s' % server['id']
+794             ).body['migrations']
+795 
+796         if migrations:
+797             # If there is more than one migration, they are sorted by
+798             # created_at in descending order so we'll get the last one
+799             # which is probably what we'd always want anyway.
+800             migration_uuid = migrations[0]['uuid']
+801         else:
+802             migration_uuid = None
+803 
+804         self._delete_server(server)
+805 
+806         # NOTE(gibi): The resource allocation is deleted after the instance is
+807         # destroyed in the db so wait_until_deleted might return before the
+808         # the resource are deleted in placement. So we need to wait for the
+809         # instance.delete.end notification as that is emitted after the
+810         # resources are freed.
+811 
+812         fake_notifier.wait_for_versioned_notifications('instance.delete.end')
+813 
+814         for rp_uuid in [
+815             self._get_provider_uuid_by_host(hostname)
+816             for hostname in self.computes.keys()
+817         ]:
+818             self.assertRequestMatchesUsage(
+819                 {'VCPU': 0, 'MEMORY_MB': 0, 'DISK_GB': 0}, rp_uuid)
+820 
+821         # and no allocations for the deleted server
+822         allocations = self._get_allocations_by_server_uuid(server['id'])
+823         self.assertEqual(0, len(allocations))
+824 
+825         if migration_uuid:
+826             # and no allocations for the delete migration
+827             allocations = self._get_allocations_by_server_uuid(migration_uuid)
+828             self.assertEqual(0, len(allocations))
+829 
+830         return migration_uuid
+831 
+832     def _move_and_check_allocations(
+833         self, server, request, old_flavor, new_flavor, source_rp_uuid,
+834         dest_rp_uuid,
+835     ):
+836         if 'resize' not in request and 'migrate' not in request:
+837             raise Exception(
+838                 '_move_and_check_allocations only supports resize or migrate '
+839                 'requests.')
+840 
+841         self.api.post_server_action(server['id'], request)
+842         self._wait_for_state_change(server, 'VERIFY_RESIZE')
+843 
+844         def _check_allocation():
+845             self.assertFlavorMatchesUsage(source_rp_uuid, old_flavor)
+846             self.assertFlavorMatchesUsage(dest_rp_uuid, new_flavor)
+847 
+848             # The instance should own the new_flavor allocation against the
+849             # destination host created by the scheduler
+850             self.assertFlavorMatchesAllocation(new_flavor, server['id'],
+851                                                dest_rp_uuid)
+852 
+853             # The migration should own the old_flavor allocation against the
+854             # source host created by conductor
+855             migration_uuid = self.get_migration_uuid_for_instance(server['id'])
+856             self.assertFlavorMatchesAllocation(old_flavor, migration_uuid,
+857                                                source_rp_uuid)
+858 
+859         # OK, so the move operation has run, but we have not yet confirmed or
+860         # reverted the move operation. Before we run periodics, make sure
+861         # that we have allocations/usages on BOTH the source and the
+862         # destination hosts.
+863         _check_allocation()
+864         self._run_periodics()
+865         _check_allocation()
+866 
+867         # Make sure the RequestSpec.flavor matches the new_flavor.
+868         ctxt = context.get_admin_context()
+869         reqspec = objects.RequestSpec.get_by_instance_uuid(ctxt, server['id'])
+870         self.assertEqual(new_flavor['id'], reqspec.flavor.flavorid)
+871 
+872     # TODO(stephenfin): Rename to '_migrate_server_and_check_allocations'
+873     def _migrate_and_check_allocations(
+874         self, server, flavor, source_rp_uuid, dest_rp_uuid,
+875     ):
+876         request = {'migrate': None}
+877         self._move_and_check_allocations(
+878             server, request=request, old_flavor=flavor, new_flavor=flavor,
+879             source_rp_uuid=source_rp_uuid, dest_rp_uuid=dest_rp_uuid)
+880 
+881     # TODO(stephenfin): Rename to '_resize_server_and_check_allocations'
+882     def _resize_and_check_allocations(
+883         self, server, old_flavor, new_flavor, source_rp_uuid, dest_rp_uuid,
+884     ):
+885         request = {
+886             'resize': {
+887                 'flavorRef': new_flavor['id']
+888             }
+889         }
+890         self._move_and_check_allocations(
+891             server, request=request, old_flavor=old_flavor,
+892             new_flavor=new_flavor, source_rp_uuid=source_rp_uuid,
+893             dest_rp_uuid=dest_rp_uuid)
+894 
+895     # TODO(stephenfin): Rename to
+896     # '_resize_server_to_same_host_and_check_allocations'
+897     def _resize_to_same_host_and_check_allocations(
+898         self, server, old_flavor, new_flavor, rp_uuid,
+899     ):
+900         # Resize the server to the same host and check usages in VERIFY_RESIZE
+901         # state
+902         self.flags(allow_resize_to_same_host=True)
+903         self._resize_server(server, new_flavor['id'])
+904 
+905         self.assertFlavorMatchesUsage(rp_uuid, old_flavor, new_flavor)
+906 
+907         # The instance should hold a new_flavor allocation
+908         self.assertFlavorMatchesAllocation(new_flavor, server['id'],
+909                                            rp_uuid)
+910 
+911         # The migration should hold an old_flavor allocation
+912         migration_uuid = self.get_migration_uuid_for_instance(server['id'])
+913         self.assertFlavorMatchesAllocation(old_flavor, migration_uuid,
+914                                            rp_uuid)
+915 
+916         # We've resized to the same host and have doubled allocations for both
+917         # the old and new flavor on the same host. Run the periodic on the
+918         # compute to see if it tramples on what the scheduler did.
+919         self._run_periodics()
+920 
+921         # In terms of usage, it's still double on the host because the instance
+922         # and the migration each hold an allocation for the new and old
+923         # flavors respectively.
+924         self.assertFlavorMatchesUsage(rp_uuid, old_flavor, new_flavor)
+925 
+926         # The instance should hold a new_flavor allocation
+927         self.assertFlavorMatchesAllocation(new_flavor, server['id'],
+928                                            rp_uuid)
+929 
+930         # The migration should hold an old_flavor allocation
+931         self.assertFlavorMatchesAllocation(old_flavor, migration_uuid,
+932                                            rp_uuid)
+933 
+934     def _check_allocation_during_evacuate(
+935         self, flavor, server_uuid, source_root_rp_uuid, dest_root_rp_uuid,
+936     ):
+937         allocations = self._get_allocations_by_server_uuid(server_uuid)
+938         self.assertEqual(2, len(allocations))
+939         self.assertFlavorMatchesUsage(source_root_rp_uuid, flavor)
+940         self.assertFlavorMatchesUsage(dest_root_rp_uuid, flavor)
+941 
+942     def assert_hypervisor_usage(
+943         self, compute_node_uuid, flavor, volume_backed,
+944     ):
+945         """Asserts the given hypervisor's resource usage matches the
+946         given flavor (assumes a single instance on the hypervisor).
+947 
+948         :param compute_node_uuid: UUID of the ComputeNode to check.
+949         :param flavor: "flavor" entry dict from from GET /flavors/{flavor_id}
+950         :param volume_backed: True if the flavor is used with a volume-backed
+951             server, False otherwise.
+952         """
+953         # GET /os-hypervisors/{uuid} requires at least 2.53
+954         with utils.temporary_mutation(self.admin_api, microversion='2.53'):
+955             hypervisor = self.admin_api.api_get(
+956                 '/os-hypervisors/%s' % compute_node_uuid
+957             ).body['hypervisor']
+958 
+959         if volume_backed:
+960             expected_disk_usage = 0
+961         else:
+962             expected_disk_usage = flavor['disk']
+963 
+964         # Account for reserved_host_disk_mb.
+965         expected_disk_usage += compute_utils.convert_mb_to_ceil_gb(
+966             CONF.reserved_host_disk_mb)
+967         self.assertEqual(expected_disk_usage, hypervisor['local_gb_used'])
+968         # Account for reserved_host_memory_mb.
+969         expected_ram_usage = CONF.reserved_host_memory_mb + flavor['ram']
+970         self.assertEqual(expected_ram_usage, hypervisor['memory_mb_used'])
+971         # Account for reserved_host_cpus.
+972         expected_vcpu_usage = CONF.reserved_host_cpus + flavor['vcpus']
+973         self.assertEqual(expected_vcpu_usage, hypervisor['vcpus_used'])
+974 
+975 
+976 class _IntegratedTestBase(test.TestCase, PlacementInstanceHelperMixin):
+977     #: Whether the test requires global external locking being configured for
+978     #: them. New tests should set this to False.
+979     REQUIRES_LOCKING = True
+980 
+981     #: Whether to use admin credentials for all nova API requests.
+982     ADMIN_API = False
+983 
+984     # TODO(stephenfin): Rename to API_MAJOR_VERSION
+985     #: The default API major version to use for all nova API requests.
+986     api_major_version = 'v2.1'
+987 
+988     # TODO(stephenfin): Rename to API_MICRO_VERSION
+989     #: The default microversion to use for all nova API requests; requires API
+990     #: major version 2.1
+991     microversion = None
+992 
+993     #: Whether to include the project ID in the URL for API requests through
+994     #: OSAPIFixture.
+995     USE_PROJECT_ID = False
+996 
+997     #: Whether to stub keystonemiddleware and NovaKeystoneContext; override to
+998     #: making those middlewares behave as they would in real life, i.e. try to
+999     #: do real authentication.
+1000     STUB_KEYSTONE = True
+1001 
+1002     def setUp(self):
+1003         super(_IntegratedTestBase, self).setUp()
+1004 
+1005         self.fake_image_service =\
+1006             nova.tests.unit.image.fake.stub_out_image_service(self)
+1007 
+1008         self.useFixture(cast_as_call.CastAsCall(self))
+1009 
+1010         placement = self.useFixture(func_fixtures.PlacementFixture())
+1011         self.placement_api = placement.api
+1012 
+1013         self.neutron = self.useFixture(nova_fixtures.NeutronFixture(self))
+1014 
+1015         fake_notifier.stub_notifier(self)
+1016         self.addCleanup(fake_notifier.reset)
+1017 
+1018         self._setup_services()
+1019 
+1020         self.addCleanup(nova.tests.unit.image.fake.FakeImageService_reset)
+1021 
+1022     def _setup_compute_service(self):
+1023         return self._start_compute('compute')
+1024 
+1025     def _setup_scheduler_service(self):
+1026         return self.start_service('scheduler')
+1027 
+1028     def _setup_services(self):
+1029         # NOTE(danms): Set the global MQ connection to that of our first cell
+1030         # for any cells-ignorant code. Normally this is defaulted in the tests
+1031         # which will result in us not doing the right thing.
+1032         if 'cell1' in self.cell_mappings:
+1033             self.flags(transport_url=self.cell_mappings['cell1'].transport_url)
+1034 
+1035         self.conductor = self.start_service('conductor')
+1036         self.scheduler = self._setup_scheduler_service()
+1037         self.compute = self._setup_compute_service()
+1038 
+1039         self.api_fixture = self.useFixture(
+1040             nova_fixtures.OSAPIFixture(
+1041                 api_version=self.api_major_version,
+1042                 use_project_id_in_urls=self.USE_PROJECT_ID,
+1043                 stub_keystone=self.STUB_KEYSTONE))
+1044 
+1045         # if the class needs to run as admin, make the api endpoint
+1046         # the admin, otherwise it's safer to run as non admin user.
+1047         if self.ADMIN_API:
+1048             self.api = self.api_fixture.admin_api
+1049         else:
+1050             self.api = self.api_fixture.api
+1051             self.admin_api = self.api_fixture.admin_api
+1052 
+1053         if self.microversion:
+1054             self.api.microversion = self.microversion
+1055 
+1056             if not self.ADMIN_API:
+1057                 self.admin_api.microversion = self.microversion
+1058 
+1059     def _check_api_endpoint(self, endpoint, expected_middleware):
+1060         app = self.api_fixture.app().get((None, '/v2'))
+1061 
+1062         while getattr(app, 'application', False):
+1063             for middleware in expected_middleware:
+1064                 if isinstance(app.application, middleware):
+1065                     expected_middleware.remove(middleware)
+1066                     break
+1067             app = app.application
+1068 
+1069         self.assertEqual([],
+1070                          expected_middleware,
+1071                          ("The expected wsgi middlewares %s are not "
+1072                           "existed") % expected_middleware)
+1073 
+1074 
+1075 # TODO(stephenfin): This is almost identical to '_IntegratedTestBase' now and
+1076 # could be removed
+1077 class ProviderUsageBaseTestCase(test.TestCase, PlacementInstanceHelperMixin):
+1078     """Base test class for functional tests that check provider usage
+1079     and consumer allocations in Placement during various operations.
+1080 
+1081     Subclasses must define a **compute_driver** attribute for the virt driver
+1082     to use.
+1083 
+1084     This class sets up standard fixtures and controller services but does not
+1085     start any compute services, that is left to the subclass.
+1086     """
+1087 
+1088     microversion = 'latest'
+1089 
+1090     def setUp(self):
+1091         self.flags(compute_driver=self.compute_driver)
+1092         super(ProviderUsageBaseTestCase, self).setUp()
+1093 
+1094         self.policy = self.useFixture(policy_fixture.RealPolicyFixture())
+1095         self.neutron = self.useFixture(nova_fixtures.NeutronFixture(self))
+1096         self.useFixture(nova_fixtures.AllServicesCurrent())
+1097 
+1098         fake_notifier.stub_notifier(self)
+1099         self.addCleanup(fake_notifier.reset)
+1100 
+1101         placement = self.useFixture(func_fixtures.PlacementFixture())
+1102         self.placement_api = placement.api
+1103         self.api_fixture = self.useFixture(nova_fixtures.OSAPIFixture(
+1104             api_version='v2.1'))
+1105 
+1106         self.admin_api = self.api_fixture.admin_api
+1107         self.admin_api.microversion = self.microversion
+1108         self.api = self.admin_api
+1109 
+1110         # the image fake backend needed for image discovery
+1111         self.image_service = (
+1112             nova.tests.unit.image.fake.stub_out_image_service(self))
+1113 
+1114         self.start_service('conductor')
+1115         self.scheduler_service = self.start_service('scheduler')
+1116 
+1117         self.addCleanup(nova.tests.unit.image.fake.FakeImageService_reset)

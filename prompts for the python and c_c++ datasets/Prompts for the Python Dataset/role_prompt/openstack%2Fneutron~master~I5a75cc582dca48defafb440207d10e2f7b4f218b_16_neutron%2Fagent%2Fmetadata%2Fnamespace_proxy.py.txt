@@ -1,0 +1,197 @@
+I want you to act as a code reviewer of Neutron in OpenStack. Please review the code below to detect security defects. If any are found, please describe the security defect in detail and indicate the corresponding line number of code and solution. If none are found, please state '''No security defects are detected in the code'''.
+
+1 # Copyright 2012 New Dream Network, LLC (DreamHost)
+2 #
+3 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
+4 #    not use this file except in compliance with the License. You may obtain
+5 #    a copy of the License at
+6 #
+7 #         http://www.apache.org/licenses/LICENSE-2.0
+8 #
+9 #    Unless required by applicable law or agreed to in writing, software
+10 #    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+11 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+12 #    License for the specific language governing permissions and limitations
+13 #    under the License.
+14 
+15 import errno
+16 import grp
+17 import os
+18 import pwd
+19 
+20 from oslo_config import cfg
+21 from oslo_log import log as logging
+22 
+23 from neutron.agent.linux import daemon
+24 from neutron.agent.linux import utils as agent_utils
+25 from neutron.common import config
+26 from neutron.common import exceptions
+27 from neutron.common import utils
+28 from neutron.conf.agent.metadata import namespace_proxy as namespace
+29 
+30 LOG = logging.getLogger(__name__)
+31 
+32 PROXY_CONFIG_DIR = "ns-metadata-proxy"
+33 _HAPROXY_CONFIG_TEMPLATE = """
+34 global
+35     user        %(user)s
+36     group       %(group)s
+37     maxconn     1024
+38 
+39 defaults
+40     mode                    http
+41     option http-server-close
+42     option forwardfor
+43     retries                 3
+44     timeout http-request    30s
+45     timeout connect         30s
+46     timeout client          32s
+47     timeout server          32s
+48     timeout http-keep-alive 30s
+49 
+50 listen listener
+51     bind 0.0.0.0:%(port)s
+52     server metadata %(unix_socket_path)s
+53 """
+54 
+55 
+56 class NetworkMetadataProxyHandler(object):
+57     """Proxy AF_INET metadata request through Unix Domain socket.
+58 
+59     The Unix domain socket allows the proxy access resource that are not
+60     accessible within the isolated tenant context.
+61     """
+62 
+63     def __init__(self, network_id=None, router_id=None, unix_socket_path=None,
+64                  port='9697', user=None, group=None, state_path=None):
+65         self.network_id = network_id
+66         self.router_id = router_id
+67         if network_id is None and router_id is None:
+68             raise exceptions.NetworkIdOrRouterIdRequiredError()
+69 
+70         self.port = port
+71         self.user = user or str(os.geteuid())
+72         self.group = group or str(os.getegid())
+73         self.state_path = state_path
+74         self.unix_socket_path = (unix_socket_path or
+75                                  cfg.CONF.metadata_proxy_socket)
+76 
+77     def _create_config_file(self):
+78         """Create the config file for haproxy."""
+79         # Need to convert uid/gid into username/group
+80         try:
+81             pw_user = pwd.getpwuid(int(self.user))
+82             username = pw_user[0]
+83         except ValueError:
+84             username = self.user
+85 
+86         try:
+87             groupname = grp.getgrgid(int(self.group)).gr_name
+88         except ValueError:
+89             groupname = self.group
+90 
+91         cfg_info = {
+92             'port': self.port,
+93             'unix_socket_path': self.unix_socket_path,
+94             'user': username,
+95             'group': groupname
+96         }
+97 
+98         haproxy_cfg = _HAPROXY_CONFIG_TEMPLATE % cfg_info
+99         if self.network_id:
+100             haproxy_cfg += (
+101                 "    http-request add-header X-Neutron-Network-ID %s\n" %
+102                 self.network_id)
+103         if self.router_id:
+104             haproxy_cfg += (
+105                 "    http-request add-header X-Neutron-Router-ID %s\n" %
+106                 self.router_id)
+107         LOG.debug("haproxy_cfg = %s", haproxy_cfg)
+108         cfg_dir = self.get_config_path(self.state_path)
+109         # uuid has to be included somewhere in the command line so that it can
+110         # be tracked by process_monitor.
+111         self.cfg_path = os.path.join(cfg_dir,
+112                                      (self.router_id or self.network_id) +
+113                                      ".conf")
+114         if not os.path.exists(cfg_dir):
+115             os.makedirs(cfg_dir)
+116         with open(self.cfg_path, "w") as cfg_file:
+117             cfg_file.write(haproxy_cfg)
+118 
+119     def run_proxy(self):
+120         """Start haproxy with the right config file."""
+121         self._create_config_file()
+122         haproxy_path = agent_utils.execute(['which', 'haproxy'],
+123                                            run_as_root=False).strip()
+124         LOG.debug("haproxy path: %s", haproxy_path)
+125 
+126         # Replace our process image with haproxy and keep our PID for tracking
+127         os.execl(haproxy_path, haproxy_path, '-f', self.cfg_path)
+128 
+129     @staticmethod
+130     def get_config_path(state_path):
+131         return os.path.join(state_path or cfg.CONF.state_path,
+132                             PROXY_CONFIG_DIR)
+133 
+134 
+135 def cleanup_config_file(uuid, state_path=None):
+136     """Delete config file created when metadata proxy was spawned."""
+137     # Delete config file if it exists
+138     cfg_path = os.path.join(
+139         NetworkMetadataProxyHandler.get_config_path(state_path),
+140         uuid + ".conf")
+141     try:
+142         os.unlink(cfg_path)
+143     except OSError as ex:
+144         # It can happen that this function is called but metadata proxy
+145         # was never spawned so its config file won't exist
+146         if ex.errno != errno.ENOENT:
+147             raise
+148 
+149 
+150 class ProxyDaemon(daemon.Daemon):
+151     def __init__(self, pidfile, port, network_id=None, router_id=None,
+152                  user=None, group=None, watch_log=True,
+153                  proxy_socket=None, state_path=''):
+154         uuid = network_id or router_id
+155         super(ProxyDaemon, self).__init__(pidfile, uuid=uuid, user=user,
+156                                           group=group, watch_log=watch_log)
+157         self.network_id = network_id
+158         self.router_id = router_id
+159         self.port = port
+160         self.proxy_socket = proxy_socket
+161         self.state_path = state_path
+162 
+163     def run(self):
+164         handler = NetworkMetadataProxyHandler(
+165             self.network_id,
+166             self.router_id,
+167             self.proxy_socket,
+168             self.port,
+169             self.user,
+170             self.group,
+171             self.state_path)
+172         handler.run_proxy()
+173 
+174 
+175 def main():
+176     namespace.register_namespace_proxy_opts(cfg.CONF)
+177     # Don't read any default configuration file,  just handle cmdline opts
+178     cfg.CONF(project='neutron',
+179              default_config_files=[], default_config_dirs=[])
+180     config.setup_logging()
+181     utils.log_opt_values(LOG)
+182 
+183     proxy = ProxyDaemon(cfg.CONF.pid_file,
+184                         cfg.CONF.metadata_port,
+185                         network_id=cfg.CONF.network_id,
+186                         router_id=cfg.CONF.router_id,
+187                         user=cfg.CONF.metadata_proxy_user,
+188                         group=cfg.CONF.metadata_proxy_group,
+189                         proxy_socket=cfg.CONF.metadata_proxy_socket,
+190                         state_path=cfg.CONF.state_path)
+191 
+192     if cfg.CONF.daemonize:
+193         proxy.start()
+194     else:
+195         proxy.run()

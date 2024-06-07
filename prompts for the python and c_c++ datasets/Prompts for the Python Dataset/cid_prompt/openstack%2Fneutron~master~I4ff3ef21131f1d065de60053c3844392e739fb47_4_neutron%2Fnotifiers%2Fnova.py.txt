@@ -1,0 +1,324 @@
+Please review the code below for security defects. You can consider defect types in terms of:
+1.CWE-284 (Improper Access Control)
+2.CWE-435 (Improper Interaction Between Multiple Entities)
+3.CWE-664 (Improper Control of a Resource Through its Lifetime)
+4.CWE-682 (Incorrect Calculation)
+5.CWE-691 (Insufficient Control Flow Management)
+6.CWE-693 (Protection Mechanism Failure)
+7.CWE-697 (Incorrect Comparison)
+8.CWE-703 (Improper Check or Handling of Exceptional Conditions)
+9.CWE-707 (Improper Neutralization)
+10.CWE-710 (Improper Adherence to Coding Standards)
+If any are found, please describe the security defect in detail and indicate the corresponding line number of code and solution. If none are detected, states: 'No security defects are detected in the code'.
+
+1 # Copyright (c) 2014 OpenStack Foundation.
+2 # All Rights Reserved.
+3 #
+4 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
+5 #    not use this file except in compliance with the License. You may obtain
+6 #    a copy of the License at
+7 #
+8 #         http://www.apache.org/licenses/LICENSE-2.0
+9 #
+10 #    Unless required by applicable law or agreed to in writing, software
+11 #    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+12 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+13 #    License for the specific language governing permissions and limitations
+14 #    under the License.
+15 
+16 import contextlib
+17 
+18 from keystoneauth1 import loading as ks_loading
+19 from neutron_lib.callbacks import events
+20 from neutron_lib.callbacks import registry
+21 from neutron_lib.callbacks import resources
+22 from neutron_lib import constants
+23 from neutron_lib import context
+24 from neutron_lib import exceptions as exc
+25 from neutron_lib.plugins import directory
+26 from novaclient import api_versions
+27 from novaclient import client as nova_client
+28 from novaclient import exceptions as nova_exceptions
+29 from oslo_config import cfg
+30 from oslo_context import context as common_context
+31 from oslo_log import log as logging
+32 from oslo_utils import uuidutils
+33 from sqlalchemy.orm import attributes as sql_attr
+34 
+35 from neutron.notifiers import batch_notifier
+36 
+37 
+38 LOG = logging.getLogger(__name__)
+39 
+40 VIF_UNPLUGGED = 'network-vif-unplugged'
+41 VIF_PLUGGED = 'network-vif-plugged'
+42 VIF_DELETED = 'network-vif-deleted'
+43 NEUTRON_NOVA_EVENT_STATUS_MAP = {constants.PORT_STATUS_ACTIVE: 'completed',
+44                                  constants.PORT_STATUS_ERROR: 'failed',
+45                                  constants.PORT_STATUS_DOWN: 'completed'}
+46 NOVA_API_VERSION = "2.1"
+47 
+48 
+49 @registry.has_registry_receivers
+50 class Notifier(object):
+51 
+52     _instance = None
+53 
+54     @classmethod
+55     def get_instance(cls):
+56         if cls._instance is None:
+57             cls._instance = cls()
+58         return cls._instance
+59 
+60     def __init__(self):
+61         auth = ks_loading.load_auth_from_conf_options(cfg.CONF, 'nova')
+62         self.session = ks_loading.load_session_from_conf_options(
+63             cfg.CONF,
+64             'nova',
+65             auth=auth)
+66         self.extensions = [
+67             ext for ext in nova_client.discover_extensions(NOVA_API_VERSION)
+68             if ext.name == "server_external_events"]
+69         self.batch_notifier = batch_notifier.BatchNotifier(
+70             cfg.CONF.send_events_interval, self.send_events)
+71         self._enabled = True
+72 
+73     @contextlib.contextmanager
+74     def context_enabled(self, enabled):
+75         stored_enabled = self._enabled
+76         try:
+77             self._enabled = enabled
+78             yield
+79         finally:
+80             self._enabled = stored_enabled
+81 
+82     def _get_nova_client(self):
+83         global_id = common_context.generate_request_id()
+84         return nova_client.Client(
+85             api_versions.APIVersion(NOVA_API_VERSION),
+86             session=self.session,
+87             region_name=cfg.CONF.nova.region_name,
+88             endpoint_type=cfg.CONF.nova.endpoint_type,
+89             extensions=self.extensions,
+90             connect_retries=cfg.CONF.http_retries,
+91             global_request_id=global_id)
+92 
+93     def _is_compute_port(self, port):
+94         try:
+95             if (port['device_id'] and
+96                     uuidutils.is_uuid_like(port['device_id']) and
+97                     port['device_owner'].startswith(
+98                         constants.DEVICE_OWNER_COMPUTE_PREFIX)):
+99                 return True
+100         except (KeyError, AttributeError):
+101             pass
+102         return False
+103 
+104     def _get_network_changed_event(self, port):
+105         return {'name': 'network-changed',
+106                 'server_uuid': port['device_id'],
+107                 'tag': port['id']}
+108 
+109     def _get_port_delete_event(self, port):
+110         return {'server_uuid': port['device_id'],
+111                 'name': VIF_DELETED,
+112                 'tag': port['id']}
+113 
+114     @registry.receives(resources.PORT, [events.BEFORE_RESPONSE])
+115     @registry.receives(resources.FLOATING_IP, [events.BEFORE_RESPONSE])
+116     def _send_nova_notification(self, resource, event, trigger, payload=None):
+117         self.send_network_change(payload.action, payload.states[0],
+118                                  payload.latest_state)
+119 
+120     def send_network_change(self, action, original_obj,
+121                             returned_obj):
+122         """Called when a network change is made that nova cares about.
+123 
+124         :param action: the event that occurred.
+125         :param original_obj: the previous value of resource before action.
+126         :param returned_obj: the body returned to client as result of action.
+127         """
+128 
+129         if not cfg.CONF.notify_nova_on_port_data_changes:
+130             return
+131 
+132         # When neutron re-assigns floating ip from an original instance
+133         # port to a new instance port without disassociate it first, an
+134         # event should be sent for original instance, that will make nova
+135         # know original instance's info, and update database for it.
+136         if (action == 'update_floatingip' and
+137                 returned_obj['floatingip'].get('port_id') and
+138                 original_obj.get('port_id')):
+139             disassociate_returned_obj = {'floatingip': {'port_id': None}}
+140             event = self.create_port_changed_event(action, original_obj,
+141                                                    disassociate_returned_obj)
+142             self.batch_notifier.queue_event(event)
+143 
+144         event = self.create_port_changed_event(action, original_obj,
+145                                                returned_obj)
+146         self.batch_notifier.queue_event(event)
+147 
+148     def create_port_changed_event(self, action, original_obj, returned_obj):
+149         port = None
+150         if action in ['update_port', 'delete_port']:
+151             port = returned_obj['port']
+152 
+153         elif action in ['update_floatingip', 'create_floatingip',
+154                         'delete_floatingip']:
+155             # NOTE(arosen) if we are associating a floatingip the
+156             # port_id is in the returned_obj. Otherwise on disassociate
+157             # it's in the original_object
+158             port_id = (returned_obj['floatingip'].get('port_id') or
+159                        original_obj.get('port_id'))
+160 
+161             if port_id is None:
+162                 return
+163 
+164             ctx = context.get_admin_context()
+165             try:
+166                 port = directory.get_plugin().get_port(ctx, port_id)
+167             except exc.PortNotFound:
+168                 LOG.debug("Port %s was deleted, no need to send any "
+169                           "notification", port_id)
+170                 return
+171 
+172         if port and self._is_compute_port(port):
+173             if action == 'delete_port':
+174                 return self._get_port_delete_event(port)
+175             else:
+176                 return self._get_network_changed_event(port)
+177 
+178     def _can_notify(self, port):
+179         if not self._enabled:
+180             LOG.debug("Nova notifier disabled")
+181             return False
+182 
+183         if not port.id:
+184             LOG.warning("Port ID not set! Nova will not be notified of "
+185                         "port status change.")
+186             return False
+187 
+188         # If there is no device_id set there is nothing we can do here.
+189         if not port.device_id:
+190             LOG.debug("device_id is not set on port %s yet.", port.id)
+191             return False
+192 
+193         # We only want to notify about nova ports.
+194         if not self._is_compute_port(port):
+195             return False
+196 
+197         return True
+198 
+199     def record_port_status_changed(self, port, current_port_status,
+200                                    previous_port_status, initiator):
+201         """Determine if nova needs to be notified due to port status change.
+202         """
+203         # clear out previous _notify_event
+204         port._notify_event = None
+205         if not self._can_notify(port):
+206             return
+207         # We notify nova when a vif is unplugged which only occurs when
+208         # the status goes from ACTIVE to DOWN.
+209         if (previous_port_status == constants.PORT_STATUS_ACTIVE and
+210                 current_port_status == constants.PORT_STATUS_DOWN):
+211             event_name = VIF_UNPLUGGED
+212 
+213         # We only notify nova when a vif is plugged which only occurs
+214         # when the status goes from:
+215         # NO_VALUE/DOWN/BUILD -> ACTIVE/ERROR.
+216         elif (previous_port_status in [sql_attr.NO_VALUE,
+217                                        constants.PORT_STATUS_DOWN,
+218                                        constants.PORT_STATUS_BUILD] and
+219               current_port_status in [constants.PORT_STATUS_ACTIVE,
+220                                       constants.PORT_STATUS_ERROR]):
+221             event_name = VIF_PLUGGED
+222         # All the remaining state transitions are of no interest to nova
+223         else:
+224             LOG.debug("Ignoring state change previous_port_status: "
+225                       "%(pre_status)s current_port_status: %(cur_status)s"
+226                       " port_id %(id)s",
+227                       {'pre_status': previous_port_status,
+228                        'cur_status': current_port_status,
+229                        'id': port.id})
+230             return
+231 
+232         port._notify_event = (
+233             {'server_uuid': port.device_id,
+234              'name': event_name,
+235              'status': NEUTRON_NOVA_EVENT_STATUS_MAP.get(current_port_status),
+236              'tag': port.id})
+237 
+238     def send_port_status(self, mapper, connection, port):
+239         event = getattr(port, "_notify_event", None)
+240         self.batch_notifier.queue_event(event)
+241         port._notify_event = None
+242 
+243     def notify_port_active_direct(self, port):
+244         """Notify nova about active port
+245 
+246         Used when port was wired on the host other than port's current host
+247         according to port binding. This happens during live migration.
+248         In this case ml2 plugin skips port status update but we still we need
+249         to notify nova.
+250         """
+251         if not self._can_notify(port):
+252             return
+253 
+254         port._notify_event = (
+255             {'server_uuid': port.device_id,
+256              'name': VIF_PLUGGED,
+257              'status': 'completed',
+258              'tag': port.id})
+259         self.send_port_status(None, None, port)
+260 
+261     def send_events(self, batched_events):
+262         LOG.debug("Sending events: %s", batched_events)
+263         novaclient = self._get_nova_client()
+264         try:
+265             response = novaclient.server_external_events.create(
+266                 batched_events)
+267         except nova_exceptions.NotFound:
+268             LOG.debug("Nova returned NotFound for event: %s",
+269                       batched_events)
+270         except Exception:
+271             LOG.exception("Failed to notify nova on events: %s",
+272                           batched_events)
+273         else:
+274             if not isinstance(response, list):
+275                 LOG.error("Error response returned from nova: %s",
+276                           response)
+277                 return
+278             response_error = False
+279             for event in response:
+280                 try:
+281                     code = event['code']
+282                 except KeyError:
+283                     response_error = True
+284                     continue
+285                 if code != 200:
+286                     LOG.warning("Nova event: %s returned with failed "
+287                                 "status", event)
+288                 else:
+289                     LOG.info("Nova event response: %s", event)
+290             if response_error:
+291                 LOG.error("Error response returned from nova: %s",
+292                           response)
+293 
+294     def is_port_bound_with_nonexistent_server(self, port):
+295         """Return true only if port is bound with a nonexistent server"""
+296         if not self._is_compute_port(port):
+297             return False
+298 
+299         server_uuid = port['device_id']
+300         LOG.debug("Get server %s status", server_uuid)
+301         novaclient = self._get_nova_client()
+302         try:
+303             novaclient.servers.get(server_uuid)
+304         except nova_exceptions.NotFound:
+305             LOG.warning('Nova returned not found for %s', server_uuid)
+306             return True
+307         except Exception:
+308             LOG.error('Failed to get server %s from nova', server_uuid)
+309         else:
+310             LOG.info('Port is bound with %s', server_uuid)
+311         return False

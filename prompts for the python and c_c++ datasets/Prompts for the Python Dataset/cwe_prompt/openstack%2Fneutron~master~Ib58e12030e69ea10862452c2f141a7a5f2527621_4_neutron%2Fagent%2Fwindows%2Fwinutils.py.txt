@@ -1,0 +1,608 @@
+Please review the code below for security defects using the CWE (Common Weakness Enumeration) as a reference standard. If any are found, please describe the security defect in detail and indicate the corresponding line number of code and solution. If none are detected, state: 'No security defects are detected in the code'.
+
+1 # Copyright 2017 Cloudbase Solutions.
+2 # All Rights Reserved.
+3 #
+4 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
+5 #    not use this file except in compliance with the License. You may obtain
+6 #    a copy of the License at
+7 #
+8 #         http://www.apache.org/licenses/LICENSE-2.0
+9 #
+10 #    Unless required by applicable law or agreed to in writing, software
+11 #    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+12 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+13 #    License for the specific language governing permissions and limitations
+14 #    under the License.
+15 
+16 import os
+17 import random
+18 import time
+19 
+20 import eventlet
+21 from eventlet import tpool
+22 from ovs import winutils as ovs_winutils
+23 
+24 import win32con
+25 import win32event
+26 import win32process
+27 import win32security
+28 
+29 
+30 def avoid_blocking_call(f, *args, **kwargs):
+31     """Ensure that the method "f" will not block other greenthreads.
+32 
+33     Performs the call to the function "f" received as parameter in a
+34     different thread using tpool.execute when called from a greenthread.
+35     This will ensure that the function "f" will not block other greenthreads.
+36     If not called from a greenthread, it will invoke the function "f" directly.
+37     The function "f" will receive as parameters the arguments "args" and
+38     keyword arguments "kwargs".
+39     """
+40     # Note that eventlet.getcurrent will always return a greenlet object.
+41     # In case of a greenthread, the parent greenlet will always be the hub
+42     # loop greenlet.
+43     if eventlet.getcurrent().parent:
+44         return tpool.execute(f, *args, **kwargs)
+45     else:
+46         return f(*args, **kwargs)
+47 
+48 
+49 class WindowsException(Exception):
+50     """Base Windows Exception
+51 
+52     This class is inherited by all the other exceptions that are used in
+53     this file. The 'error_message' property should be defined in the class
+54     that inherits from this with a particular message if needed.
+55     """
+56     error_message = None
+57 
+58     def __init__(self, message):
+59         super(WindowsException, self).__init__()
+60         # The error message which will be printed for this exception
+61         self.error_message = message
+62 
+63     def __str__(self):
+64         return self.error_message
+65 
+66 
+67 class NamedPipeException(WindowsException):
+68     """Exception raised when there is an error with the named pipes.
+69 
+70     If there is an error code associated with this exception, it can be
+71     retrieved by accessing the 'code' property of this class.
+72     """
+73     def __init__(self, message, error_code=None):
+74         super(NamedPipeException, self).__init__(message)
+75         # The error code associated with this exception. This property should
+76         # be different than 'None' if there is an existing error code.
+77         self.code = error_code
+78         if self.code:
+79             # Appending the error code to the message
+80             self.error_message += " Error code: '%s'." % self.code
+81 
+82     def __str__(self):
+83         return self._error_string
+84 
+85 
+86 class ProcessException(WindowsException):
+87     """Exception raised when there is an error with the child process.
+88 
+89     This class inherits the implementation from the super class, it does not
+90     have anything particular. It is intentionally left blank.
+91     """
+92     pass
+93 
+94 
+95 class NamedPipe(object):
+96     def __init__(self, pipe_name=None, sec_attributes=-1):
+97         """Create a named pipe with the given name.
+98 
+99         :param pipe_name(Optional): string representing the name of the pipe
+100             which should be used to create the named pipe
+101         :param sec_attributes(Optional): type win32security.SECURITY_ATTRIBUTES
+102             The default value is -1 which uses the default security attributes.
+103             This means that the named pipe handle is inherited when a new
+104             process is created.
+105         """
+106         # For reading from the named pipe, we will use an overlapped structure
+107         # for non-blocking I/O
+108         self._read = ovs_winutils.pywintypes.OVERLAPPED()
+109         # Create a new event which will be used by the overlapped structure
+110         self._read.hEvent = ovs_winutils.get_new_event()
+111         # This property tells if there is a pending reading operation on
+112         # the named pipe or not.
+113         self._read_pending = False
+114 
+115         if pipe_name is None:
+116             # Generate a random name for the named pipe if the name was not
+117             # passed explicitly as parameter.
+118             pipe_name = ("NamedPipe_%d_%s" %
+119                          (time.time(), str(random.random()).split(".")[1]))
+120 
+121         # Creating the name for a local named pipe. The property "name" will
+122         # have "\\.\pipe\" appended at the start of pipe_name
+123         self.name = ovs_winutils.get_pipe_name(pipe_name)
+124         # This property will contain the handle of the named pipe which can
+125         # be accessed later on.
+126         self.namedpipe = ovs_winutils.create_named_pipe(self.name,
+127                                                         saAttr=sec_attributes)
+128         # This property should be initialised explicitly later on by calling
+129         # the method create_file of this class.
+130         self._npipe_file = None
+131 
+132         if not self.namedpipe:
+133             # If there was an error when creating the named pipe, the property
+134             # "namedpipe" should be None. We raise an exception in this case
+135             raise NamedPipeException("Failed to create named pipe.")
+136 
+137     @property
+138     def read_overlapped_event(self):
+139         """Return the event used by the overlapped structure for reading.
+140 
+141         This is the handle(event) on which we should wait if we want to be
+142         notified when there is something to read from the named pipe.
+143         """
+144         return self._read.hEvent
+145 
+146     def _wait_event(self, event, timeout=win32event.INFINITE):
+147         """Wait until the event is signaled or the timeout has passed."""
+148         # If greenthreads are used, we need to wrap the call to
+149         # win32event.WaitForMultipleObjects using avoid_blocking_call to make
+150         # sure the function will not block the other greenthreads.
+151         avoid_blocking_call(win32event.WaitForMultipleObjects,
+152                             [event],
+153                             False,
+154                             timeout)
+155 
+156     def wait_for_read(self, timeout=win32event.INFINITE):
+157         """Wait until there is something to read from the named pipe or the
+158 
+159         timeout passed as parameter has passed.
+160 
+161         :param timeout: int representing the timeout in milliseconds
+162         """
+163         if self._read_pending:
+164             self._wait_event(self._read.hEvent, timeout)
+165 
+166     def create_file(self, sec_attributes=-1):
+167         """Create the file for the named pipe and store it in the '_npipe_file'
+168 
+169         property of the class.
+170 
+171         :param sec_attributes: type win32security.SECURITY_ATTRIBUTES
+172             The default value is -1 which uses the default security attributes.
+173             This means that the file handle will NOT be inherited when
+174             a new process is created.
+175         """
+176         try:
+177             # Create the file using the name of the named pipe with the given
+178             # security attributes
+179             self._npipe_file = ovs_winutils.create_file(
+180                 self.name, attributes=sec_attributes)
+181             try:
+182                 ovs_winutils.set_pipe_mode(
+183                     self._npipe_file,
+184                     ovs_winutils.win32pipe.PIPE_READMODE_BYTE)
+185             except ovs_winutils.pywintypes.error as e:
+186                 raise NamedPipeException(
+187                     "Could not set pipe read mode to byte. "
+188                     "Error: %s." % e.strerror, e.winerror)
+189         except ovs_winutils.pywintypes.error as e:
+190             raise NamedPipeException("Could not create file for named pipe. "
+191                                      "Error: %s." % e.strerror, e.winerror)
+192 
+193     def blocking_write(self, buf, to_namedpipe=True):
+194         """Write to the named pipe handle or the file handle.
+195 
+196         This function will wait until the write operation has completed.
+197 
+198         :param buf: string representing the buffer which will be written
+199         :param to_namedpipe: boolean representing where to write the buffer
+200             True = the buffer 'buf' will be written to the named pipe handle
+201             False = the buffer 'buf' will be written to the file handle
+202         """
+203         if not to_namedpipe and self._npipe_file is None:
+204             # If the method tries to write to the file handle but the
+205             # property '_npipe_file' does not contain the file handle then
+206             # we raise an exception
+207             raise NamedPipeException("create_file must be called first.")
+208         # Represents the handle where we should write the buffer
+209         handle_to_write = self.namedpipe if to_namedpipe else self._npipe_file
+210         # encoded_buf will contain the buffer 'buf' represented in binary type
+211         encoded_buf = ovs_winutils.get_encoded_buffer(buf)
+212 
+213         # If greenthreads are used, we need to wrap the call to
+214         # ovs_winutils.write_file using avoid_blocking_call to make
+215         # sure the function will not block the other greenthreads.
+216         (errCode, _nBytesWritten) = avoid_blocking_call(
+217             ovs_winutils.write_file,
+218             handle_to_write,
+219             encoded_buf,
+220             None)
+221         if errCode:
+222             # errCode should be 0 if the operation completed successfully.
+223             # If we reach here it means there was an error during the write
+224             # operation and we should raise an exception
+225             raise NamedPipeException("Could not write to named pipe.", errCode)
+226 
+227     def nonblocking_read(self, bytes_to_read, from_namedpipe=True):
+228         """Read from the named pipe handle or the file handle.
+229 
+230         This function returns imediatly and does not wait for the read
+231         operation to complete. In case the read operation is not complete,
+232         the property '_read_pending' will be set to True and the method
+233         get_read_result should be called to retrieve the result. Otherwise,
+234         the output of the read operation is returned.
+235 
+236         :param bytes_to_read: int representing the maximum number of bytes
+237             to be read.
+238         :param from_namedpipe: boolean representing from where to read
+239             True = the function reads from the named pipe handle
+240             False = he function reads from the file handle
+241         """
+242         if self._read_pending:
+243             # If there is a pending read operation, the method
+244             # 'get_read_result' should be called to retrieve the result.
+245             return
+246 
+247         # Represents the handle from where we should read.
+248         handle_to_read = self.namedpipe if from_namedpipe else self._npipe_file
+249 
+250         # The read operation is non-blocking because the read overlapped
+251         # structure is passed. It will return immediately.
+252         (errCode, self._read_buffer) = ovs_winutils.read_file(
+253             handle_to_read,
+254             bytes_to_read,
+255             self._read)
+256 
+257         if errCode:
+258             # The error code should be 0 if the operation executed with success
+259             if errCode == ovs_winutils.winerror.ERROR_IO_PENDING:
+260                 # This is returned when the overlapped structure is passed
+261                 # to the read operation (which is our case) and the operation
+262                 # has not finished yet. We mark this as a pending read
+263                 # operation and we will use the method 'get_read_result'
+264                 # later on to retrieve the result.
+265                 self._read_pending = True
+266             else:
+267                 # In this case we received an unexpected error code, raise
+268                 # an exception.
+269                 raise NamedPipeException(
+270                     "Could not read from named pipe.", errCode)
+271             return None
+272 
+273         # If we can not retrieve the output from the overlapped result,
+274         # it means that the pipe was disconnected so we have no output.
+275         # The returned value should be an empty string.
+276         output = ""
+277         try:
+278             # Try to retrieve the result from the overlapped structure.
+279             # This call should succeed or otherwise will raise an exception,
+280             # but it will not block.
+281             nBytesRead = ovs_winutils.get_overlapped_result(
+282                 handle_to_read,
+283                 self._read,
+284                 False)
+285             # Mark the read operation as complete
+286             self._read_pending = False
+287             # Retrieve the result and put the decoded result inside the
+288             # 'output' variable.
+289             output = ovs_winutils.get_decoded_buffer(
+290                 self._read_buffer[:nBytesRead])
+291             # We need to manually signal the event to make sure the call to
+292             # wait for the event will not block.
+293             win32event.SetEvent(self._read.hEvent)
+294         except NamedPipeException as e:
+295             # If the pipe was disconnected, it means no output, we will return
+296             # an empty string in this case. Otherwise raise an exception.
+297             if e.code not in ovs_winutils.pipe_disconnected_errors:
+298                 raise e
+299         return output
+300 
+301     def get_read_result(self, from_namedpipe=True):
+302         """Return the result from the overlapped structure.
+303 
+304         If there is no pending read operation, this function will return
+305         immediately. This call will return False if the reading operation
+306         has not completed yet and the read operation is still in progress.
+307         Otherwise, it will return the result.
+308 
+309         :param from_namedpipe: boolean representing from where to read
+310             True = the function reads from the named pipe handle
+311             False = he function reads from the file handle
+312         """
+313         if not self._read_pending:
+314             # There is no pending read operation, we should return here
+315             return
+316 
+317         # Represents the handle from where we should read.
+318         handle_to_read = self.namedpipe if from_namedpipe else self._npipe_file
+319         try:
+320             # Try to retrieve the result from the overlapped structure.
+321             # This will raise an ERROR_IO_INCOMPLETE exception if the
+322             # read operation has not completed yet.
+323             nBytesRead = ovs_winutils.get_overlapped_result(handle_to_read,
+324                                                             self._read,
+325                                                             False)
+326             # Mark the read operation as complete
+327             self._read_pending = False
+328             # Decode the result and return it
+329             return ovs_winutils.get_decoded_buffer(
+330                 self._read_buffer[:nBytesRead])
+331         except ovs_winutils.pywintypes.error as e:
+332             if e.winerror == ovs_winutils.winerror.ERROR_IO_INCOMPLETE:
+333                 # In this case we should call again this function to try to
+334                 # retrieve the result.
+335                 self._read_pending = True
+336                 # Return False to mark that the read operation has not
+337                 # completed yet.
+338                 return False
+339             else:
+340                 # If we reach here it means that an unexpected error was
+341                 # received. We should raise an exception in this case.
+342                 raise NamedPipeException(
+343                     "Could not get the overlapped result. "
+344                     "Error: '%s'" % e.strerror, e.winerror)
+345 
+346     def close_filehandle(self):
+347         """Close the file handle."""
+348         ovs_winutils.close_handle(self._npipe_file)
+349 
+350     def get_file_handle(self):
+351         """Returns the file handle."""
+352         return self._npipe_file
+353 
+354     def close_all_handles(self):
+355         """Close all the handles used by this class."""
+356         if hasattr(self, "namedpipe") and self.namedpipe:
+357             ovs_winutils.close_handle(self.namedpipe)
+358         if hasattr(self, "_read") and self._read.hEvent:
+359             ovs_winutils.close_handle(self._read.hEvent)
+360         if hasattr(self, "_npipe_file") and self._npipe_file:
+361             ovs_winutils.close_handle(self._npipe_file)
+362 
+363     def __del__(self):
+364         """Make sure all the handles are closed."""
+365         self.close_all_handles()
+366 
+367 
+368 class ProcessWithNamedPipes(object):
+369     class HandleClass(object):
+370         """This class is used only to provide a 'close' method for the stdin,
+371         stdout and stderr of the new process. This ensures compatibility with
+372         the subprocess.Popen returned object.
+373         """
+374         def __init__(self, namedpipe):
+375             self.namedpipe = namedpipe
+376 
+377         def close(self):
+378             # Close all the handles used
+379             if self.namedpipe:
+380                 self.namedpipe.close_all_handles()
+381                 self.namedpipe = None
+382 
+383     # The maximum number of bytes to be read
+384     _BUFSIZE = 16384
+385 
+386     def __init__(self, cmd, env):
+387         """Create a new process executing 'cmd' and with environment 'env'.
+388 
+389         :param cmd: string representing the command line to be executed
+390         :param env: instance representing the environment which should be used
+391             for the new process. Look at 'os.environ' for an example.
+392         """
+393         # The startupinfo structure used to spawn the new process
+394         self._si = win32process.STARTUPINFO()
+395 
+396         # Attributes defined to ensure compatibility with the subprocess.Popen
+397         # returned object.
+398         self.returncode = None
+399         self.stdin = None
+400         self.stdout = None
+401         self.stderr = None
+402         self.pid = None
+403 
+404         # Convert the command to be a single string
+405         cmd = " ".join(cmd)
+406         # Initialize the named pipes used for stdin, stdout and stderr
+407         self._initialize_named_pipes_for_std()
+408         # Create the child process
+409         self._start_process(cmd, env)
+410 
+411     def _initialize_named_pipes_for_std(self):
+412         """Initialize the named pipes used for communication with the child
+413         process.
+414         """
+415 
+416         # used in generating the name for the pipe
+417         pid = os.getpid()
+418 
+419         # Security attributes for the named pipes, should not be inherited
+420         # by the child process. Those are used by the parent process to
+421         # communicate with the child process.
+422         _saAttr_pipe = win32security.SECURITY_ATTRIBUTES()
+423         _saAttr_pipe.bInheritHandle = 0
+424         # Security attributes for the file handles, they should be inherited
+425         # by the child process which will use them as stdin, stdout and stderr.
+426         # The parent process will close those handles after the child process
+427         # is created.
+428         _saAttr_file = win32security.SECURITY_ATTRIBUTES()
+429         _saAttr_file.bInheritHandle = 1
+430 
+431         def create_namedpipe_and_file(prefix, saAttr_pipe=_saAttr_pipe,
+432                                       saAttr_file=_saAttr_file):
+433             """Create the named pipe and the file for it.
+434 
+435             :param prefix: string representing the prefix which will be
+436                 appended to the start of the name for the pipe
+437             :param saAttr_pipe: security attributes used to create
+438                 the named pipe
+439             :param saAttr_file: security attributes used to create the file
+440             """
+441             pipename = ("%s_NamedPipe_%d_%d_%s" % (
+442                 prefix, pid, time.time(), str(random.random()).split(".")[1]))
+443             # Create the named pipe
+444             pipe = NamedPipe(pipe_name=pipename,
+445                              sec_attributes=saAttr_pipe)
+446             # Create the file for the previously created named pipe
+447             pipe.create_file(sec_attributes=saAttr_file)
+448             return pipe
+449 
+450         # Create the named pipes and the files used for parent - child process
+451         # communication.
+452         _pipe_stdin = create_namedpipe_and_file("Stdin")
+453         self._pipe_stdout = create_namedpipe_and_file("Stdout")
+454         self._pipe_stderr = create_namedpipe_and_file("Stderr")
+455 
+456         # Set the file handles from the named pipes as stdin, stdout and stderr
+457         # in startupinfo structure for the child process.
+458         self._si.hStdInput = _pipe_stdin.get_file_handle()
+459         self._si.hStdOutput = self._pipe_stdout.get_file_handle()
+460         self._si.hStdError = self._pipe_stderr.get_file_handle()
+461         self._si.dwFlags |= win32con.STARTF_USESTDHANDLES
+462 
+463         # Wrapping around stdin in order to be able to call self.stdin.close()
+464         # to close the stdin.
+465         self.stdin = ProcessWithNamedPipes.HandleClass(_pipe_stdin)
+466         _pipe_stdin = None
+467 
+468     def _get_result_namedpipe(self, namedpipe):
+469         """Retrieve the result from the named pipe given as parameter.
+470 
+471         This function will return False if the read operation has not
+472         completed yet and we should call this method again to try to retrieve
+473         the result.
+474 
+475         :param namedpipe: represents the NamedPipe object from where to
+476             retrieve the result
+477         """
+478         # The default returned value will be empty string. This is returned
+479         # in case the pipe was disconnected.
+480         output = ""
+481         try:
+482             output = namedpipe.get_read_result()
+483         except NamedPipeException as e:
+484             # If the pipe was disconnected the error is ignored, otherwise
+485             # we raise an exception
+486             if e.code not in ovs_winutils.pipe_disconnected_errors:
+487                 raise e
+488         return output
+489 
+490     def communicate(self, input=None):
+491         """Return stdout and stderr of the child process.
+492 
+493         Interact with process: Send the 'input' argument to stdin.
+494         The function waits until the process terminates and reads from
+495         stdout and stderr.
+496 
+497         :param input: string representing the input which should be sent
+498             to the child process. If this value is None, then nothing is passed
+499             as stdin for the child process.
+500         """
+501         if input:
+502             # If we received any input, write it to stdin then close the handle
+503             # to send EOF on stdin to the child process
+504             self._stdin_write(input)
+505             self.stdin.close()
+506 
+507         # Try to retrieve the output for stdout and stderr. If the read
+508         # operation has not completed yet, then None will be returned and
+509         # we will try to retrieve the result again after the process is
+510         # terminated.
+511         stdout = self._pipe_stdout.nonblocking_read(self._BUFSIZE)
+512         stderr = self._pipe_stderr.nonblocking_read(self._BUFSIZE)
+513 
+514         # Wait for the process to terminate
+515         self.wait()
+516 
+517         if stdout is None:
+518             # Wait until the read operation for stdout has completed and
+519             # then retrieve the result.
+520             self._pipe_stdout.wait_for_read()
+521             stdout = self._get_result_namedpipe(self._pipe_stdout)
+522 
+523         if stderr is None:
+524             # Wait until the read operation for stdout has completed and
+525             # then retrieve the result.
+526             self._pipe_stderr.wait_for_read()
+527             stderr = self._get_result_namedpipe(self._pipe_stderr)
+528 
+529         # Close all the handles since the child process is terminated
+530         # at this point.
+531         self._pipe_stdout.close_all_handles()
+532         self._pipe_stdout = None
+533         self._pipe_stderr.close_all_handles()
+534         self._pipe_stderr = None
+535 
+536         # Return a tuple containing stdout and stderr to ensure compatibility
+537         # with the subprocess module.
+538         return (stdout, stderr)
+539 
+540     def _stdin_write(self, input):
+541         """Send input to stdin for the child process."""
+542         if input:
+543             encoded_buf = ovs_winutils.get_encoded_buffer(input)
+544             self.stdin.namedpipe.blocking_write(encoded_buf)
+545 
+546     def _start_process(self, cmd_line, env):
+547         """Create a process with the command line 'cmd_line' and environment
+548         'env'. Stores the pid of the child process in the 'pid' attribute.
+549         """
+550         app_name = None
+551         # The command line to be executed.
+552         command_line = cmd_line
+553         process_attributes = None
+554         thread_attributes = None
+555         # Each inheritable handle in the calling process is
+556         # inherited by the new process.
+557         inherit_handles = 1
+558         # The new process has a new console, instead of inheriting
+559         # its parent's console
+560         creation_flags = win32process.CREATE_NO_WINDOW
+561         # Environment used for the new process.
+562         new_environment = env
+563         current_directory = None
+564 
+565         proc_args = (app_name,
+566                      command_line,
+567                      process_attributes,
+568                      thread_attributes,
+569                      inherit_handles,
+570                      creation_flags,
+571                      new_environment,
+572                      current_directory,
+573                      self._si)
+574         proc_handles = win32process.CreateProcess(*proc_args)
+575 
+576         # Close the handles that the parent is not going to use
+577         self._pipe_stdout.close_filehandle()
+578         self._pipe_stderr.close_filehandle()
+579 
+580         self._hProcess, self._hThread, self.pid, self._tid = proc_handles
+581 
+582     def wait(self, timeout=None):
+583         """Wait for the process to terminate or until timeout expires.
+584 
+585         Returns returncode attribute. If timeout is None, then the method
+586         will wait until the process terminates.
+587 
+588         :param timeout: int or float representing the timeout in seconds
+589         """
+590         if timeout is None:
+591             timeout_millis = win32event.INFINITE
+592         else:
+593             timeout_millis = int(timeout * 1000)
+594 
+595         if self.returncode is None:
+596             # If the 'returncode' attribute is not set, it means that we
+597             # have to wait for the child process to terminate and to return the
+598             # exit code of it.
+599             result = avoid_blocking_call(win32event.WaitForSingleObject,
+600                                          self._hProcess,
+601                                          timeout_millis)
+602             if result == win32event.WAIT_TIMEOUT:
+603                 raise ProcessException("Timeout Exception.")
+604             self.returncode = win32process.GetExitCodeProcess(self._hProcess)
+605         # Return the exit code of the child process
+606         return self.returncode

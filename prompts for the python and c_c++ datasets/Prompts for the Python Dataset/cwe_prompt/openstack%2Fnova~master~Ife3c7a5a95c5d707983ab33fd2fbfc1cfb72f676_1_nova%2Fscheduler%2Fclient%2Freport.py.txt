@@ -1,0 +1,2409 @@
+Please review the code below for security defects using the CWE (Common Weakness Enumeration) as a reference standard. If any are found, please describe the security defect in detail and indicate the corresponding line number of code and solution. If none are detected, state: 'No security defects are detected in the code'.
+
+1 # Copyright (c) 2014 Red Hat, Inc.
+2 # All Rights Reserved.
+3 #
+4 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
+5 #    not use this file except in compliance with the License. You may obtain
+6 #    a copy of the License at
+7 #
+8 #         http://www.apache.org/licenses/LICENSE-2.0
+9 #
+10 #    Unless required by applicable law or agreed to in writing, software
+11 #    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+12 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+13 #    License for the specific language governing permissions and limitations
+14 #    under the License.
+15 
+16 import collections
+17 import contextlib
+18 import copy
+19 import functools
+20 import random
+21 import time
+22 
+23 from keystoneauth1 import exceptions as ks_exc
+24 import os_resource_classes as orc
+25 import os_traits
+26 from oslo_log import log as logging
+27 from oslo_middleware import request_id
+28 from oslo_utils import excutils
+29 from oslo_utils import versionutils
+30 import retrying
+31 import six
+32 
+33 from nova.compute import provider_tree
+34 import nova.conf
+35 from nova import exception
+36 from nova.i18n import _
+37 from nova import objects
+38 from nova import utils
+39 
+40 
+41 CONF = nova.conf.CONF
+42 LOG = logging.getLogger(__name__)
+43 WARN_EVERY = 10
+44 NEGATIVE_MEMBER_OF_VERSION = '1.32'
+45 RESHAPER_VERSION = '1.30'
+46 CONSUMER_GENERATION_VERSION = '1.28'
+47 ALLOW_RESERVED_EQUAL_TOTAL_INVENTORY_VERSION = '1.26'
+48 POST_RPS_RETURNS_PAYLOAD_API_VERSION = '1.20'
+49 AGGREGATE_GENERATION_VERSION = '1.19'
+50 NESTED_PROVIDER_API_VERSION = '1.14'
+51 POST_ALLOCATIONS_API_VERSION = '1.13'
+52 GET_USAGES_VERSION = '1.9'
+53 
+54 AggInfo = collections.namedtuple('AggInfo', ['aggregates', 'generation'])
+55 TraitInfo = collections.namedtuple('TraitInfo', ['traits', 'generation'])
+56 ProviderAllocInfo = collections.namedtuple(
+57     'ProviderAllocInfo', ['allocations'])
+58 
+59 
+60 def warn_limit(self, msg):
+61     if self._warn_count:
+62         self._warn_count -= 1
+63     else:
+64         self._warn_count = WARN_EVERY
+65         LOG.warning(msg)
+66 
+67 
+68 def safe_connect(f):
+69     @functools.wraps(f)
+70     def wrapper(self, *a, **k):
+71         try:
+72             return f(self, *a, **k)
+73         except ks_exc.EndpointNotFound:
+74             warn_limit(
+75                 self, 'The placement API endpoint was not found.')
+76             # Reset client session so there is a new catalog, which
+77             # gets cached when keystone is first successfully contacted.
+78             self._client = self._create_client()
+79         except ks_exc.MissingAuthPlugin:
+80             warn_limit(
+81                 self, 'No authentication information found for placement API.')
+82         except ks_exc.Unauthorized:
+83             warn_limit(
+84                 self, 'Placement service credentials do not work.')
+85         except ks_exc.DiscoveryFailure:
+86             # TODO(_gryf): Looks like DiscoveryFailure is not the only missing
+87             # exception here. In Pike we should take care about keystoneauth1
+88             # failures handling globally.
+89             warn_limit(self,
+90                        'Discovering suitable URL for placement API failed.')
+91         except ks_exc.ConnectFailure:
+92             LOG.warning('Placement API service is not responding.')
+93     return wrapper
+94 
+95 
+96 class Retry(Exception):
+97     def __init__(self, operation, reason):
+98         self.operation = operation
+99         self.reason = reason
+100 
+101 
+102 def retries(f):
+103     """Decorator to retry a call three times if it raises Retry
+104 
+105     Note that this returns the actual value of the inner call on success
+106     or returns False if all the retries fail.
+107     """
+108     @functools.wraps(f)
+109     def wrapper(self, *a, **k):
+110         for retry in range(0, 4):
+111             try:
+112                 sleep_time = random.uniform(0, retry * 2)
+113                 time.sleep(sleep_time)
+114                 return f(self, *a, **k)
+115             except Retry as e:
+116                 LOG.debug(
+117                     'Unable to %(op)s because %(reason)s; retrying...',
+118                     {'op': e.operation, 'reason': e.reason})
+119         LOG.error('Failed scheduler client operation %s: out of retries',
+120                   f.__name__)
+121         return False
+122     return wrapper
+123 
+124 
+125 def _move_operation_alloc_request(source_allocs, dest_alloc_req):
+126     """Given existing allocations for a source host and a new allocation
+127     request for a destination host, return a new allocation_request that
+128     contains resources claimed against both source and destination, accounting
+129     for shared providers.
+130 
+131     This is expected to only be used during an evacuate operation.
+132 
+133     :param source_allocs: Dict, keyed by resource provider UUID, of resources
+134                           allocated on the source host
+135     :param dest_alloc_req: The allocation_request for resources against the
+136                            destination host
+137     """
+138     LOG.debug("Doubling-up allocation_request for move operation. Current "
+139               "allocations: %s", source_allocs)
+140     # Remove any allocations against resource providers that are
+141     # already allocated against on the source host (like shared storage
+142     # providers)
+143     cur_rp_uuids = set(source_allocs.keys())
+144     new_rp_uuids = set(dest_alloc_req['allocations']) - cur_rp_uuids
+145 
+146     current_allocs = {
+147         cur_rp_uuid: {'resources': alloc['resources']}
+148             for cur_rp_uuid, alloc in source_allocs.items()
+149     }
+150     new_alloc_req = {'allocations': current_allocs}
+151     for rp_uuid in dest_alloc_req['allocations']:
+152         if rp_uuid in new_rp_uuids:
+153             new_alloc_req['allocations'][rp_uuid] = dest_alloc_req[
+154                 'allocations'][rp_uuid]
+155 
+156     LOG.debug("New allocation_request containing both source and "
+157               "destination hosts in move operation: %s", new_alloc_req)
+158     return new_alloc_req
+159 
+160 
+161 def get_placement_request_id(response):
+162     if response is not None:
+163         return response.headers.get(request_id.HTTP_RESP_HEADER_REQUEST_ID)
+164 
+165 
+166 # TODO(mriedem): Consider making SchedulerReportClient a global singleton so
+167 # that things like the compute API do not have to lazy-load it. That would
+168 # likely require inspecting methods that use a ProviderTree cache to see if
+169 # they need locks.
+170 class SchedulerReportClient(object):
+171     """Client class for updating the scheduler."""
+172 
+173     def __init__(self, adapter=None):
+174         """Initialize the report client.
+175 
+176         :param adapter: A prepared keystoneauth1 Adapter for API communication.
+177                 If unspecified, one is created based on config options in the
+178                 [placement] section.
+179         """
+180         self._adapter = adapter
+181         # An object that contains a nova-compute-side cache of resource
+182         # provider and inventory information
+183         self._provider_tree = None
+184         # Track the last time we updated providers' aggregates and traits
+185         self._association_refresh_time = None
+186         self._client = self._create_client()
+187         # NOTE(danms): Keep track of how naggy we've been
+188         self._warn_count = 0
+189 
+190     def clear_provider_cache(self, init=False):
+191         if not init:
+192             LOG.info("Clearing the report client's provider cache.")
+193         self._provider_tree = provider_tree.ProviderTree()
+194         self._association_refresh_time = {}
+195 
+196     def _clear_provider_cache_for_tree(self, rp_uuid):
+197         """Clear the provider cache for only the tree containing rp_uuid.
+198 
+199         This exists for situations where we encounter an error updating
+200         placement, and therefore need to refresh the provider tree cache before
+201         redriving the update. However, it would be wasteful and inefficient to
+202         clear the *entire* cache, which may contain many separate trees (e.g.
+203         ironic nodes or sharing providers) which should be unaffected by the
+204         error.
+205 
+206         :param rp_uuid: UUID of a resource provider, which may be anywhere in a
+207                         a tree hierarchy, i.e. need not be a root. For non-root
+208                         providers, we still clear the cache for the entire tree
+209                         including descendants, ancestors up to the root,
+210                         siblings/cousins and *their* ancestors/descendants.
+211         """
+212         try:
+213             uuids = self._provider_tree.get_provider_uuids_in_tree(rp_uuid)
+214         except ValueError:
+215             # If the provider isn't in the tree, it should also not be in the
+216             # timer dict, so nothing to clear.
+217             return
+218 
+219         # get_provider_uuids_in_tree returns UUIDs in top-down order, so the
+220         # first one is the root; and .remove() is recursive.
+221         self._provider_tree.remove(uuids[0])
+222         for uuid in uuids:
+223             self._association_refresh_time.pop(uuid, None)
+224 
+225     def _create_client(self):
+226         """Create the HTTP session accessing the placement service."""
+227         # Flush provider tree and associations so we start from a clean slate.
+228         self.clear_provider_cache(init=True)
+229         client = self._adapter or utils.get_sdk_adapter('placement')
+230         # Set accept header on every request to ensure we notify placement
+231         # service of our response body media type preferences.
+232         client.additional_headers = {'accept': 'application/json'}
+233         return client
+234 
+235     def get(self, url, version=None, global_request_id=None):
+236         return self._client.get(url, microversion=version,
+237                                 global_request_id=global_request_id)
+238 
+239     def post(self, url, data, version=None, global_request_id=None):
+240         # NOTE(sdague): using json= instead of data= sets the
+241         # media type to application/json for us. Placement API is
+242         # more sensitive to this than other APIs in the OpenStack
+243         # ecosystem.
+244         return self._client.post(url, json=data, microversion=version,
+245                                  global_request_id=global_request_id)
+246 
+247     def put(self, url, data, version=None, global_request_id=None):
+248         # NOTE(sdague): using json= instead of data= sets the
+249         # media type to application/json for us. Placement API is
+250         # more sensitive to this than other APIs in the OpenStack
+251         # ecosystem.
+252         return self._client.put(url, json=data, microversion=version,
+253                                 global_request_id=global_request_id)
+254 
+255     def delete(self, url, version=None, global_request_id=None):
+256         return self._client.delete(url, microversion=version,
+257                                    global_request_id=global_request_id)
+258 
+259     @safe_connect
+260     def get_allocation_candidates(self, context, resources):
+261         """Returns a tuple of (allocation_requests, provider_summaries,
+262         allocation_request_version).
+263 
+264         The allocation_requests are a collection of potential JSON objects that
+265         can be passed to the PUT /allocations/{consumer_uuid} Placement REST
+266         API to claim resources against one or more resource providers that meet
+267         the requested resource constraints.
+268 
+269         The provider summaries is a dict, keyed by resource provider UUID, of
+270         inventory and capacity information and traits for any resource
+271         provider involved in the allocation_requests.
+272 
+273         :returns: A tuple with a list of allocation_request dicts, a dict of
+274                   provider information, and the microversion used to request
+275                   this data from placement, or (None, None, None) if the
+276                   request failed
+277 
+278         :param context: The security context
+279         :param nova.scheduler.utils.ResourceRequest resources:
+280             A ResourceRequest object representing the requested resources,
+281             traits, and aggregates from the request spec.
+282 
+283         Example member_of (aggregates) value in resources:
+284 
+285             [('foo', 'bar'), ('baz',)]
+286 
+287         translates to:
+288 
+289             "Candidates are in either 'foo' or 'bar', but definitely in 'baz'"
+290 
+291         """
+292         # Note that claim_resources() will use this version as well to
+293         # make allocations by `PUT /allocations/{consumer_uuid}`
+294         version = NEGATIVE_MEMBER_OF_VERSION
+295         qparams = resources.to_querystring()
+296         url = "/allocation_candidates?%s" % qparams
+297         resp = self.get(url, version=version,
+298                         global_request_id=context.global_id)
+299         if resp.status_code == 200:
+300             data = resp.json()
+301             return (data['allocation_requests'], data['provider_summaries'],
+302                     version)
+303 
+304         args = {
+305             'resource_request': str(resources),
+306             'status_code': resp.status_code,
+307             'err_text': resp.text,
+308         }
+309         msg = ("Failed to retrieve allocation candidates from placement "
+310                "API for filters: %(resource_request)s\n"
+311                "Got %(status_code)d: %(err_text)s.")
+312         LOG.error(msg, args)
+313         return None, None, None
+314 
+315     @safe_connect
+316     def _get_provider_aggregates(self, context, rp_uuid):
+317         """Queries the placement API for a resource provider's aggregates.
+318 
+319         :param rp_uuid: UUID of the resource provider to grab aggregates for.
+320         :return: A namedtuple comprising:
+321                     * .aggregates: A set() of string aggregate UUIDs, which may
+322                       be empty if the specified provider is associated with no
+323                       aggregates.
+324                     * .generation: The resource provider generation.
+325         :raise: ResourceProviderAggregateRetrievalFailed on errors.  In
+326                 particular, we raise this exception (as opposed to returning
+327                 None or the empty set()) if the specified resource provider
+328                 does not exist.
+329         """
+330         resp = self.get("/resource_providers/%s/aggregates" % rp_uuid,
+331                         version=AGGREGATE_GENERATION_VERSION,
+332                         global_request_id=context.global_id)
+333         if resp.status_code == 200:
+334             data = resp.json()
+335             return AggInfo(aggregates=set(data['aggregates']),
+336                            generation=data['resource_provider_generation'])
+337 
+338         placement_req_id = get_placement_request_id(resp)
+339         msg = ("[%(placement_req_id)s] Failed to retrieve aggregates from "
+340                "placement API for resource provider with UUID %(uuid)s. "
+341                "Got %(status_code)d: %(err_text)s.")
+342         args = {
+343             'placement_req_id': placement_req_id,
+344             'uuid': rp_uuid,
+345             'status_code': resp.status_code,
+346             'err_text': resp.text,
+347         }
+348         LOG.error(msg, args)
+349         raise exception.ResourceProviderAggregateRetrievalFailed(uuid=rp_uuid)
+350 
+351     def get_provider_traits(self, context, rp_uuid):
+352         """Queries the placement API for a resource provider's traits.
+353 
+354         :param context: The security context
+355         :param rp_uuid: UUID of the resource provider to grab traits for.
+356         :return: A namedtuple comprising:
+357                     * .traits: A set() of string trait names, which may be
+358                       empty if the specified provider has no traits.
+359                     * .generation: The resource provider generation.
+360         :raise: ResourceProviderTraitRetrievalFailed on errors.  In particular,
+361                 we raise this exception (as opposed to returning None or the
+362                 empty set()) if the specified resource provider does not exist.
+363         :raise: keystoneauth1.exceptions.ClientException if placement API
+364                 communication fails.
+365         """
+366         resp = self.get("/resource_providers/%s/traits" % rp_uuid,
+367                         version='1.6', global_request_id=context.global_id)
+368 
+369         if resp.status_code == 200:
+370             json = resp.json()
+371             return TraitInfo(traits=set(json['traits']),
+372                              generation=json['resource_provider_generation'])
+373 
+374         placement_req_id = get_placement_request_id(resp)
+375         LOG.error(
+376             "[%(placement_req_id)s] Failed to retrieve traits from "
+377             "placement API for resource provider with UUID %(uuid)s. Got "
+378             "%(status_code)d: %(err_text)s.",
+379             {'placement_req_id': placement_req_id, 'uuid': rp_uuid,
+380              'status_code': resp.status_code, 'err_text': resp.text})
+381         raise exception.ResourceProviderTraitRetrievalFailed(uuid=rp_uuid)
+382 
+383     def get_resource_provider_name(self, context, uuid):
+384         """Return the name of a RP. It tries to use the internal of RPs or
+385         falls back to calling placement directly.
+386 
+387         :param context: The security context
+388         :param uuid: UUID identifier for the resource provider to look up
+389         :return: The name of the RP
+390         :raise: ResourceProviderRetrievalFailed if the RP is not in the cache
+391             and the communication with the placement is failed.
+392         :raise: ResourceProviderNotFound if the RP does not exist.
+393         """
+394 
+395         try:
+396             return self._provider_tree.data(uuid).name
+397         except ValueError:
+398             rsp = self._get_resource_provider(context, uuid)
+399             if rsp is None:
+400                 raise exception.ResourceProviderNotFound(name_or_uuid=uuid)
+401             else:
+402                 return rsp['name']
+403 
+404     @safe_connect
+405     def _get_resource_provider(self, context, uuid):
+406         """Queries the placement API for a resource provider record with the
+407         supplied UUID.
+408 
+409         :param context: The security context
+410         :param uuid: UUID identifier for the resource provider to look up
+411         :return: A dict of resource provider information if found or None if no
+412                  such resource provider could be found.
+413         :raise: ResourceProviderRetrievalFailed on error.
+414         """
+415         resp = self.get("/resource_providers/%s" % uuid,
+416                         version=NESTED_PROVIDER_API_VERSION,
+417                         global_request_id=context.global_id)
+418         if resp.status_code == 200:
+419             data = resp.json()
+420             return data
+421         elif resp.status_code == 404:
+422             return None
+423         else:
+424             placement_req_id = get_placement_request_id(resp)
+425             msg = ("[%(placement_req_id)s] Failed to retrieve resource "
+426                    "provider record from placement API for UUID %(uuid)s. Got "
+427                    "%(status_code)d: %(err_text)s.")
+428             args = {
+429                 'uuid': uuid,
+430                 'status_code': resp.status_code,
+431                 'err_text': resp.text,
+432                 'placement_req_id': placement_req_id,
+433             }
+434             LOG.error(msg, args)
+435             raise exception.ResourceProviderRetrievalFailed(uuid=uuid)
+436 
+437     @safe_connect
+438     def _get_sharing_providers(self, context, agg_uuids):
+439         """Queries the placement API for a list of the resource providers
+440         associated with any of the specified aggregates and possessing the
+441         MISC_SHARES_VIA_AGGREGATE trait.
+442 
+443         :param context: The security context
+444         :param agg_uuids: Iterable of string UUIDs of aggregates to filter on.
+445         :return: A list of dicts of resource provider information, which may be
+446                  empty if no provider exists with the specified UUID.
+447         :raise: ResourceProviderRetrievalFailed on error.
+448         """
+449         if not agg_uuids:
+450             return []
+451 
+452         aggs = ','.join(agg_uuids)
+453         url = "/resource_providers?member_of=in:%s&required=%s" % (
+454             aggs, os_traits.MISC_SHARES_VIA_AGGREGATE)
+455         resp = self.get(url, version='1.18',
+456                         global_request_id=context.global_id)
+457         if resp.status_code == 200:
+458             return resp.json()['resource_providers']
+459 
+460         msg = _("[%(placement_req_id)s] Failed to retrieve sharing resource "
+461                 "providers associated with the following aggregates from "
+462                 "placement API: %(aggs)s. Got %(status_code)d: %(err_text)s.")
+463         args = {
+464             'aggs': aggs,
+465             'status_code': resp.status_code,
+466             'err_text': resp.text,
+467             'placement_req_id': get_placement_request_id(resp),
+468         }
+469         LOG.error(msg, args)
+470         raise exception.ResourceProviderRetrievalFailed(message=msg % args)
+471 
+472     def get_providers_in_tree(self, context, uuid):
+473         """Queries the placement API for a list of the resource providers in
+474         the tree associated with the specified UUID.
+475 
+476         :param context: The security context
+477         :param uuid: UUID identifier for the resource provider to look up
+478         :return: A list of dicts of resource provider information, which may be
+479                  empty if no provider exists with the specified UUID.
+480         :raise: ResourceProviderRetrievalFailed on error.
+481         :raise: keystoneauth1.exceptions.ClientException if placement API
+482                 communication fails.
+483         """
+484         resp = self.get("/resource_providers?in_tree=%s" % uuid,
+485                         version=NESTED_PROVIDER_API_VERSION,
+486                         global_request_id=context.global_id)
+487 
+488         if resp.status_code == 200:
+489             return resp.json()['resource_providers']
+490 
+491         # Some unexpected error
+492         placement_req_id = get_placement_request_id(resp)
+493         msg = ("[%(placement_req_id)s] Failed to retrieve resource provider "
+494                "tree from placement API for UUID %(uuid)s. Got "
+495                "%(status_code)d: %(err_text)s.")
+496         args = {
+497             'uuid': uuid,
+498             'status_code': resp.status_code,
+499             'err_text': resp.text,
+500             'placement_req_id': placement_req_id,
+501         }
+502         LOG.error(msg, args)
+503         raise exception.ResourceProviderRetrievalFailed(uuid=uuid)
+504 
+505     @safe_connect
+506     def _create_resource_provider(self, context, uuid, name,
+507                                   parent_provider_uuid=None):
+508         """Calls the placement API to create a new resource provider record.
+509 
+510         :param context: The security context
+511         :param uuid: UUID of the new resource provider
+512         :param name: Name of the resource provider
+513         :param parent_provider_uuid: Optional UUID of the immediate parent
+514         :return: A dict of resource provider information object representing
+515                  the newly-created resource provider.
+516         :raise: ResourceProviderCreationFailed or
+517                 ResourceProviderRetrievalFailed on error.
+518         """
+519         url = "/resource_providers"
+520         payload = {
+521             'uuid': uuid,
+522             'name': name,
+523         }
+524         if parent_provider_uuid is not None:
+525             payload['parent_provider_uuid'] = parent_provider_uuid
+526 
+527         # Bug #1746075: First try the microversion that returns the new
+528         # provider's payload.
+529         resp = self.post(url, payload,
+530                          version=POST_RPS_RETURNS_PAYLOAD_API_VERSION,
+531                          global_request_id=context.global_id)
+532 
+533         placement_req_id = get_placement_request_id(resp)
+534 
+535         if resp:
+536             msg = ("[%(placement_req_id)s] Created resource provider record "
+537                    "via placement API for resource provider with UUID "
+538                    "%(uuid)s and name %(name)s.")
+539             args = {
+540                 'uuid': uuid,
+541                 'name': name,
+542                 'placement_req_id': placement_req_id,
+543             }
+544             LOG.info(msg, args)
+545             return resp.json()
+546 
+547         # TODO(efried): Push error codes from placement, and use 'em.
+548         name_conflict = 'Conflicting resource provider name:'
+549         if resp.status_code == 409 and name_conflict not in resp.text:
+550             # Another thread concurrently created a resource provider with the
+551             # same UUID. Log a warning and then just return the resource
+552             # provider object from _get_resource_provider()
+553             msg = ("[%(placement_req_id)s] Another thread already created a "
+554                    "resource provider with the UUID %(uuid)s. Grabbing that "
+555                    "record from the placement API.")
+556             args = {
+557                 'uuid': uuid,
+558                 'placement_req_id': placement_req_id,
+559             }
+560             LOG.info(msg, args)
+561             return self._get_resource_provider(context, uuid)
+562 
+563         # A provider with the same *name* already exists, or some other error.
+564         msg = ("[%(placement_req_id)s] Failed to create resource provider "
+565                "record in placement API for UUID %(uuid)s. Got "
+566                "%(status_code)d: %(err_text)s.")
+567         args = {
+568             'uuid': uuid,
+569             'status_code': resp.status_code,
+570             'err_text': resp.text,
+571             'placement_req_id': placement_req_id,
+572         }
+573         LOG.error(msg, args)
+574         raise exception.ResourceProviderCreationFailed(name=name)
+575 
+576     def _ensure_resource_provider(self, context, uuid, name=None,
+577                                   parent_provider_uuid=None):
+578         """Ensures that the placement API has a record of a resource provider
+579         with the supplied UUID. If not, creates the resource provider record in
+580         the placement API for the supplied UUID, passing in a name for the
+581         resource provider.
+582 
+583         If found or created, the provider's UUID is returned from this method.
+584         If the resource provider for the supplied uuid was not found and the
+585         resource provider record could not be created in the placement API, an
+586         exception is raised.
+587 
+588         If this method returns successfully, callers are assured that the
+589         placement API contains a record of the provider; and that the local
+590         cache of resource provider information contains a record of:
+591         - The specified provider
+592         - All providers in its tree
+593         - All providers associated via aggregate with all providers in said
+594           tree
+595         and for each of those providers:
+596         - The UUIDs of its aggregates
+597         - The trait strings associated with the provider
+598 
+599         Note that if the provider did not exist prior to this call, the above
+600         reduces to just the specified provider as a root, with no aggregates or
+601         traits.
+602 
+603         :param context: The security context
+604         :param uuid: UUID identifier for the resource provider to ensure exists
+605         :param name: Optional name for the resource provider if the record
+606                      does not exist. If empty, the name is set to the UUID
+607                      value
+608         :param parent_provider_uuid: Optional UUID of the immediate parent,
+609                                      which must have been previously _ensured.
+610         :raise ResourceProviderCreationFailed: If we expected to be creating
+611                 providers, but couldn't.
+612         :raise: keystoneauth1.exceptions.ClientException if placement API
+613                 communication fails.
+614         """
+615         # NOTE(efried): We currently have no code path where we need to set the
+616         # parent_provider_uuid on a previously-parent-less provider - so we do
+617         # NOT handle that scenario here.
+618 
+619         # If we already have the root provider in the cache, and it's not
+620         # stale, don't refresh it; and use the cache to determine the
+621         # descendants to (soft) refresh.
+622         # NOTE(efried): This assumes the compute service only cares about
+623         # providers it "owns". If that ever changes, we'll need a way to find
+624         # out about out-of-band changes here. Options that have been
+625         # brainstormed at this time:
+626         # - Make this condition more frequently True
+627         # - Some kind of notification subscription so a separate thread is
+628         #   alerted when <thing we care about happens in placement>.
+629         # - "Cascading generations" - i.e. a change to a leaf node percolates
+630         #   generation bump up the tree so that we bounce 409 the next time we
+631         #   try to update anything and have to refresh.
+632         if (self._provider_tree.exists(uuid) and
+633                 not self._associations_stale(uuid)):
+634             uuids_to_refresh = [
+635                 u for u in self._provider_tree.get_provider_uuids(uuid)
+636                 if self._associations_stale(u)]
+637         else:
+638             # We either don't have it locally or it's stale. Pull or create it.
+639             created_rp = None
+640             rps_to_refresh = self.get_providers_in_tree(context, uuid)
+641             if not rps_to_refresh:
+642                 created_rp = self._create_resource_provider(
+643                     context, uuid, name or uuid,
+644                     parent_provider_uuid=parent_provider_uuid)
+645                 # If @safe_connect can't establish a connection to the
+646                 # placement service, like if placement isn't running or
+647                 # nova-compute is mis-configured for authentication, we'll get
+648                 # None back and need to treat it like we couldn't create the
+649                 # provider (because we couldn't).
+650                 if created_rp is None:
+651                     raise exception.ResourceProviderCreationFailed(
+652                         name=name or uuid)
+653                 # Don't add the created_rp to rps_to_refresh.  Since we just
+654                 # created it, it has no aggregates or traits.
+655                 # But do mark it as having just been "refreshed".
+656                 self._association_refresh_time[uuid] = time.time()
+657 
+658             self._provider_tree.populate_from_iterable(
+659                 rps_to_refresh or [created_rp])
+660 
+661             uuids_to_refresh = [rp['uuid'] for rp in rps_to_refresh]
+662 
+663         # At this point, the whole tree exists in the local cache.
+664 
+665         for uuid_to_refresh in uuids_to_refresh:
+666             self._refresh_associations(context, uuid_to_refresh, force=True)
+667 
+668         return uuid
+669 
+670     def _delete_provider(self, rp_uuid, global_request_id=None):
+671         resp = self.delete('/resource_providers/%s' % rp_uuid,
+672                            global_request_id=global_request_id)
+673         # Check for 404 since we don't need to warn/raise if we tried to delete
+674         # something which doesn"t actually exist.
+675         if resp or resp.status_code == 404:
+676             if resp:
+677                 LOG.info("Deleted resource provider %s", rp_uuid)
+678             # clean the caches
+679             try:
+680                 self._provider_tree.remove(rp_uuid)
+681             except ValueError:
+682                 pass
+683             self._association_refresh_time.pop(rp_uuid, None)
+684             return
+685 
+686         msg = ("[%(placement_req_id)s] Failed to delete resource provider "
+687                "with UUID %(uuid)s from the placement API. Got "
+688                "%(status_code)d: %(err_text)s.")
+689         args = {
+690             'placement_req_id': get_placement_request_id(resp),
+691             'uuid': rp_uuid,
+692             'status_code': resp.status_code,
+693             'err_text': resp.text
+694         }
+695         LOG.error(msg, args)
+696         # On conflict, the caller may wish to delete allocations and
+697         # redrive.  (Note that this is not the same as a
+698         # PlacementAPIConflict case.)
+699         if resp.status_code == 409:
+700             raise exception.ResourceProviderInUse()
+701         raise exception.ResourceProviderDeletionFailed(uuid=rp_uuid)
+702 
+703     def _get_inventory(self, context, rp_uuid):
+704         url = '/resource_providers/%s/inventories' % rp_uuid
+705         result = self.get(url, global_request_id=context.global_id)
+706         if not result:
+707             # TODO(efried): Log.
+708             return None
+709         return result.json()
+710 
+711     def _refresh_and_get_inventory(self, context, rp_uuid):
+712         """Helper method that retrieves the current inventory for the supplied
+713         resource provider according to the placement API.
+714 
+715         If the cached generation of the resource provider is not the same as
+716         the generation returned from the placement API, we update the cached
+717         generation and attempt to update inventory if any exists, otherwise
+718         return empty inventories.
+719         """
+720         curr = self._get_inventory(context, rp_uuid)
+721         if curr is None:
+722             return None
+723 
+724         LOG.debug('Updating ProviderTree inventory for provider %s from '
+725                   '_refresh_and_get_inventory using data: %s', rp_uuid,
+726                   curr['inventories'])
+727         self._provider_tree.update_inventory(
+728             rp_uuid, curr['inventories'],
+729             generation=curr['resource_provider_generation'])
+730 
+731         return curr
+732 
+733     def _refresh_associations(self, context, rp_uuid, force=False,
+734                               refresh_sharing=True):
+735         """Refresh inventories, aggregates, traits, and (optionally) aggregate-
+736         associated sharing providers for the specified resource provider uuid.
+737 
+738         Only refresh if there has been no refresh during the lifetime of
+739         this process, CONF.compute.resource_provider_association_refresh
+740         seconds have passed, or the force arg has been set to True.
+741 
+742         :param context: The security context
+743         :param rp_uuid: UUID of the resource provider to check for fresh
+744                         inventories, aggregates, and traits
+745         :param force: If True, force the refresh
+746         :param refresh_sharing: If True, fetch all the providers associated
+747                                 by aggregate with the specified provider,
+748                                 including their inventories, traits, and
+749                                 aggregates (but not *their* sharing providers).
+750         :raise: On various placement API errors, one of:
+751                 - ResourceProviderAggregateRetrievalFailed
+752                 - ResourceProviderTraitRetrievalFailed
+753                 - ResourceProviderRetrievalFailed
+754         :raise: keystoneauth1.exceptions.ClientException if placement API
+755                 communication fails.
+756         """
+757         if force or self._associations_stale(rp_uuid):
+758             # Refresh inventories
+759             msg = "Refreshing inventories for resource provider %s"
+760             LOG.debug(msg, rp_uuid)
+761             self._refresh_and_get_inventory(context, rp_uuid)
+762             # Refresh aggregates
+763             agg_info = self._get_provider_aggregates(context, rp_uuid)
+764             # If @safe_connect makes the above return None, this will raise
+765             # TypeError. Good.
+766             aggs, generation = agg_info.aggregates, agg_info.generation
+767             msg = ("Refreshing aggregate associations for resource provider "
+768                    "%s, aggregates: %s")
+769             LOG.debug(msg, rp_uuid, ','.join(aggs or ['None']))
+770 
+771             # NOTE(efried): This will blow up if called for a RP that doesn't
+772             # exist in our _provider_tree.
+773             self._provider_tree.update_aggregates(
+774                 rp_uuid, aggs, generation=generation)
+775 
+776             # Refresh traits
+777             trait_info = self.get_provider_traits(context, rp_uuid)
+778             traits, generation = trait_info.traits, trait_info.generation
+779             msg = ("Refreshing trait associations for resource provider %s, "
+780                    "traits: %s")
+781             LOG.debug(msg, rp_uuid, ','.join(traits or ['None']))
+782             # NOTE(efried): This will blow up if called for a RP that doesn't
+783             # exist in our _provider_tree.
+784             self._provider_tree.update_traits(
+785                 rp_uuid, traits, generation=generation)
+786 
+787             if refresh_sharing:
+788                 # Refresh providers associated by aggregate
+789                 for rp in self._get_sharing_providers(context, aggs):
+790                     if not self._provider_tree.exists(rp['uuid']):
+791                         # NOTE(efried): Right now sharing providers are always
+792                         # treated as roots. This is deliberate. From the
+793                         # context of this compute's RP, it doesn't matter if a
+794                         # sharing RP is part of a tree.
+795                         self._provider_tree.new_root(
+796                             rp['name'], rp['uuid'],
+797                             generation=rp['generation'])
+798                     # Now we have to (populate or) refresh that provider's
+799                     # traits, aggregates, and inventories (but not *its*
+800                     # aggregate-associated providers). No need to override
+801                     # force=True for newly-added providers - the missing
+802                     # timestamp will always trigger them to refresh.
+803                     self._refresh_associations(context, rp['uuid'],
+804                                                force=force,
+805                                                refresh_sharing=False)
+806             self._association_refresh_time[rp_uuid] = time.time()
+807 
+808     def _associations_stale(self, uuid):
+809         """Respond True if aggregates and traits have not been refreshed
+810         "recently".
+811 
+812         Associations are stale if association_refresh_time for this uuid is not
+813         set or is more than CONF.compute.resource_provider_association_refresh
+814         seconds ago.
+815 
+816         Always False if CONF.compute.resource_provider_association_refresh is
+817         zero.
+818         """
+819         rpar = CONF.compute.resource_provider_association_refresh
+820         refresh_time = self._association_refresh_time.get(uuid, 0)
+821         # If refresh is disabled, associations are "never" stale. (But still
+822         # load them if we haven't yet done so.)
+823         if rpar == 0 and refresh_time != 0:
+824             # TODO(efried): If refresh is disabled, we could avoid touching the
+825             # _association_refresh_time dict anywhere, but that would take some
+826             # nontrivial refactoring.
+827             return False
+828         return (time.time() - refresh_time) > rpar
+829 
+830     def get_provider_tree_and_ensure_root(self, context, rp_uuid, name=None,
+831                                           parent_provider_uuid=None):
+832         """Returns a fresh ProviderTree representing all providers which are in
+833         the same tree or in the same aggregate as the specified provider,
+834         including their aggregates, traits, and inventories.
+835 
+836         If the specified provider does not exist, it is created with the
+837         specified UUID, name, and parent provider (which *must* already exist).
+838 
+839         :param context: The security context
+840         :param rp_uuid: UUID of the resource provider for which to populate the
+841                         tree.  (This doesn't need to be the UUID of the root.)
+842         :param name: Optional name for the resource provider if the record
+843                      does not exist. If empty, the name is set to the UUID
+844                      value
+845         :param parent_provider_uuid: Optional UUID of the immediate parent,
+846                                      which must have been previously _ensured.
+847         :return: A new ProviderTree object.
+848         """
+849         # TODO(efried): We would like to have the caller handle create-and/or-
+850         # cache-if-not-already, but the resource tracker is currently
+851         # structured to handle initialization and update in a single path.  At
+852         # some point this should be refactored, and this method can *just*
+853         # return a deep copy of the local _provider_tree cache.
+854         # (Re)populate the local ProviderTree
+855         self._ensure_resource_provider(
+856             context, rp_uuid, name=name,
+857             parent_provider_uuid=parent_provider_uuid)
+858         # Return a *copy* of the tree.
+859         return copy.deepcopy(self._provider_tree)
+860 
+861     def set_inventory_for_provider(self, context, rp_uuid, inv_data):
+862         """Given the UUID of a provider, set the inventory records for the
+863         provider to the supplied dict of resources.
+864 
+865         The provider must exist - this method does not attempt to create it.
+866 
+867         :param context: The security context
+868         :param rp_uuid: The UUID of the provider whose inventory is to be
+869                         updated.
+870         :param inv_data: Dict, keyed by resource class name, of inventory data
+871                          to set for the provider.  Use None or the empty dict
+872                          to remove all inventory for the provider.
+873         :raises: InventoryInUse if inv_data indicates removal of inventory in a
+874                  resource class which has active allocations for this provider.
+875         :raises: InvalidResourceClass if inv_data contains a resource class
+876                  which cannot be created.
+877         :raises: ResourceProviderUpdateConflict if the provider's generation
+878                  doesn't match the generation in the cache.  Callers may choose
+879                  to retrieve the provider and its associations afresh and
+880                  redrive this operation.
+881         :raises: ResourceProviderUpdateFailed on any other placement API
+882                  failure.
+883         """
+884         # NOTE(efried): This is here because _ensure_resource_class already has
+885         # @safe_connect, so we don't want to decorate this whole method with it
+886         @safe_connect
+887         def do_put(url, payload):
+888             # NOTE(vdrok): in microversion 1.26 it is allowed to have inventory
+889             # records with reserved value equal to total
+890             return self.put(
+891                 url, payload, global_request_id=context.global_id,
+892                 version=ALLOW_RESERVED_EQUAL_TOTAL_INVENTORY_VERSION)
+893 
+894         # If not different from what we've got, short out
+895         if not self._provider_tree.has_inventory_changed(rp_uuid, inv_data):
+896             LOG.debug('Inventory has not changed for provider %s based '
+897                       'on inventory data: %s', rp_uuid, inv_data)
+898             return
+899 
+900         # Ensure non-standard resource classes exist, creating them if needed.
+901         self._ensure_resource_classes(context, set(inv_data))
+902 
+903         url = '/resource_providers/%s/inventories' % rp_uuid
+904         inv_data = inv_data or {}
+905         generation = self._provider_tree.data(rp_uuid).generation
+906         payload = {
+907             'resource_provider_generation': generation,
+908             'inventories': inv_data,
+909         }
+910         resp = do_put(url, payload)
+911 
+912         if resp.status_code == 200:
+913             LOG.debug('Updated inventory for provider %s with generation %s '
+914                       'in Placement from set_inventory_for_provider using '
+915                       'data: %s', rp_uuid, generation, inv_data)
+916             json = resp.json()
+917             self._provider_tree.update_inventory(
+918                 rp_uuid, json['inventories'],
+919                 generation=json['resource_provider_generation'])
+920             return
+921 
+922         # Some error occurred; log it
+923         msg = ("[%(placement_req_id)s] Failed to update inventory to "
+924                "[%(inv_data)s] for resource provider with UUID %(uuid)s.  Got "
+925                "%(status_code)d: %(err_text)s")
+926         args = {
+927             'placement_req_id': get_placement_request_id(resp),
+928             'uuid': rp_uuid,
+929             'inv_data': str(inv_data),
+930             'status_code': resp.status_code,
+931             'err_text': resp.text,
+932         }
+933         LOG.error(msg, args)
+934 
+935         if resp.status_code == 409:
+936             # If a conflict attempting to remove inventory in a resource class
+937             # with active allocations, raise InventoryInUse
+938             err = resp.json()['errors'][0]
+939             # TODO(efried): If there's ever a lib exporting symbols for error
+940             # codes, use it.
+941             if err['code'] == 'placement.inventory.inuse':
+942                 # The error detail includes the resource class and provider.
+943                 raise exception.InventoryInUse(err['detail'])
+944             # Other conflicts are generation mismatch: raise conflict exception
+945             raise exception.ResourceProviderUpdateConflict(
+946                 uuid=rp_uuid, generation=generation, error=resp.text)
+947 
+948         # Otherwise, raise generic exception
+949         raise exception.ResourceProviderUpdateFailed(url=url, error=resp.text)
+950 
+951     @safe_connect
+952     def _ensure_traits(self, context, traits):
+953         """Make sure all specified traits exist in the placement service.
+954 
+955         :param context: The security context
+956         :param traits: Iterable of trait strings to ensure exist.
+957         :raises: TraitCreationFailed if traits contains a trait that did not
+958                  exist in placement, and couldn't be created.  When this
+959                  exception is raised, it is possible that *some* of the
+960                  requested traits were created.
+961         :raises: TraitRetrievalFailed if the initial query of existing traits
+962                  was unsuccessful.  In this scenario, it is guaranteed that
+963                  no traits were created.
+964         """
+965         if not traits:
+966             return
+967 
+968         # Query for all the requested traits.  Whichever ones we *don't* get
+969         # back, we need to create.
+970         # NOTE(efried): We don't attempt to filter based on our local idea of
+971         # standard traits, which may not be in sync with what the placement
+972         # service knows.  If the caller tries to ensure a nonexistent
+973         # "standard" trait, they deserve the TraitCreationFailed exception
+974         # they'll get.
+975         resp = self.get('/traits?name=in:' + ','.join(traits), version='1.6',
+976                         global_request_id=context.global_id)
+977         if resp.status_code == 200:
+978             traits_to_create = set(traits) - set(resp.json()['traits'])
+979             # Might be neat to have a batch create.  But creating multiple
+980             # traits will generally happen once, at initial startup, if at all.
+981             for trait in traits_to_create:
+982                 resp = self.put('/traits/' + trait, None, version='1.6',
+983                                 global_request_id=context.global_id)
+984                 if not resp:
+985                     raise exception.TraitCreationFailed(name=trait,
+986                                                         error=resp.text)
+987             return
+988 
+989         # The initial GET failed
+990         msg = ("[%(placement_req_id)s] Failed to retrieve the list of traits. "
+991                "Got %(status_code)d: %(err_text)s")
+992         args = {
+993             'placement_req_id': get_placement_request_id(resp),
+994             'status_code': resp.status_code,
+995             'err_text': resp.text,
+996         }
+997         LOG.error(msg, args)
+998         raise exception.TraitRetrievalFailed(error=resp.text)
+999 
+1000     @safe_connect
+1001     def set_traits_for_provider(self, context, rp_uuid, traits):
+1002         """Replace a provider's traits with those specified.
+1003 
+1004         The provider must exist - this method does not attempt to create it.
+1005 
+1006         :param context: The security context
+1007         :param rp_uuid: The UUID of the provider whose traits are to be updated
+1008         :param traits: Iterable of traits to set on the provider
+1009         :raises: ResourceProviderUpdateConflict if the provider's generation
+1010                  doesn't match the generation in the cache.  Callers may choose
+1011                  to retrieve the provider and its associations afresh and
+1012                  redrive this operation.
+1013         :raises: ResourceProviderUpdateFailed on any other placement API
+1014                  failure.
+1015         :raises: TraitCreationFailed if traits contains a trait that did not
+1016                  exist in placement, and couldn't be created.
+1017         :raises: TraitRetrievalFailed if the initial query of existing traits
+1018                  was unsuccessful.
+1019         """
+1020         # If not different from what we've got, short out
+1021         if not self._provider_tree.have_traits_changed(rp_uuid, traits):
+1022             return
+1023 
+1024         self._ensure_traits(context, traits)
+1025 
+1026         url = '/resource_providers/%s/traits' % rp_uuid
+1027         # NOTE(efried): Don't use the DELETE API when traits is empty, because
+1028         # that method doesn't return content, and we need to update the cached
+1029         # provider tree with the new generation.
+1030         traits = list(traits) if traits else []
+1031         generation = self._provider_tree.data(rp_uuid).generation
+1032         payload = {
+1033             'resource_provider_generation': generation,
+1034             'traits': traits,
+1035         }
+1036         resp = self.put(url, payload, version='1.6',
+1037                         global_request_id=context.global_id)
+1038 
+1039         if resp.status_code == 200:
+1040             json = resp.json()
+1041             self._provider_tree.update_traits(
+1042                 rp_uuid, json['traits'],
+1043                 generation=json['resource_provider_generation'])
+1044             return
+1045 
+1046         # Some error occurred; log it
+1047         msg = ("[%(placement_req_id)s] Failed to update traits to "
+1048                "[%(traits)s] for resource provider with UUID %(uuid)s.  Got "
+1049                "%(status_code)d: %(err_text)s")
+1050         args = {
+1051             'placement_req_id': get_placement_request_id(resp),
+1052             'uuid': rp_uuid,
+1053             'traits': ','.join(traits),
+1054             'status_code': resp.status_code,
+1055             'err_text': resp.text,
+1056         }
+1057         LOG.error(msg, args)
+1058 
+1059         # If a conflict, raise special conflict exception
+1060         if resp.status_code == 409:
+1061             raise exception.ResourceProviderUpdateConflict(
+1062                 uuid=rp_uuid, generation=generation, error=resp.text)
+1063 
+1064         # Otherwise, raise generic exception
+1065         raise exception.ResourceProviderUpdateFailed(url=url, error=resp.text)
+1066 
+1067     @safe_connect
+1068     def set_aggregates_for_provider(self, context, rp_uuid, aggregates,
+1069             use_cache=True, generation=None):
+1070         """Replace a provider's aggregates with those specified.
+1071 
+1072         The provider must exist - this method does not attempt to create it.
+1073 
+1074         :param context: The security context
+1075         :param rp_uuid: The UUID of the provider whose aggregates are to be
+1076                         updated.
+1077         :param aggregates: Iterable of aggregates to set on the provider.
+1078         :param use_cache: If False, indicates not to update the cache of
+1079                           resource providers.
+1080         :param generation: Resource provider generation. Required if use_cache
+1081                            is False.
+1082         :raises: ResourceProviderUpdateConflict if the provider's generation
+1083                  doesn't match the generation in the cache.  Callers may choose
+1084                  to retrieve the provider and its associations afresh and
+1085                  redrive this operation.
+1086         :raises: ResourceProviderUpdateFailed on any other placement API
+1087                  failure.
+1088         """
+1089         # If a generation is specified, it trumps whatever's in the cache.
+1090         # Otherwise...
+1091         if generation is None:
+1092             if use_cache:
+1093                 generation = self._provider_tree.data(rp_uuid).generation
+1094             else:
+1095                 # Either cache or generation is required
+1096                 raise ValueError(
+1097                     _("generation is required with use_cache=False"))
+1098 
+1099         # Check whether aggregates need updating.  We can only do this if we
+1100         # have a cache entry with a matching generation.
+1101         try:
+1102             if (self._provider_tree.data(rp_uuid).generation == generation and
+1103                     not self._provider_tree.have_aggregates_changed(
+1104                         rp_uuid, aggregates)):
+1105                 return
+1106         except ValueError:
+1107             # Not found in the cache; proceed
+1108             pass
+1109 
+1110         url = '/resource_providers/%s/aggregates' % rp_uuid
+1111         aggregates = list(aggregates) if aggregates else []
+1112         payload = {'aggregates': aggregates,
+1113                    'resource_provider_generation': generation}
+1114         resp = self.put(url, payload, version=AGGREGATE_GENERATION_VERSION,
+1115                         global_request_id=context.global_id)
+1116 
+1117         if resp.status_code == 200:
+1118             # Try to update the cache regardless.  If use_cache=False, ignore
+1119             # any failures.
+1120             try:
+1121                 data = resp.json()
+1122                 self._provider_tree.update_aggregates(
+1123                     rp_uuid, data['aggregates'],
+1124                     generation=data['resource_provider_generation'])
+1125             except ValueError:
+1126                 if use_cache:
+1127                     # The entry should've been there
+1128                     raise
+1129             return
+1130 
+1131         # Some error occurred; log it
+1132         msg = ("[%(placement_req_id)s] Failed to update aggregates to "
+1133                "[%(aggs)s] for resource provider with UUID %(uuid)s.  Got "
+1134                "%(status_code)d: %(err_text)s")
+1135         args = {
+1136             'placement_req_id': get_placement_request_id(resp),
+1137             'uuid': rp_uuid,
+1138             'aggs': ','.join(aggregates),
+1139             'status_code': resp.status_code,
+1140             'err_text': resp.text,
+1141         }
+1142 
+1143         # If a conflict, invalidate the cache and raise special exception
+1144         if resp.status_code == 409:
+1145             # No reason to condition cache invalidation on use_cache - if we
+1146             # got a 409, the cache entry is still bogus if it exists; and the
+1147             # below is a no-op if it doesn't.
+1148             try:
+1149                 self._provider_tree.remove(rp_uuid)
+1150             except ValueError:
+1151                 pass
+1152             self._association_refresh_time.pop(rp_uuid, None)
+1153 
+1154             LOG.warning(msg, args)
+1155             raise exception.ResourceProviderUpdateConflict(
+1156                 uuid=rp_uuid, generation=generation, error=resp.text)
+1157 
+1158         # Otherwise, raise generic exception
+1159         LOG.error(msg, args)
+1160         raise exception.ResourceProviderUpdateFailed(url=url, error=resp.text)
+1161 
+1162     @safe_connect
+1163     def _ensure_resource_classes(self, context, names):
+1164         """Make sure resource classes exist.
+1165 
+1166         :param context: The security context
+1167         :param names: Iterable of string names of the resource classes to
+1168                       check/create.  Must not be None.
+1169         :raises: exception.InvalidResourceClass if an attempt is made to create
+1170                  an invalid resource class.
+1171         """
+1172         # Placement API version that supports PUT /resource_classes/CUSTOM_*
+1173         # to create (or validate the existence of) a consumer-specified
+1174         # resource class.
+1175         version = '1.7'
+1176         to_ensure = set(n for n in names
+1177                         if n.startswith(orc.CUSTOM_NAMESPACE))
+1178 
+1179         for name in to_ensure:
+1180             # no payload on the put request
+1181             resp = self.put(
+1182                 "/resource_classes/%s" % name, None, version=version,
+1183                 global_request_id=context.global_id)
+1184             if not resp:
+1185                 msg = ("Failed to ensure resource class record with placement "
+1186                        "API for resource class %(rc_name)s. Got "
+1187                        "%(status_code)d: %(err_text)s.")
+1188                 args = {
+1189                     'rc_name': name,
+1190                     'status_code': resp.status_code,
+1191                     'err_text': resp.text,
+1192                 }
+1193                 LOG.error(msg, args)
+1194                 raise exception.InvalidResourceClass(resource_class=name)
+1195 
+1196     def _reshape(self, context, inventories, allocations):
+1197         """Perform atomic inventory & allocation data migration.
+1198 
+1199         :param context: The security context
+1200         :param inventories: A dict, keyed by resource provider UUID, of:
+1201                 { "inventories": { inventory dicts, keyed by resource class },
+1202                   "resource_provider_generation": $RP_GEN }
+1203         :param allocations: A dict, keyed by consumer UUID, of:
+1204                 { "project_id": $PROJ_ID,
+1205                   "user_id": $USER_ID,
+1206                   "consumer_generation": $CONSUMER_GEN,
+1207                   "allocations": {
+1208                       $RP_UUID: {
+1209                           "resources": { $RC: $AMOUNT, ... }
+1210                       },
+1211                       ...
+1212                   }
+1213                 }
+1214         :return: The Response object representing a successful API call.
+1215         :raises: ReshapeFailed if the POST /reshaper request fails.
+1216         :raises: keystoneauth1.exceptions.ClientException if placement API
+1217                  communication fails.
+1218         """
+1219         # We have to make sure any new resource classes exist
+1220         for invs in inventories.values():
+1221             self._ensure_resource_classes(context, list(invs['inventories']))
+1222         payload = {"inventories": inventories, "allocations": allocations}
+1223         resp = self.post('/reshaper', payload, version=RESHAPER_VERSION,
+1224                          global_request_id=context.global_id)
+1225         if not resp:
+1226             raise exception.ReshapeFailed(error=resp.text)
+1227 
+1228         return resp
+1229 
+1230     def _set_up_and_do_reshape(self, context, old_tree, new_tree, allocations):
+1231         LOG.info("Performing resource provider inventory and allocation "
+1232                  "data migration.")
+1233         new_uuids = new_tree.get_provider_uuids()
+1234         inventories = {}
+1235         for rp_uuid in new_uuids:
+1236             data = new_tree.data(rp_uuid)
+1237             inventories[rp_uuid] = {
+1238                 "inventories": data.inventory,
+1239                 "resource_provider_generation": data.generation
+1240             }
+1241         # Even though we're going to delete them immediately, we still want
+1242         # to send "inventory changes" for to-be-removed providers in this
+1243         # reshape request so they're done atomically. This prevents races
+1244         # where the scheduler could allocate between here and when we
+1245         # delete the providers.
+1246         to_remove = set(old_tree.get_provider_uuids()) - set(new_uuids)
+1247         for rp_uuid in to_remove:
+1248             inventories[rp_uuid] = {
+1249                 "inventories": {},
+1250                 "resource_provider_generation":
+1251                     old_tree.data(rp_uuid).generation
+1252             }
+1253         # Now we're ready to POST /reshaper. This can raise ReshapeFailed,
+1254         # but we also need to convert any other exception (including e.g.
+1255         # PlacementAPIConnectFailure) to ReshapeFailed because we want any
+1256         # failure here to be fatal to the caller.
+1257         try:
+1258             self._reshape(context, inventories, allocations)
+1259         except exception.ReshapeFailed:
+1260             raise
+1261         except Exception as e:
+1262             # Make sure the original stack trace gets logged.
+1263             LOG.exception('Reshape failed')
+1264             raise exception.ReshapeFailed(error=e)
+1265 
+1266     def update_from_provider_tree(self, context, new_tree, allocations=None):
+1267         """Flush changes from a specified ProviderTree back to placement.
+1268 
+1269         The specified ProviderTree is compared against the local cache.  Any
+1270         changes are flushed back to the placement service.  Upon successful
+1271         completion, the local cache should reflect the specified ProviderTree.
+1272 
+1273         This method is best-effort and not atomic.  When exceptions are raised,
+1274         it is possible that some of the changes have been flushed back, leaving
+1275         the placement database in an inconsistent state.  This should be
+1276         recoverable through subsequent calls.
+1277 
+1278         :param context: The security context
+1279         :param new_tree: A ProviderTree instance representing the desired state
+1280                          of providers in placement.
+1281         :param allocations: A dict, keyed by consumer UUID, of allocation
+1282                             records of the form returned by
+1283                             GET /allocations/{consumer_uuid} representing the
+1284                             comprehensive final picture of the allocations for
+1285                             each consumer therein. A value of None indicates
+1286                             that no reshape is being performed.
+1287         :raises: ResourceProviderUpdateConflict if a generation conflict was
+1288                  encountered - i.e. we are attempting to update placement based
+1289                  on a stale view of it.
+1290         :raises: ResourceProviderSyncFailed if any errors were encountered
+1291                  attempting to perform the necessary API operations, except
+1292                  reshape (see below).
+1293         :raises: ReshapeFailed if a reshape was signaled (allocations not None)
+1294                  and it fails for any reason.
+1295         :raises: keystoneauth1.exceptions.base.ClientException on failure to
+1296                  communicate with the placement API
+1297         """
+1298         # NOTE(efried): We currently do not handle the "rename" case.  This is
+1299         # where new_tree contains a provider named Y whose UUID already exists
+1300         # but is named X.
+1301 
+1302         @contextlib.contextmanager
+1303         def catch_all(rp_uuid):
+1304             """Convert all "expected" exceptions from placement API helpers to
+1305             ResourceProviderSyncFailed* and invalidate the caches for the tree
+1306             around `rp_uuid`.
+1307 
+1308             * Except ResourceProviderUpdateConflict, which signals the caller
+1309               to redrive the operation; and ReshapeFailed, which triggers
+1310               special error handling behavior in the resource tracker and
+1311               compute manager.
+1312             """
+1313             # TODO(efried): Make a base exception class from which all these
+1314             # can inherit.
+1315             helper_exceptions = (
+1316                 exception.InvalidResourceClass,
+1317                 exception.InventoryInUse,
+1318                 exception.ResourceProviderAggregateRetrievalFailed,
+1319                 exception.ResourceProviderDeletionFailed,
+1320                 exception.ResourceProviderInUse,
+1321                 exception.ResourceProviderRetrievalFailed,
+1322                 exception.ResourceProviderTraitRetrievalFailed,
+1323                 exception.ResourceProviderUpdateFailed,
+1324                 exception.TraitCreationFailed,
+1325                 exception.TraitRetrievalFailed,
+1326                 # NOTE(efried): We do not trap/convert ReshapeFailed - that one
+1327                 # needs to bubble up right away and be handled specially.
+1328             )
+1329             try:
+1330                 yield
+1331             except exception.ResourceProviderUpdateConflict:
+1332                 # Invalidate the tree around the failing provider and reraise
+1333                 # the conflict exception. This signals the resource tracker to
+1334                 # redrive the update right away rather than waiting until the
+1335                 # next periodic.
+1336                 with excutils.save_and_reraise_exception():
+1337                     self._clear_provider_cache_for_tree(rp_uuid)
+1338             except helper_exceptions:
+1339                 # Invalidate the relevant part of the cache. It gets rebuilt on
+1340                 # the next pass.
+1341                 self._clear_provider_cache_for_tree(rp_uuid)
+1342                 raise exception.ResourceProviderSyncFailed()
+1343 
+1344         # Helper methods herein will be updating the local cache (this is
+1345         # intentional) so we need to grab up front any data we need to operate
+1346         # on in its "original" form.
+1347         old_tree = self._provider_tree
+1348         old_uuids = old_tree.get_provider_uuids()
+1349         new_uuids = new_tree.get_provider_uuids()
+1350         uuids_to_add = set(new_uuids) - set(old_uuids)
+1351         uuids_to_remove = set(old_uuids) - set(new_uuids)
+1352 
+1353         # In case a reshape is happening, we first have to create (or load) any
+1354         # "new" providers.
+1355         # We have to do additions in top-down order, so we don't error
+1356         # attempting to create a child before its parent exists.
+1357         for uuid in new_uuids:
+1358             if uuid not in uuids_to_add:
+1359                 continue
+1360             provider = new_tree.data(uuid)
+1361             with catch_all(uuid):
+1362                 self._ensure_resource_provider(
+1363                     context, uuid, name=provider.name,
+1364                     parent_provider_uuid=provider.parent_uuid)
+1365                 # We have to stuff the freshly-created provider's generation
+1366                 # into the new_tree so we don't get conflicts updating its
+1367                 # inventories etc. later.
+1368                 # TODO(efried): We don't have a good way to set the generation
+1369                 # independently; this is a hack.
+1370                 new_tree.update_inventory(
+1371                     uuid, new_tree.data(uuid).inventory,
+1372                     generation=self._provider_tree.data(uuid).generation)
+1373 
+1374         # If we need to reshape, do it here.
+1375         if allocations is not None:
+1376             # NOTE(efried): We do not catch_all here, because ReshapeFailed
+1377             # needs to bubble up right away and be handled specially.
+1378             self._set_up_and_do_reshape(context, old_tree, new_tree,
+1379                                         allocations)
+1380             # The reshape updated provider generations, so the ones we have in
+1381             # the cache are now stale. The inventory update below will short
+1382             # out, but we would still bounce with a provider generation
+1383             # conflict on the trait and aggregate updates.
+1384             for uuid in new_uuids:
+1385                 # TODO(efried): GET /resource_providers?uuid=in:[list] would be
+1386                 # handy here. Meanwhile, this is an already-written, if not
+1387                 # obvious, way to refresh provider generations in the cache.
+1388                 with catch_all(uuid):
+1389                     self._refresh_and_get_inventory(context, uuid)
+1390 
+1391         # Now we can do provider deletions, because we should have moved any
+1392         # allocations off of them via reshape.
+1393         # We have to do deletions in bottom-up order, so we don't error
+1394         # attempting to delete a parent who still has children. (We get the
+1395         # UUIDs in bottom-up order by reversing old_uuids, which was given to
+1396         # us in top-down order per ProviderTree.get_provider_uuids().)
+1397         for uuid in reversed(old_uuids):
+1398             if uuid not in uuids_to_remove:
+1399                 continue
+1400             with catch_all(uuid):
+1401                 self._delete_provider(uuid)
+1402 
+1403         # At this point the local cache should have all the same providers as
+1404         # new_tree.  Whether we added them or not, walk through and diff/flush
+1405         # inventories, traits, and aggregates as necessary. Note that, if we
+1406         # reshaped above, any inventory changes have already been done. But the
+1407         # helper methods are set up to check and short out when the relevant
+1408         # property does not differ from what's in the cache.
+1409         # If we encounter any error and remove a provider from the cache, all
+1410         # its descendants are also removed, and set_*_for_provider methods on
+1411         # it wouldn't be able to get started. Walking the tree in bottom-up
+1412         # order ensures we at least try to process all of the providers. (We
+1413         # get the UUIDs in bottom-up order by reversing new_uuids, which was
+1414         # given to us in top-down order per ProviderTree.get_provider_uuids().)
+1415         for uuid in reversed(new_uuids):
+1416             pd = new_tree.data(uuid)
+1417             with catch_all(pd.uuid):
+1418                 self.set_inventory_for_provider(
+1419                     context, pd.uuid, pd.inventory)
+1420                 self.set_aggregates_for_provider(
+1421                     context, pd.uuid, pd.aggregates)
+1422                 self.set_traits_for_provider(context, pd.uuid, pd.traits)
+1423 
+1424     # TODO(efried): Cut users of this method over to get_allocs_for_consumer
+1425     def get_allocations_for_consumer(self, context, consumer):
+1426         """Legacy method for allocation retrieval.
+1427 
+1428         Callers should move to using get_allocs_for_consumer, which handles
+1429         errors properly and returns the entire payload.
+1430 
+1431         :param context: The nova.context.RequestContext auth context
+1432         :param consumer: UUID of the consumer resource
+1433         :returns: A dict of the form:
+1434                 {
+1435                     $RP_UUID: {
+1436                               "generation": $RP_GEN,
+1437                               "resources": {
+1438                                   $RESOURCE_CLASS: $AMOUNT
+1439                                   ...
+1440                               },
+1441                     },
+1442                     ...
+1443                 }
+1444         """
+1445         try:
+1446             return self.get_allocs_for_consumer(
+1447                 context, consumer)['allocations']
+1448         except ks_exc.ClientException as e:
+1449             LOG.warning("Failed to get allocations for consumer %(consumer)s: "
+1450                         "%(error)s", {'consumer': consumer, 'error': e})
+1451             # Because this is what @safe_connect did
+1452             return None
+1453         except exception.ConsumerAllocationRetrievalFailed as e:
+1454             LOG.warning(e)
+1455             # Because this is how we used to treat non-200
+1456             return {}
+1457 
+1458     def get_allocs_for_consumer(self, context, consumer):
+1459         """Makes a GET /allocations/{consumer} call to Placement.
+1460 
+1461         :param context: The nova.context.RequestContext auth context
+1462         :param consumer: UUID of the consumer resource
+1463         :return: Dict of the form:
+1464                 { "allocations": {
+1465                       $RP_UUID: {
+1466                           "generation": $RP_GEN,
+1467                           "resources": {
+1468                               $RESOURCE_CLASS: $AMOUNT
+1469                               ...
+1470                           },
+1471                       },
+1472                       ...
+1473                   },
+1474                   "consumer_generation": $CONSUMER_GEN,
+1475                   "project_id": $PROJ_ID,
+1476                   "user_id": $USER_ID,
+1477                 }
+1478         :raises: keystoneauth1.exceptions.base.ClientException on failure to
+1479                  communicate with the placement API
+1480         :raises: ConsumerAllocationRetrievalFailed if the placement API call
+1481                  fails
+1482         """
+1483         resp = self.get('/allocations/%s' % consumer,
+1484                         version=CONSUMER_GENERATION_VERSION,
+1485                         global_request_id=context.global_id)
+1486         if not resp:
+1487             # TODO(efried): Use code/title/detail to make a better exception
+1488             raise exception.ConsumerAllocationRetrievalFailed(
+1489                 consumer_uuid=consumer, error=resp.text)
+1490 
+1491         return resp.json()
+1492 
+1493     def get_allocations_for_consumer_by_provider(self, context, rp_uuid,
+1494                                                  consumer):
+1495         """Return allocations for a consumer and a resource provider.
+1496 
+1497         :param context: The nova.context.RequestContext auth context
+1498         :param rp_uuid: UUID of the resource provider
+1499         :param consumer: UUID of the consumer
+1500         :return: the resources dict of the consumer's allocation keyed by
+1501                  resource classes
+1502         """
+1503         # NOTE(cdent): This trims to just the allocations being
+1504         # used on this resource provider. In the future when there
+1505         # are shared resources there might be other providers.
+1506         allocations = self.get_allocations_for_consumer(context, consumer)
+1507         if allocations is None:
+1508             # safe_connect can return None on 404
+1509             allocations = {}
+1510         return allocations.get(
+1511             rp_uuid, {}).get('resources', {})
+1512 
+1513     # NOTE(jaypipes): Currently, this method is ONLY used in three places:
+1514     # 1. By the scheduler to allocate resources on the selected destination
+1515     #    hosts.
+1516     # 2. By the conductor LiveMigrationTask to allocate resources on a forced
+1517     #    destination host. In this case, the source node allocations have
+1518     #    already been moved to the migration record so the instance should not
+1519     #    have allocations and _move_operation_alloc_request will not be called.
+1520     # 3. By the conductor ComputeTaskManager to allocate resources on a forced
+1521     #    destination host during evacuate. This case will call the
+1522     #    _move_operation_alloc_request method.
+1523     # This method should not be called by the resource tracker.
+1524     @safe_connect
+1525     @retries
+1526     def claim_resources(self, context, consumer_uuid, alloc_request,
+1527                         project_id, user_id, allocation_request_version,
+1528                         consumer_generation=None):
+1529         """Creates allocation records for the supplied instance UUID against
+1530         the supplied resource providers.
+1531 
+1532         We check to see if resources have already been claimed for this
+1533         consumer. If so, we assume that a move operation is underway and the
+1534         scheduler is attempting to claim resources against the new (destination
+1535         host). In order to prevent compute nodes currently performing move
+1536         operations from being scheduled to improperly, we create a "doubled-up"
+1537         allocation that consumes resources on *both* the source and the
+1538         destination host during the move operation.
+1539 
+1540         :param context: The security context
+1541         :param consumer_uuid: The instance's UUID.
+1542         :param alloc_request: The JSON body of the request to make to the
+1543                               placement's PUT /allocations API
+1544         :param project_id: The project_id associated with the allocations.
+1545         :param user_id: The user_id associated with the allocations.
+1546         :param allocation_request_version: The microversion used to request the
+1547                                            allocations.
+1548         :param consumer_generation: The expected generation of the consumer.
+1549                                     None if a new consumer is expected
+1550         :returns: True if the allocations were created, False otherwise.
+1551         :raise AllocationUpdateFailed: If consumer_generation in the
+1552                                        alloc_request does not match with the
+1553                                        placement view.
+1554         """
+1555         # Ensure we don't change the supplied alloc request since it's used in
+1556         # a loop within the scheduler against multiple instance claims
+1557         ar = copy.deepcopy(alloc_request)
+1558 
+1559         url = '/allocations/%s' % consumer_uuid
+1560 
+1561         payload = ar
+1562 
+1563         # We first need to determine if this is a move operation and if so
+1564         # create the "doubled-up" allocation that exists for the duration of
+1565         # the move operation against both the source and destination hosts
+1566         r = self.get(url, global_request_id=context.global_id,
+1567                      version=CONSUMER_GENERATION_VERSION)
+1568         if r.status_code == 200:
+1569             body = r.json()
+1570             current_allocs = body['allocations']
+1571             if current_allocs:
+1572                 if 'consumer_generation' not in ar:
+1573                     # this is non-forced evacuation. Evacuation does not use
+1574                     # the migration.uuid to hold the source host allocation
+1575                     # therefore when the scheduler calls claim_resources() then
+1576                     # the two allocations need to be combined. Scheduler does
+1577                     # not know that this is not a new consumer as it only sees
+1578                     # allocation candidates.
+1579                     # Therefore we need to use the consumer generation from
+1580                     # the above GET.
+1581                     # If between the GET and the PUT the consumer generation
+1582                     # changes in placement then we raise
+1583                     # AllocationUpdateFailed.
+1584                     # NOTE(gibi): This only detect a small portion of possible
+1585                     # cases when allocation is modified outside of the this
+1586                     # code path. The rest can only be detected if nova would
+1587                     # cache at least the consumer generation of the instance.
+1588                     consumer_generation = body['consumer_generation']
+1589                 else:
+1590                     # this is forced evacuation and the caller
+1591                     # claim_resources_on_destination() provides the consumer
+1592                     # generation it sees in the conductor when it generates the
+1593                     # request.
+1594                     consumer_generation = ar['consumer_generation']
+1595                 payload = _move_operation_alloc_request(current_allocs, ar)
+1596 
+1597         payload['project_id'] = project_id
+1598         payload['user_id'] = user_id
+1599 
+1600         if (versionutils.convert_version_to_tuple(
+1601                 allocation_request_version) >=
+1602                 versionutils.convert_version_to_tuple(
+1603                     CONSUMER_GENERATION_VERSION)):
+1604             payload['consumer_generation'] = consumer_generation
+1605 
+1606         r = self._put_allocations(
+1607             context,
+1608             consumer_uuid,
+1609             payload,
+1610             version=allocation_request_version)
+1611         if r.status_code != 204:
+1612             err = r.json()['errors'][0]
+1613             if err['code'] == 'placement.concurrent_update':
+1614                 # NOTE(jaypipes): Yes, it sucks doing string comparison like
+1615                 # this but we have no error codes, only error messages.
+1616                 # TODO(gibi): Use more granular error codes when available
+1617                 if 'consumer generation conflict' in err['detail']:
+1618                     reason = ('another process changed the consumer %s after '
+1619                               'the report client read the consumer state '
+1620                               'during the claim ' % consumer_uuid)
+1621                     raise exception.AllocationUpdateFailed(
+1622                         consumer_uuid=consumer_uuid, error=reason)
+1623 
+1624                 # this is not a consumer generation conflict so it can only be
+1625                 # a resource provider generation conflict. The caller does not
+1626                 # provide resource provider generation so this is just a
+1627                 # placement internal race. We can blindly retry locally.
+1628                 reason = ('another process changed the resource providers '
+1629                           'involved in our attempt to put allocations for '
+1630                           'consumer %s' % consumer_uuid)
+1631                 raise Retry('claim_resources', reason)
+1632         return r.status_code == 204
+1633 
+1634     def remove_resources_from_instance_allocation(
+1635             self, context, consumer_uuid, resources):
+1636         """Removes certain resources from the current allocation of the
+1637         consumer.
+1638 
+1639         :param context: the request context
+1640         :param consumer_uuid: the uuid of the consumer to update
+1641         :param resources: a dict of resources. E.g.:
+1642                               {
+1643                                   <rp_uuid>: {
+1644                                       <resource class>: amount
+1645                                       <other resource class>: amount
+1646                                   }
+1647                                   <other_ rp_uuid>: {
+1648                                       <other resource class>: amount
+1649                                   }
+1650                               }
+1651         :raises AllocationUpdateFailed: if the requested resource cannot be
+1652                 removed from the current allocation (e.g. rp is missing from
+1653                 the allocation) or there was multiple generation conflict and
+1654                 we run out of retires.
+1655         :raises ConsumerAllocationRetrievalFailed: If the current allocation
+1656                 cannot be read from placement.
+1657         :raises: keystoneauth1.exceptions.base.ClientException on failure to
+1658                  communicate with the placement API
+1659         """
+1660 
+1661         # NOTE(gibi): It is just a small wrapper to raise instead of return
+1662         # if we run out of retries.
+1663         if not self._remove_resources_from_instance_allocation(
+1664                 context, consumer_uuid, resources):
+1665             error_reason = _("Cannot remove resources %s from the allocation "
+1666                              "due to multiple successive generation conflicts "
+1667                              "in placement.")
+1668             raise exception.AllocationUpdateFailed(
+1669                 consumer_uuid=consumer_uuid,
+1670                 error=error_reason % resources)
+1671 
+1672     @retries
+1673     def _remove_resources_from_instance_allocation(
+1674             self, context, consumer_uuid, resources):
+1675         if not resources:
+1676             # Nothing to remove so do not query or update allocation in
+1677             # placement.
+1678             # The True value is only here because the retry decorator returns
+1679             # False when runs out of retries. It would be nicer to raise in
+1680             # that case too.
+1681             return True
+1682 
+1683         current_allocs = self.get_allocs_for_consumer(context, consumer_uuid)
+1684 
+1685         if not current_allocs['allocations']:
+1686             error_reason = _("Cannot remove resources %(resources)s from "
+1687                              "allocation %(allocations)s. The allocation is "
+1688                              "empty.")
+1689             raise exception.AllocationUpdateFailed(
+1690                 consumer_uuid=consumer_uuid,
+1691                 error=error_reason %
+1692                       {'resources': resources, 'allocations': current_allocs})
+1693 
+1694         try:
+1695             for rp_uuid, resources_to_remove in resources.items():
+1696                 allocation_on_rp = current_allocs['allocations'][rp_uuid]
+1697                 for rc, value in resources_to_remove.items():
+1698                     allocation_on_rp['resources'][rc] -= value
+1699 
+1700                     if allocation_on_rp['resources'][rc] < 0:
+1701                         error_reason = _(
+1702                             "Cannot remove resources %(resources)s from "
+1703                             "allocation %(allocations)s. There are not enough "
+1704                             "allocated resources left on %(rp_uuid)s resource "
+1705                             "provider to remove %(amount)d amount of "
+1706                             "%(resource_class)s resources.")
+1707                         raise exception.AllocationUpdateFailed(
+1708                             consumer_uuid=consumer_uuid,
+1709                             error=error_reason %
+1710                                   {'resources': resources,
+1711                                    'allocations': current_allocs,
+1712                                    'rp_uuid': rp_uuid,
+1713                                    'amount': value,
+1714                                    'resource_class': rc})
+1715 
+1716                     if allocation_on_rp['resources'][rc] == 0:
+1717                         # if no allocation left for this rc then remove it
+1718                         # from the allocation
+1719                         del allocation_on_rp['resources'][rc]
+1720         except KeyError as e:
+1721             error_reason = _("Cannot remove resources %(resources)s from "
+1722                              "allocation %(allocations)s. Key %(missing_key)s "
+1723                              "is missing from the allocation.")
+1724             # rp_uuid is missing from the allocation or resource class is
+1725             # missing from the allocation
+1726             raise exception.AllocationUpdateFailed(
+1727                 consumer_uuid=consumer_uuid,
+1728                 error=error_reason %
+1729                       {'resources': resources,
+1730                        'allocations': current_allocs,
+1731                        'missing_key': e})
+1732 
+1733         # we have to remove the rps from the allocation that has no resources
+1734         # any more
+1735         current_allocs['allocations'] = {
+1736             rp_uuid: alloc
+1737             for rp_uuid, alloc in current_allocs['allocations'].items()
+1738             if alloc['resources']}
+1739 
+1740         r = self._put_allocations(
+1741             context, consumer_uuid, current_allocs)
+1742 
+1743         if r.status_code != 204:
+1744             err = r.json()['errors'][0]
+1745             if err['code'] == 'placement.concurrent_update':
+1746                 reason = ('another process changed the resource providers or '
+1747                           'the consumer involved in our attempt to update '
+1748                           'allocations for consumer %s so we cannot remove '
+1749                           'resources %s from the current allocation %s' %
+1750                           (consumer_uuid, resources, current_allocs))
+1751                 # NOTE(gibi): automatic retry is meaningful if we can still
+1752                 # remove the resources from the updated allocations. Retry
+1753                 # works here as this function (re)queries the allocations.
+1754                 raise Retry(
+1755                     'remove_resources_from_instance_allocation', reason)
+1756 
+1757         # It is only here because the retry decorator returns False when runs
+1758         # out of retries. It would be nicer to raise in that case too.
+1759         return True
+1760 
+1761     def remove_provider_tree_from_instance_allocation(self, context,
+1762                                                       consumer_uuid,
+1763                                                       root_rp_uuid):
+1764         """Removes every allocation from the consumer that is on the
+1765         specified provider tree.
+1766 
+1767         Note that this function does not try to remove allocations from sharing
+1768         providers.
+1769 
+1770         :param context: The security context
+1771         :param consumer_uuid: The UUID of the consumer to manipulate
+1772         :param root_rp_uuid: The root of the provider tree
+1773         :raises: keystoneauth1.exceptions.base.ClientException on failure to
+1774                  communicate with the placement API
+1775         :raises: ConsumerAllocationRetrievalFailed if this call cannot read
+1776                  the current state of the allocations from placement
+1777         :raises: ResourceProviderRetrievalFailed if it cannot collect the RPs
+1778                  in the tree specified by root_rp_uuid.
+1779         """
+1780         current_allocs = self.get_allocs_for_consumer(context, consumer_uuid)
+1781         if not current_allocs['allocations']:
+1782             LOG.error("Expected to find current allocations for %s, but "
+1783                       "found none.", consumer_uuid)
+1784             # TODO(gibi): do not return False as none of the callers
+1785             # do anything with the return value except log
+1786             return False
+1787 
+1788         rps = self.get_providers_in_tree(context, root_rp_uuid)
+1789         rp_uuids = [rp['uuid'] for rp in rps]
+1790 
+1791         # go through the current allocations and remove every RP from it that
+1792         # belongs to the RP tree identified by the root_rp_uuid parameter
+1793         has_changes = False
+1794         for rp_uuid in rp_uuids:
+1795             changed = bool(
+1796                 current_allocs['allocations'].pop(rp_uuid, None))
+1797             has_changes = has_changes or changed
+1798 
+1799         # If nothing changed then don't do anything
+1800         if not has_changes:
+1801             LOG.warning(
+1802                 "Expected to find allocations referencing resource "
+1803                 "provider tree rooted at %s for %s, but found none.",
+1804                 root_rp_uuid, consumer_uuid)
+1805             # TODO(gibi): do not return a value as none of the callers
+1806             # do anything with the return value except logging
+1807             return True
+1808 
+1809         r = self._put_allocations(context, consumer_uuid, current_allocs)
+1810         # TODO(gibi): do not return a value as none of the callers
+1811         # do anything with the return value except logging
+1812         return r.status_code == 204
+1813 
+1814     def _put_allocations(
+1815             self, context, consumer_uuid, payload,
+1816             version=CONSUMER_GENERATION_VERSION):
+1817         url = '/allocations/%s' % consumer_uuid
+1818         r = self.put(url, payload, version=version,
+1819                      global_request_id=context.global_id)
+1820         if r.status_code != 204:
+1821             LOG.warning("Failed to save allocation for %s. Got HTTP %s: %s",
+1822                         consumer_uuid, r.status_code, r.text)
+1823         return r
+1824 
+1825     @safe_connect
+1826     @retries
+1827     def move_allocations(self, context, source_consumer_uuid,
+1828                          target_consumer_uuid):
+1829         """Move allocations from one consumer to the other
+1830 
+1831         Note that this call moves the current allocation from the source
+1832         consumer to the target consumer. If parallel update happens on either
+1833         consumer during this call then Placement will detect that and
+1834         this code will raise AllocationMoveFailed. If you want to move a known
+1835         piece of allocation from source to target then this function might not
+1836         be what you want as it always moves what source has in Placement.
+1837 
+1838         If the target consumer has allocations but the source consumer does
+1839         not, this method assumes the allocations were already moved and
+1840         returns True.
+1841 
+1842         :param context: The security context
+1843         :param source_consumer_uuid: the UUID of the consumer from which
+1844                                      allocations are moving
+1845         :param target_consumer_uuid: the UUID of the target consumer for the
+1846                                      allocations
+1847         :returns: True if the move was successful (or already done),
+1848                   False otherwise.
+1849         :raises AllocationMoveFailed: If the source or the target consumer has
+1850                                       been modified while this call tries to
+1851                                       move allocations.
+1852         """
+1853         source_alloc = self.get_allocs_for_consumer(
+1854             context, source_consumer_uuid)
+1855         target_alloc = self.get_allocs_for_consumer(
+1856             context, target_consumer_uuid)
+1857 
+1858         if target_alloc and target_alloc['allocations']:
+1859             # Check to see if the source allocations still exist because if
+1860             # they don't they might have already been moved to the target.
+1861             if not (source_alloc and source_alloc['allocations']):
+1862                 LOG.info('Allocations not found for consumer %s; assuming '
+1863                          'they were already moved to consumer %s',
+1864                          source_consumer_uuid, target_consumer_uuid)
+1865                 return True
+1866             LOG.debug('Overwriting current allocation %(allocation)s on '
+1867                       'consumer %(consumer)s',
+1868                       {'allocation': target_alloc,
+1869                        'consumer': target_consumer_uuid})
+1870 
+1871         new_allocs = {
+1872             source_consumer_uuid: {
+1873                 # 'allocations': {} means we are removing the allocation from
+1874                 # the source consumer
+1875                 'allocations': {},
+1876                 'project_id': source_alloc['project_id'],
+1877                 'user_id': source_alloc['user_id'],
+1878                 'consumer_generation': source_alloc['consumer_generation']},
+1879             target_consumer_uuid: {
+1880                 'allocations': source_alloc['allocations'],
+1881                 # NOTE(gibi): Is there any case when we need to keep the
+1882                 # project_id and user_id of the target allocation that we are
+1883                 # about to overwrite?
+1884                 'project_id': source_alloc['project_id'],
+1885                 'user_id': source_alloc['user_id'],
+1886                 'consumer_generation': target_alloc.get('consumer_generation')
+1887             }
+1888         }
+1889         r = self.post('/allocations', new_allocs,
+1890                       version=CONSUMER_GENERATION_VERSION,
+1891                       global_request_id=context.global_id)
+1892         if r.status_code != 204:
+1893             err = r.json()['errors'][0]
+1894             if err['code'] == 'placement.concurrent_update':
+1895                 # NOTE(jaypipes): Yes, it sucks doing string comparison like
+1896                 # this but we have no error codes, only error messages.
+1897                 # TODO(gibi): Use more granular error codes when available
+1898                 if 'consumer generation conflict' in err['detail']:
+1899                     raise exception.AllocationMoveFailed(
+1900                         source_consumer=source_consumer_uuid,
+1901                         target_consumer=target_consumer_uuid,
+1902                         error=r.text)
+1903 
+1904                 reason = ('another process changed the resource providers '
+1905                           'involved in our attempt to post allocations for '
+1906                           'consumer %s' % target_consumer_uuid)
+1907                 raise Retry('move_allocations', reason)
+1908             else:
+1909                 LOG.warning(
+1910                     'Unable to post allocations for consumer '
+1911                     '%(uuid)s (%(code)i %(text)s)',
+1912                     {'uuid': target_consumer_uuid,
+1913                      'code': r.status_code,
+1914                      'text': r.text})
+1915         return r.status_code == 204
+1916 
+1917     @retries
+1918     def put_allocations(self, context, consumer_uuid, payload):
+1919         """Creates allocation records for the supplied consumer UUID based on
+1920         the provided allocation dict
+1921 
+1922         :param context: The security context
+1923         :param consumer_uuid: The instance's UUID.
+1924         :param payload: Dict in the format expected by the placement
+1925             PUT /allocations/{consumer_uuid} API
+1926         :returns: True if the allocations were created, False otherwise.
+1927         :raises: Retry if the operation should be retried due to a concurrent
+1928             resource provider update.
+1929         :raises: AllocationUpdateFailed if placement returns a consumer
+1930             generation conflict
+1931         :raises: PlacementAPIConnectFailure on failure to communicate with the
+1932             placement API
+1933         """
+1934 
+1935         try:
+1936             r = self._put_allocations(context, consumer_uuid, payload)
+1937         except ks_exc.ClientException:
+1938             raise exception.PlacementAPIConnectFailure()
+1939 
+1940         if r.status_code != 204:
+1941             err = r.json()['errors'][0]
+1942             # NOTE(jaypipes): Yes, it sucks doing string comparison like this
+1943             # but we have no error codes, only error messages.
+1944             # TODO(gibi): Use more granular error codes when available
+1945             if err['code'] == 'placement.concurrent_update':
+1946                 if 'consumer generation conflict' in err['detail']:
+1947                     raise exception.AllocationUpdateFailed(
+1948                         consumer_uuid=consumer_uuid, error=err['detail'])
+1949                 # this is not a consumer generation conflict so it can only be
+1950                 # a resource provider generation conflict. The caller does not
+1951                 # provide resource provider generation so this is just a
+1952                 # placement internal race. We can blindly retry locally.
+1953                 reason = ('another process changed the resource providers '
+1954                           'involved in our attempt to put allocations for '
+1955                           'consumer %s' % consumer_uuid)
+1956                 raise Retry('put_allocations', reason)
+1957         return r.status_code == 204
+1958 
+1959     @safe_connect
+1960     def delete_allocation_for_instance(self, context, uuid,
+1961                                        consumer_type='instance',
+1962                                        force=False):
+1963         """Delete the instance allocation from placement
+1964 
+1965         :param context: The security context
+1966         :param uuid: the instance or migration UUID which will be used
+1967                      as the consumer UUID towards placement
+1968         :param consumer_type: The type of the consumer specified by uuid.
+1969                               'instance' or 'migration' (Default: instance)
+1970         :param force: True if the allocations should be deleted without regard
+1971                       to consumer generation conflicts, False will attempt to
+1972                       GET and PUT empty allocations and use the consumer
+1973                       generation which could result in a conflict and need to
+1974                       retry the operation.
+1975         :return: Returns True if the allocation is successfully deleted by this
+1976                  call. Returns False if the allocation does not exist.
+1977         :raises AllocationDeleteFailed: If the allocation cannot be read from
+1978                 placement (if force=False), is changed by another process while
+1979                 we tried to delete it (if force=False), or if some other server
+1980                 side error occurred (if force=True)
+1981         """
+1982         url = '/allocations/%s' % uuid
+1983         if force:
+1984             # Do not bother with consumer generations, just delete the
+1985             # allocations.
+1986             r = self.delete(url, global_request_id=context.global_id)
+1987             if r:
+1988                 LOG.info('Deleted allocations for %(consumer_type)s %(uuid)s',
+1989                          {'consumer_type': consumer_type, 'uuid': uuid})
+1990                 return True
+1991 
+1992             # Check for 404 since we don't need to log a warning if we
+1993             # tried to delete something which doesn't actually exist.
+1994             if r.status_code != 404:
+1995                 LOG.warning(
+1996                     'Unable to delete allocation for %(consumer_type)s '
+1997                     '%(uuid)s: (%(code)i %(text)s)',
+1998                     {'consumer_type': consumer_type,
+1999                      'uuid': uuid,
+2000                      'code': r.status_code,
+2001                      'text': r.text})
+2002                 raise exception.AllocationDeleteFailed(consumer_uuid=uuid,
+2003                                                        error=r.text)
+2004             return False
+2005 
+2006         # We read the consumer generation then try to put an empty allocation
+2007         # for that consumer. If between the GET and the PUT the consumer
+2008         # generation changes then we raise AllocationDeleteFailed.
+2009         # NOTE(gibi): This only detect a small portion of possible cases when
+2010         # allocation is modified outside of the delete code path. The rest can
+2011         # only be detected if nova would cache at least the consumer generation
+2012         # of the instance.
+2013         # NOTE(gibi): placement does not return 404 for non-existing consumer
+2014         # but returns an empty consumer instead. Putting an empty allocation to
+2015         # that non-existing consumer won't be 404 or other error either.
+2016         r = self.get(url, global_request_id=context.global_id,
+2017                      version=CONSUMER_GENERATION_VERSION)
+2018         if not r:
+2019             # at the moment there is no way placement returns a failure so we
+2020             # could even delete this code
+2021             LOG.warning('Unable to delete allocation for %(consumer_type)s '
+2022                         '%(uuid)s. Got %(code)i while retrieving existing '
+2023                         'allocations: (%(text)s)',
+2024                         {'consumer_type': consumer_type,
+2025                          'uuid': uuid,
+2026                          'code': r.status_code,
+2027                          'text': r.text})
+2028             raise exception.AllocationDeleteFailed(consumer_uuid=uuid,
+2029                                                    error=r.text)
+2030         allocations = r.json()
+2031         if allocations['allocations'] == {}:
+2032             # the consumer did not exist in the first place
+2033             LOG.debug('Cannot delete allocation for %s consumer in placement '
+2034                       'as consumer does not exist', uuid)
+2035             return False
+2036 
+2037         # removing all resources from the allocation will auto delete the
+2038         # consumer in placement
+2039         allocations['allocations'] = {}
+2040         r = self.put(url, allocations, global_request_id=context.global_id,
+2041                      version=CONSUMER_GENERATION_VERSION)
+2042         if r.status_code == 204:
+2043             LOG.info('Deleted allocation for %(consumer_type)s %(uuid)s',
+2044                      {'consumer_type': consumer_type,
+2045                       'uuid': uuid})
+2046             return True
+2047         else:
+2048             LOG.warning('Unable to delete allocation for %(consumer_type)s '
+2049                         '%(uuid)s: (%(code)i %(text)s)',
+2050                         {'consumer_type': consumer_type,
+2051                          'uuid': uuid,
+2052                          'code': r.status_code,
+2053                          'text': r.text})
+2054             raise exception.AllocationDeleteFailed(consumer_uuid=uuid,
+2055                                                    error=r.text)
+2056 
+2057     def get_allocations_for_resource_provider(self, context, rp_uuid):
+2058         """Retrieves the allocations for a specific provider.
+2059 
+2060         :param context: The nova.context.RequestContext auth context
+2061         :param rp_uuid: The UUID of the provider.
+2062         :return: ProviderAllocInfo namedtuple.
+2063         :raises: keystoneauth1.exceptions.base.ClientException on failure to
+2064                  communicate with the placement API
+2065         :raises: ResourceProviderAllocationRetrievalFailed if the placement API
+2066                  call fails.
+2067         """
+2068         url = '/resource_providers/%s/allocations' % rp_uuid
+2069         resp = self.get(url, global_request_id=context.global_id)
+2070         if not resp:
+2071             raise exception.ResourceProviderAllocationRetrievalFailed(
+2072                 rp_uuid=rp_uuid, error=resp.text)
+2073 
+2074         data = resp.json()
+2075         return ProviderAllocInfo(allocations=data['allocations'])
+2076 
+2077     def get_allocations_for_provider_tree(self, context, nodename):
+2078         """Retrieve allocation records associated with all providers in the
+2079         provider tree.
+2080 
+2081         This method uses the cache exclusively to discover providers. The
+2082         caller must ensure that the cache is populated.
+2083 
+2084         This method is (and should remain) used exclusively in the reshaper
+2085         flow by the resource tracker.
+2086 
+2087         Note that, in addition to allocations on providers in this compute
+2088         node's provider tree, this method will return allocations on sharing
+2089         providers if those allocations are associated with a consumer on this
+2090         compute node. This is intentional and desirable. But it may also return
+2091         allocations belonging to other hosts, e.g. if this is happening in the
+2092         middle of an evacuate. ComputeDriver.update_provider_tree is supposed
+2093         to ignore such allocations if they appear.
+2094 
+2095         :param context: The security context
+2096         :param nodename: The name of a node for whose tree we are getting
+2097                 allocations.
+2098         :returns: A dict, keyed by consumer UUID, of allocation records:
+2099                 { $CONSUMER_UUID: {
+2100                       # The shape of each "allocations" dict below is identical
+2101                       # to the return from GET /allocations/{consumer_uuid}
+2102                       "allocations": {
+2103                           $RP_UUID: {
+2104                               "generation": $RP_GEN,
+2105                               "resources": {
+2106                                   $RESOURCE_CLASS: $AMOUNT,
+2107                                   ...
+2108                               },
+2109                           },
+2110                           ...
+2111                       },
+2112                       "project_id": $PROJ_ID,
+2113                       "user_id": $USER_ID,
+2114                       "consumer_generation": $CONSUMER_GEN,
+2115                   },
+2116                   ...
+2117                 }
+2118         :raises: keystoneauth1.exceptions.ClientException if placement API
+2119                  communication fails.
+2120         :raises: ResourceProviderAllocationRetrievalFailed if a placement API
+2121                  call fails.
+2122         :raises: ValueError if there's no provider with the specified nodename.
+2123         """
+2124         # NOTE(efried): Despite our best efforts, there are some scenarios
+2125         # (e.g. mid-evacuate) where we can still wind up returning allocations
+2126         # against providers belonging to other hosts. We count on the consumer
+2127         # of this information (i.e. the reshaper flow of a virt driver's
+2128         # update_provider_tree) to ignore allocations associated with any
+2129         # provider it is not reshaping - and it should never be reshaping
+2130         # providers belonging to other hosts.
+2131 
+2132         # We can't get *all* allocations for associated sharing providers
+2133         # because some of those will belong to consumers on other hosts. So we
+2134         # have to discover all the consumers associated with the providers in
+2135         # the "local" tree (we use the nodename to figure out which providers
+2136         # are "local").
+2137         # All we want to do at this point is accumulate the set of consumers we
+2138         # care about.
+2139         consumers = set()
+2140         # TODO(efried): This could be more efficient if placement offered an
+2141         # operation like GET /allocations?rp_uuid=in:<list>
+2142         for u in self._provider_tree.get_provider_uuids(name_or_uuid=nodename):
+2143             alloc_info = self.get_allocations_for_resource_provider(context, u)
+2144             # The allocations dict is keyed by consumer UUID
+2145             consumers.update(alloc_info.allocations)
+2146 
+2147         # Now get all the allocations for each of these consumers to build the
+2148         # result. This will include allocations on sharing providers, which is
+2149         # intentional and desirable. But it may also include allocations
+2150         # belonging to other hosts, e.g. if this is happening in the middle of
+2151         # an evacuate. ComputeDriver.update_provider_tree is supposed to ignore
+2152         # such allocations if they appear.
+2153         # TODO(efried): This could be more efficient if placement offered an
+2154         # operation like GET /allocations?consumer_uuid=in:<list>
+2155         return {consumer: self.get_allocs_for_consumer(context, consumer)
+2156                 for consumer in consumers}
+2157 
+2158     def delete_resource_provider(self, context, compute_node, cascade=False):
+2159         """Deletes the ResourceProvider record for the compute_node.
+2160 
+2161         :param context: The security context
+2162         :param compute_node: The nova.objects.ComputeNode object that is the
+2163                              resource provider being deleted.
+2164         :param cascade: Boolean value that, when True, will first delete any
+2165                         associated Allocation records for the compute node
+2166         :raises: keystoneauth1.exceptions.base.ClientException on failure to
+2167                  communicate with the placement API
+2168         """
+2169         nodename = compute_node.hypervisor_hostname
+2170         host = compute_node.host
+2171         rp_uuid = compute_node.uuid
+2172         if cascade:
+2173             # Delete any allocations for this resource provider.
+2174             # Since allocations are by consumer, we get the consumers on this
+2175             # host, which are its instances.
+2176             # NOTE(mriedem): This assumes the only allocations on this node
+2177             # are instances, but there could be migration consumers if the
+2178             # node is deleted during a migration or allocations from an
+2179             # evacuated host (bug 1829479). Obviously an admin shouldn't
+2180             # do that but...you know. I guess the provider deletion should fail
+2181             # in that case which is what we'd want to happen.
+2182             instance_uuids = objects.InstanceList.get_uuids_by_host_and_node(
+2183                 context, host, nodename)
+2184             for instance_uuid in instance_uuids:
+2185                 self.delete_allocation_for_instance(context, instance_uuid)
+2186         try:
+2187             self._delete_provider(rp_uuid, global_request_id=context.global_id)
+2188         except (exception.ResourceProviderInUse,
+2189                 exception.ResourceProviderDeletionFailed):
+2190             # TODO(efried): Raise these.  Right now this is being left a no-op
+2191             # for backward compatibility.
+2192             pass
+2193 
+2194     def get_provider_by_name(self, context, name):
+2195         """Queries the placement API for resource provider information matching
+2196         a supplied name.
+2197 
+2198         :param context: The security context
+2199         :param name: Name of the resource provider to look up
+2200         :return: A dict of resource provider information including the
+2201                  provider's UUID and generation
+2202         :raises: `exception.ResourceProviderNotFound` when no such provider was
+2203                  found
+2204         :raises: PlacementAPIConnectFailure if there was an issue making the
+2205                  API call to placement.
+2206         """
+2207         try:
+2208             resp = self.get("/resource_providers?name=%s" % name,
+2209                             global_request_id=context.global_id)
+2210         except ks_exc.ClientException as ex:
+2211             LOG.error('Failed to get resource provider by name: %s. Error: %s',
+2212                       name, six.text_type(ex))
+2213             raise exception.PlacementAPIConnectFailure()
+2214 
+2215         if resp.status_code == 200:
+2216             data = resp.json()
+2217             records = data['resource_providers']
+2218             num_recs = len(records)
+2219             if num_recs == 1:
+2220                 return records[0]
+2221             elif num_recs > 1:
+2222                 msg = ("Found multiple resource provider records for resource "
+2223                        "provider name %(rp_name)s: %(rp_uuids)s. "
+2224                        "This should not happen.")
+2225                 LOG.warning(msg, {
+2226                     'rp_name': name,
+2227                     'rp_uuids': ','.join([r['uuid'] for r in records])
+2228                 })
+2229         elif resp.status_code != 404:
+2230             msg = ("Failed to retrieve resource provider information by name "
+2231                    "for resource provider %s. Got %d: %s")
+2232             LOG.warning(msg, name, resp.status_code, resp.text)
+2233 
+2234         raise exception.ResourceProviderNotFound(name_or_uuid=name)
+2235 
+2236     @retrying.retry(stop_max_attempt_number=4,
+2237                     retry_on_exception=lambda e: isinstance(
+2238                         e, exception.ResourceProviderUpdateConflict))
+2239     def aggregate_add_host(self, context, agg_uuid, host_name=None,
+2240                            rp_uuid=None):
+2241         """Looks up a resource provider by the supplied host name, and adds the
+2242         aggregate with supplied UUID to that resource provider.
+2243 
+2244         :note: This method does NOT use the cached provider tree. It is only
+2245                called from the Compute API when a nova host aggregate is
+2246                modified
+2247 
+2248         :param context: The security context
+2249         :param agg_uuid: UUID of the aggregate being modified
+2250         :param host_name: Name of the nova-compute service worker to look up a
+2251                           resource provider for. Either host_name or rp_uuid is
+2252                           required.
+2253         :param rp_uuid: UUID of the resource provider to add to the aggregate.
+2254                         Either host_name or rp_uuid is required.
+2255         :raises: `exceptions.ResourceProviderNotFound` if no resource provider
+2256                   matching the host name could be found from the placement API
+2257         :raises: `exception.ResourceProviderAggregateRetrievalFailed` when
+2258                  failing to get a provider's existing aggregates
+2259         :raises: `exception.ResourceProviderUpdateFailed` if there was a
+2260                  failure attempting to save the provider aggregates
+2261         :raises: `exception.ResourceProviderUpdateConflict` if a concurrent
+2262                  update to the provider was detected.
+2263         :raises: PlacementAPIConnectFailure if there was an issue making an
+2264                  API call to placement.
+2265         """
+2266         if host_name is None and rp_uuid is None:
+2267             raise ValueError(_("Either host_name or rp_uuid is required"))
+2268         if rp_uuid is None:
+2269             rp_uuid = self.get_provider_by_name(context, host_name)['uuid']
+2270 
+2271         # Now attempt to add the aggregate to the resource provider. We don't
+2272         # want to overwrite any other aggregates the provider may be associated
+2273         # with, however, so we first grab the list of aggregates for this
+2274         # provider and add the aggregate to the list of aggregates it already
+2275         # has
+2276         agg_info = self._get_provider_aggregates(context, rp_uuid)
+2277         # @safe_connect can make the above return None
+2278         if agg_info is None:
+2279             raise exception.PlacementAPIConnectFailure()
+2280         existing_aggs, gen = agg_info.aggregates, agg_info.generation
+2281         if agg_uuid in existing_aggs:
+2282             return
+2283 
+2284         new_aggs = existing_aggs | set([agg_uuid])
+2285         self.set_aggregates_for_provider(
+2286             context, rp_uuid, new_aggs, use_cache=False, generation=gen)
+2287 
+2288     @retrying.retry(stop_max_attempt_number=4,
+2289                     retry_on_exception=lambda e: isinstance(
+2290                         e, exception.ResourceProviderUpdateConflict))
+2291     def aggregate_remove_host(self, context, agg_uuid, host_name):
+2292         """Looks up a resource provider by the supplied host name, and removes
+2293         the aggregate with supplied UUID from that resource provider.
+2294 
+2295         :note: This method does NOT use the cached provider tree. It is only
+2296                called from the Compute API when a nova host aggregate is
+2297                modified
+2298 
+2299         :param context: The security context
+2300         :param agg_uuid: UUID of the aggregate being modified
+2301         :param host_name: Name of the nova-compute service worker to look up a
+2302                           resource provider for
+2303         :raises: `exceptions.ResourceProviderNotFound` if no resource provider
+2304                   matching the host name could be found from the placement API
+2305         :raises: `exception.ResourceProviderAggregateRetrievalFailed` when
+2306                  failing to get a provider's existing aggregates
+2307         :raises: `exception.ResourceProviderUpdateFailed` if there was a
+2308                  failure attempting to save the provider aggregates
+2309         :raises: `exception.ResourceProviderUpdateConflict` if a concurrent
+2310                  update to the provider was detected.
+2311         :raises: PlacementAPIConnectFailure if there was an issue making an
+2312                  API call to placement.
+2313         """
+2314         rp_uuid = self.get_provider_by_name(context, host_name)['uuid']
+2315         # Now attempt to remove the aggregate from the resource provider. We
+2316         # don't want to overwrite any other aggregates the provider may be
+2317         # associated with, however, so we first grab the list of aggregates for
+2318         # this provider and remove the aggregate from the list of aggregates it
+2319         # already has
+2320         agg_info = self._get_provider_aggregates(context, rp_uuid)
+2321         # @safe_connect can make the above return None
+2322         if agg_info is None:
+2323             raise exception.PlacementAPIConnectFailure()
+2324         existing_aggs, gen = agg_info.aggregates, agg_info.generation
+2325         if agg_uuid not in existing_aggs:
+2326             return
+2327 
+2328         new_aggs = existing_aggs - set([agg_uuid])
+2329         self.set_aggregates_for_provider(
+2330             context, rp_uuid, new_aggs, use_cache=False, generation=gen)
+2331 
+2332     @staticmethod
+2333     def _handle_usages_error_from_placement(resp, project_id, user_id=None):
+2334         msg = ('[%(placement_req_id)s] Failed to retrieve usages for project '
+2335                '%(project_id)s and user %(user_id)s. Got %(status_code)d: '
+2336                '%(err_text)s')
+2337         args = {'placement_req_id': get_placement_request_id(resp),
+2338                 'project_id': project_id,
+2339                 'user_id': user_id or 'N/A',
+2340                 'status_code': resp.status_code,
+2341                 'err_text': resp.text}
+2342         LOG.error(msg, args)
+2343         raise exception.UsagesRetrievalFailed(project_id=project_id,
+2344                                               user_id=user_id or 'N/A')
+2345 
+2346     @retrying.retry(stop_max_attempt_number=4,
+2347                     retry_on_exception=lambda e: isinstance(
+2348                         e, ks_exc.ConnectFailure))
+2349     def _get_usages(self, context, project_id, user_id=None):
+2350         url = '/usages?project_id=%s' % project_id
+2351         if user_id:
+2352             url = ''.join([url, '&user_id=%s' % user_id])
+2353         return self.get(url, version=GET_USAGES_VERSION,
+2354                         global_request_id=context.global_id)
+2355 
+2356     def get_usages_counts_for_quota(self, context, project_id, user_id=None):
+2357         """Get the usages counts for the purpose of counting quota usage.
+2358 
+2359         :param context: The request context
+2360         :param project_id: The project_id to count across
+2361         :param user_id: The user_id to count across
+2362         :returns: A dict containing the project-scoped and user-scoped counts
+2363                   if user_id is specified. For example:
+2364                     {'project': {'cores': <count across project>,
+2365                                  'ram': <count across project>},
+2366                     {'user': {'cores': <count across user>,
+2367                               'ram': <count across user>},
+2368         :raises: `exception.UsagesRetrievalFailed` if a placement API call
+2369                  fails
+2370         """
+2371         def _get_core_usages(usages):
+2372             """For backward-compatible with existing behavior, the quota limit
+2373             on flavor.vcpus. That included the shared and dedicated CPU. So
+2374             we need to count both the orc.VCPU and orc.PCPU at here.
+2375             """
+2376             vcpus = usages['usages'].get(orc.VCPU, 0)
+2377             pcpus = usages['usages'].get(orc.PCPU, 0)
+2378             return vcpus + pcpus
+2379 
+2380         total_counts = {'project': {}}
+2381         # First query counts across all users of a project
+2382         LOG.debug('Getting usages for project_id %s from placement',
+2383                   project_id)
+2384         resp = self._get_usages(context, project_id)
+2385         if resp:
+2386             data = resp.json()
+2387             # The response from placement will not contain a resource class if
+2388             # there is no usage. We can consider a missing class to be 0 usage.
+2389             cores = _get_core_usages(data)
+2390             ram = data['usages'].get(orc.MEMORY_MB, 0)
+2391             total_counts['project'] = {'cores': cores, 'ram': ram}
+2392         else:
+2393             self._handle_usages_error_from_placement(resp, project_id)
+2394         # If specified, second query counts across one user in the project
+2395         if user_id:
+2396             LOG.debug('Getting usages for project_id %s and user_id %s from '
+2397                       'placement', project_id, user_id)
+2398             resp = self._get_usages(context, project_id, user_id=user_id)
+2399             if resp:
+2400                 data = resp.json()
+2401                 cores = _get_core_usages(data)
+2402                 ram = data['usages'].get(orc.MEMORY_MB, 0)
+2403                 total_counts['user'] = {'cores': cores, 'ram': ram}
+2404             else:
+2405                 self._handle_usages_error_from_placement(resp, project_id,
+2406                                                          user_id=user_id)
+2407         return total_counts

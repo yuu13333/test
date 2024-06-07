@@ -1,0 +1,893 @@
+Please review the code below for security defects using the CWE (Common Weakness Enumeration) as a reference standard. If any are found, please describe the security defect in detail and indicate the corresponding line number of code and solution. If none are detected, state: 'No security defects are detected in the code'.
+
+1 # Copyright (c) 2010 Citrix Systems, Inc.
+2 # Copyright 2010 OpenStack Foundation
+3 #
+4 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
+5 #    not use this file except in compliance with the License. You may obtain
+6 #    a copy of the License at
+7 #
+8 #         http://www.apache.org/licenses/LICENSE-2.0
+9 #
+10 #    Unless required by applicable law or agreed to in writing, software
+11 #    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+12 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+13 #    License for the specific language governing permissions and limitations
+14 #    under the License.
+15 
+16 """
+17 A driver for XenServer or Xen Cloud Platform.
+18 
+19 **Variable Naming Scheme**
+20 
+21 - suffix "_ref" for opaque references
+22 - suffix "_uuid" for UUIDs
+23 - suffix "_rec" for record objects
+24 """
+25 
+26 import math
+27 
+28 from os_xenapi.client import session
+29 from oslo_log import log as logging
+30 from oslo_serialization import jsonutils
+31 from oslo_utils import units
+32 from oslo_utils import uuidutils
+33 from oslo_utils import versionutils
+34 
+35 import six.moves.urllib.parse as urlparse
+36 
+37 import nova.conf
+38 from nova import exception
+39 from nova.i18n import _
+40 from nova import rc_fields as fields
+41 from nova.virt import driver
+42 from nova.virt.xenapi import host
+43 from nova.virt.xenapi import pool
+44 from nova.virt.xenapi import vm_utils
+45 from nova.virt.xenapi import vmops
+46 from nova.virt.xenapi import volumeops
+47 
+48 LOG = logging.getLogger(__name__)
+49 
+50 CONF = nova.conf.CONF
+51 
+52 OVERHEAD_BASE = 3
+53 OVERHEAD_PER_MB = 0.00781
+54 OVERHEAD_PER_VCPU = 1.5
+55 
+56 VGPU_RP_PREFIX = "VGPU_"
+57 
+58 
+59 def invalid_option(option_name, recommended_value):
+60     LOG.exception(_('Current value of '
+61                     'CONF.xenserver.%(option)s option incompatible with '
+62                     'CONF.xenserver.independent_compute=True.  '
+63                     'Consider using "%(recommended)s"'),
+64                   {'option': option_name,
+65                    'recommended': recommended_value})
+66     raise exception.NotSupportedWithOption(
+67         operation=option_name,
+68         option='CONF.xenserver.independent_compute')
+69 
+70 
+71 class XenAPIDriver(driver.ComputeDriver):
+72     """A connection to XenServer or Xen Cloud Platform."""
+73     capabilities = {
+74         "has_imagecache": False,
+75         "supports_recreate": False,
+76         "supports_migrate_to_same_host": False,
+77         "supports_attach_interface": True,
+78         "supports_device_tagging": True,
+79         "supports_multiattach": False
+80     }
+81 
+82     def __init__(self, virtapi, read_only=False):
+83         super(XenAPIDriver, self).__init__(virtapi)
+84 
+85         url = CONF.xenserver.connection_url
+86         username = CONF.xenserver.connection_username
+87         password = CONF.xenserver.connection_password
+88         if not url or password is None:
+89             raise Exception(_('Must specify connection_url, '
+90                               'connection_username (optionally), and '
+91                               'connection_password to use '
+92                               'compute_driver=xenapi.XenAPIDriver'))
+93 
+94         self._session = session.XenAPISession(url, username, password,
+95                                               originator="nova")
+96         self._volumeops = volumeops.VolumeOps(self._session)
+97         self._host_state = None
+98         self._host = host.Host(self._session, self.virtapi)
+99         self._vmops = vmops.VMOps(self._session, self.virtapi)
+100         self._initiator = None
+101         self._hypervisor_hostname = None
+102         self._pool = pool.ResourcePool(self._session, self.virtapi)
+103 
+104     @property
+105     def host_state(self):
+106         if not self._host_state:
+107             self._host_state = host.HostState(self._session)
+108         return self._host_state
+109 
+110     def init_host(self, host):
+111         if CONF.xenserver.independent_compute:
+112             # Check various options are in the correct state:
+113             if CONF.xenserver.check_host:
+114                 invalid_option('CONF.xenserver.check_host', False)
+115             if CONF.flat_injected:
+116                 invalid_option('CONF.flat_injected', False)
+117             if CONF.default_ephemeral_format and \
+118                CONF.default_ephemeral_format != 'ext3':
+119                 invalid_option('CONF.default_ephemeral_format', 'ext3')
+120 
+121         if CONF.xenserver.check_host:
+122             vm_utils.ensure_correct_host(self._session)
+123 
+124         if not CONF.xenserver.independent_compute:
+125             try:
+126                 vm_utils.cleanup_attached_vdis(self._session)
+127             except Exception:
+128                 LOG.exception(_('Failure while cleaning up attached VDIs'))
+129 
+130     def instance_exists(self, instance):
+131         """Checks existence of an instance on the host.
+132 
+133         :param instance: The instance to lookup
+134 
+135         Returns True if supplied instance exists on the host, False otherwise.
+136 
+137         NOTE(belliott): This is an override of the base method for
+138         efficiency.
+139         """
+140         return self._vmops.instance_exists(instance.name)
+141 
+142     def estimate_instance_overhead(self, instance_info):
+143         """Get virtualization overhead required to build an instance of the
+144         given flavor.
+145 
+146         :param instance_info: Instance/flavor to calculate overhead for.
+147         :returns: Overhead memory in MB.
+148         """
+149 
+150         # XenServer memory overhead is proportional to the size of the
+151         # VM.  Larger flavor VMs become more efficient with respect to
+152         # overhead.
+153 
+154         # interpolated formula to predict overhead required per vm.
+155         # based on data from:
+156         # https://wiki.openstack.org/wiki/XenServer/Overhead
+157         # Some padding is done to each value to fit all available VM data
+158         memory_mb = instance_info['memory_mb']
+159         vcpus = instance_info.get('vcpus', 1)
+160         overhead = ((memory_mb * OVERHEAD_PER_MB) + (vcpus * OVERHEAD_PER_VCPU)
+161                         + OVERHEAD_BASE)
+162         overhead = math.ceil(overhead)
+163         return {'memory_mb': overhead}
+164 
+165     def list_instances(self):
+166         """List VM instances."""
+167         return self._vmops.list_instances()
+168 
+169     def list_instance_uuids(self):
+170         """Get the list of nova instance uuids for VMs found on the
+171         hypervisor.
+172         """
+173         return self._vmops.list_instance_uuids()
+174 
+175     def _get_allocated_gpu_grp(self, allocations):
+176         # Currently, XenServer only supports one vGPU per instance, so only
+177         # the first vgpu allocation will be picked up. Resource provider uuid
+178         # in allocations is same with the corresponding gpu group uuid
+179         if not allocations:
+180             # If no allocations, there is no vGPU request.
+181             return None
+182         RC_VGPU = fields.ResourceClass.VGPU
+183         for rp in allocations:
+184             res = allocations[rp]['resources']
+185             if res and RC_VGPU in res and res[RC_VGPU] > 0:
+186                 return rp
+187         return None
+188 
+189     def _get_vgpu_info(self, allocations):
+190         """Get vGPU info if any vGPU is allocated."""
+191         gpu_grp_uuid = self._get_allocated_gpu_grp(allocations)
+192         if not gpu_grp_uuid:
+193             return None
+194         # Get vgpu information by gpu group uuid.
+195         vgpu_type_info = self.host_state.find_an_enabled_vgpu_in_group(
+196             gpu_grp_uuid)
+197         if vgpu_type_info:
+198             return dict(gpu_grp_uuid=gpu_grp_uuid,
+199                         vgpu_type_uuid=vgpu_type_info['vgpu_type_uuid'])
+200 
+201         # No remaining vGPU available: e.g. the vGPU resource has been used by
+202         # other instance or the vGPU has been changed to be disabled.
+203         raise exception.ComputeResourcesUnavailable(
+204             reason='vGPU resource is not available')
+205 
+206     def spawn(self, context, instance, image_meta, injected_files,
+207               admin_password, allocations, network_info=None,
+208               block_device_info=None):
+209         """Create VM instance."""
+210         vgpu_info = self._get_vgpu_info(allocations)
+211         self._vmops.spawn(context, instance, image_meta, injected_files,
+212                           admin_password, network_info, block_device_info,
+213                           vgpu_info)
+214 
+215     def confirm_migration(self, context, migration, instance, network_info):
+216         """Confirms a resize, destroying the source VM."""
+217         self._vmops.confirm_migration(migration, instance, network_info)
+218 
+219     def finish_revert_migration(self, context, instance, network_info,
+220                                 block_device_info=None, power_on=True):
+221         """Finish reverting a resize."""
+222         # NOTE(vish): Xen currently does not use network info.
+223         self._vmops.finish_revert_migration(context, instance,
+224                                             block_device_info,
+225                                             power_on)
+226 
+227     def finish_migration(self, context, migration, instance, disk_info,
+228                          network_info, image_meta, resize_instance,
+229                          block_device_info=None, power_on=True):
+230         """Completes a resize, turning on the migrated instance."""
+231         self._vmops.finish_migration(context, migration, instance, disk_info,
+232                                      network_info, image_meta, resize_instance,
+233                                      block_device_info, power_on)
+234 
+235     def snapshot(self, context, instance, image_id, update_task_state):
+236         """Create snapshot from a running VM instance."""
+237         self._vmops.snapshot(context, instance, image_id, update_task_state)
+238 
+239     def post_interrupted_snapshot_cleanup(self, context, instance):
+240         """Cleans up any resources left after a failed snapshot."""
+241         self._vmops.post_interrupted_snapshot_cleanup(context, instance)
+242 
+243     def reboot(self, context, instance, network_info, reboot_type,
+244                block_device_info=None, bad_volumes_callback=None):
+245         """Reboot VM instance."""
+246         self._vmops.reboot(instance, reboot_type,
+247                            bad_volumes_callback=bad_volumes_callback)
+248 
+249     def set_admin_password(self, instance, new_pass):
+250         """Set the root/admin password on the VM instance."""
+251         self._vmops.set_admin_password(instance, new_pass)
+252 
+253     def inject_file(self, instance, b64_path, b64_contents):
+254         """Create a file on the VM instance. The file path and contents
+255         should be base64-encoded.
+256         """
+257         self._vmops.inject_file(instance, b64_path, b64_contents)
+258 
+259     def change_instance_metadata(self, context, instance, diff):
+260         """Apply a diff to the instance metadata."""
+261         self._vmops.change_instance_metadata(instance, diff)
+262 
+263     def destroy(self, context, instance, network_info, block_device_info=None,
+264                 destroy_disks=True):
+265         """Destroy VM instance."""
+266         self._vmops.destroy(instance, network_info, block_device_info,
+267                             destroy_disks)
+268 
+269     def cleanup(self, context, instance, network_info, block_device_info=None,
+270                 destroy_disks=True, migrate_data=None, destroy_vifs=True):
+271         """Cleanup after instance being destroyed by Hypervisor."""
+272         pass
+273 
+274     def pause(self, instance):
+275         """Pause VM instance."""
+276         self._vmops.pause(instance)
+277 
+278     def unpause(self, instance):
+279         """Unpause paused VM instance."""
+280         self._vmops.unpause(instance)
+281 
+282     def migrate_disk_and_power_off(self, context, instance, dest,
+283                                    flavor, network_info,
+284                                    block_device_info=None,
+285                                    timeout=0, retry_interval=0):
+286         """Transfers the VHD of a running instance to another host, then shuts
+287         off the instance copies over the COW disk
+288         """
+289         # NOTE(vish): Xen currently does not use network info.
+290         # TODO(PhilDay): Add support for timeout (clean shutdown)
+291         return self._vmops.migrate_disk_and_power_off(context, instance,
+292                     dest, flavor, block_device_info)
+293 
+294     def suspend(self, context, instance):
+295         """suspend the specified instance."""
+296         self._vmops.suspend(instance)
+297 
+298     def resume(self, context, instance, network_info, block_device_info=None):
+299         """resume the specified instance."""
+300         self._vmops.resume(instance)
+301 
+302     def rescue(self, context, instance, network_info, image_meta,
+303                rescue_password):
+304         """Rescue the specified instance."""
+305         self._vmops.rescue(context, instance, network_info, image_meta,
+306                            rescue_password)
+307 
+308     def set_bootable(self, instance, is_bootable):
+309         """Set the ability to power on/off an instance."""
+310         self._vmops.set_bootable(instance, is_bootable)
+311 
+312     def unrescue(self, instance, network_info):
+313         """Unrescue the specified instance."""
+314         self._vmops.unrescue(instance)
+315 
+316     def power_off(self, instance, timeout=0, retry_interval=0):
+317         """Power off the specified instance."""
+318         # TODO(PhilDay): Add support for timeout (clean shutdown)
+319         self._vmops.power_off(instance)
+320 
+321     def power_on(self, context, instance, network_info,
+322                  block_device_info=None):
+323         """Power on the specified instance."""
+324         self._vmops.power_on(instance)
+325 
+326     def soft_delete(self, instance):
+327         """Soft delete the specified instance."""
+328         self._vmops.soft_delete(instance)
+329 
+330     def restore(self, instance):
+331         """Restore the specified instance."""
+332         self._vmops.restore(instance)
+333 
+334     def poll_rebooting_instances(self, timeout, instances):
+335         """Poll for rebooting instances."""
+336         self._vmops.poll_rebooting_instances(timeout, instances)
+337 
+338     def reset_network(self, instance):
+339         """reset networking for specified instance."""
+340         self._vmops.reset_network(instance)
+341 
+342     def inject_network_info(self, instance, nw_info):
+343         """inject network info for specified instance."""
+344         self._vmops.inject_network_info(instance, nw_info)
+345 
+346     def plug_vifs(self, instance, network_info):
+347         """Plug VIFs into networks."""
+348         self._vmops.plug_vifs(instance, network_info)
+349 
+350     def unplug_vifs(self, instance, network_info):
+351         """Unplug VIFs from networks."""
+352         self._vmops.unplug_vifs(instance, network_info)
+353 
+354     def get_info(self, instance):
+355         """Return data about VM instance."""
+356         return self._vmops.get_info(instance)
+357 
+358     def get_diagnostics(self, instance):
+359         """Return data about VM diagnostics."""
+360         return self._vmops.get_diagnostics(instance)
+361 
+362     def get_instance_diagnostics(self, instance):
+363         """Return data about VM diagnostics."""
+364         return self._vmops.get_instance_diagnostics(instance)
+365 
+366     def get_all_bw_counters(self, instances):
+367         """Return bandwidth usage counters for each interface on each
+368            running VM.
+369         """
+370 
+371         # we only care about VMs that correspond to a nova-managed
+372         # instance:
+373         imap = {inst['name']: inst['uuid'] for inst in instances}
+374         bwcounters = []
+375 
+376         # get a dictionary of instance names.  values are dictionaries
+377         # of mac addresses with values that are the bw counters:
+378         # e.g. {'instance-001' : { 12:34:56:78:90:12 : {'bw_in': 0, ....}}
+379         all_counters = self._vmops.get_all_bw_counters()
+380         for instance_name, counters in all_counters.items():
+381             if instance_name in imap:
+382                 # yes these are stats for a nova-managed vm
+383                 # correlate the stats with the nova instance uuid:
+384                 for vif_counter in counters.values():
+385                     vif_counter['uuid'] = imap[instance_name]
+386                     bwcounters.append(vif_counter)
+387         return bwcounters
+388 
+389     def get_console_output(self, context, instance):
+390         """Return snapshot of console."""
+391         return self._vmops.get_console_output(instance)
+392 
+393     def get_vnc_console(self, context, instance):
+394         """Return link to instance's VNC console."""
+395         return self._vmops.get_vnc_console(instance)
+396 
+397     def get_volume_connector(self, instance):
+398         """Return volume connector information."""
+399         if not self._initiator or not self._hypervisor_hostname:
+400             stats = self.host_state.get_host_stats(refresh=True)
+401             try:
+402                 self._initiator = stats['host_other-config']['iscsi_iqn']
+403                 self._hypervisor_hostname = stats['host_hostname']
+404             except (TypeError, KeyError) as err:
+405                 LOG.warning('Could not determine key: %s', err,
+406                             instance=instance)
+407                 self._initiator = None
+408         return {
+409             'ip': self._get_block_storage_ip(),
+410             'initiator': self._initiator,
+411             'host': self._hypervisor_hostname
+412         }
+413 
+414     def _get_block_storage_ip(self):
+415         # If CONF.my_block_storage_ip is set, use it.
+416         if CONF.my_block_storage_ip != CONF.my_ip:
+417             return CONF.my_block_storage_ip
+418         return self.get_host_ip_addr()
+419 
+420     def get_host_ip_addr(self):
+421         xs_url = urlparse.urlparse(CONF.xenserver.connection_url)
+422         return xs_url.netloc
+423 
+424     def attach_volume(self, context, connection_info, instance, mountpoint,
+425                       disk_bus=None, device_type=None, encryption=None):
+426         """Attach volume storage to VM instance."""
+427         self._volumeops.attach_volume(connection_info,
+428                                       instance['name'],
+429                                       mountpoint)
+430 
+431     def detach_volume(self, context, connection_info, instance, mountpoint,
+432                       encryption=None):
+433         """Detach volume storage from VM instance."""
+434         self._volumeops.detach_volume(connection_info,
+435                                       instance['name'],
+436                                       mountpoint)
+437 
+438     def get_console_pool_info(self, console_type):
+439         xs_url = urlparse.urlparse(CONF.xenserver.connection_url)
+440         return {'address': xs_url.netloc,
+441                 'username': CONF.xenserver.connection_username,
+442                 'password': CONF.xenserver.connection_password}
+443 
+444     def _get_vgpu_total(self, vgpu_stats):
+445         # NOTE(jianghuaw): Now we only enable one vGPU type in one
+446         # compute node. So normally vgpu_stats should contain only
+447         # one GPU group. If there are multiple GPU groups, they
+448         # must contain the same vGPU type. So just add them up.
+449         total = 0
+450         for grp_id in vgpu_stats:
+451             total += vgpu_stats[grp_id]['total']
+452         return total
+453 
+454     def get_inventory(self, nodename):
+455         """Return a dict, keyed by resource class, of inventory information for
+456         the supplied node.
+457         """
+458         host_stats = self.host_state.get_host_stats(refresh=True)
+459 
+460         vcpus = host_stats['host_cpu_info']['cpu_count']
+461         memory_mb = int(host_stats['host_memory_total'] / units.Mi)
+462         disk_gb = int(host_stats['disk_total'] / units.Gi)
+463         vgpus = self._get_vgpu_total(host_stats['vgpu_stats'])
+464 
+465         result = {
+466             fields.ResourceClass.VCPU: {
+467                 'total': vcpus,
+468                 'min_unit': 1,
+469                 'max_unit': vcpus,
+470                 'step_size': 1,
+471             },
+472             fields.ResourceClass.MEMORY_MB: {
+473                 'total': memory_mb,
+474                 'min_unit': 1,
+475                 'max_unit': memory_mb,
+476                 'step_size': 1,
+477             },
+478             fields.ResourceClass.DISK_GB: {
+479                 'total': disk_gb,
+480                 'min_unit': 1,
+481                 'max_unit': disk_gb,
+482                 'step_size': 1,
+483             },
+484         }
+485         if vgpus > 0:
+486             # Only create inventory for vGPU when driver can supply vGPUs.
+487             # At the moment, XenAPI can support up to one vGPU per VM,
+488             # so max_unit is 1.
+489             result.update(
+490                 {
+491                     fields.ResourceClass.VGPU: {
+492                         'total': vgpus,
+493                         'min_unit': 1,
+494                         'max_unit': 1,
+495                         'step_size': 1,
+496                     }
+497                 }
+498             )
+499         return result
+500 
+501     def _update_vgpu_rp(self, rp_tree, host_stats, root_name_or_uuid):
+502         """Update the resource providers for vGPUs in the provider tree. If the
+503         resource provider doesn't exist, we create one and make it as the
+504         compute node's child, then attach the inventory to it.
+505         """
+506         vgpu_stats = host_stats['vgpu_stats']
+507         for grp_id, grp_value in vgpu_stats.items():
+508             # Each gpu group have a specified group id, so we add `grp_id` to
+509             # distinguish corresponding resource providers. Add vgpu type info
+510             # to show supported vgpus as well.
+511             if vgpu_stats[grp_id]['total'] <= 0:
+512                 # If the gpu group has no resource, remove the rp if it exists
+513                 # and jump out of the loop
+514                 if rp_tree.exists(grp_id):
+515                     rp_tree.remove(grp_id)
+516                 continue
+517 
+518             rp_name = (VGPU_RP_PREFIX + grp_id)
+519             inv = {
+520                 fields.ResourceClass.VGPU: {
+521                     'total': grp_value['total'],
+522                     'min_unit': 1,
+523                     'max_unit': 1,
+524                     'step_size': 1,
+525                 }
+526             }
+527             if not rp_tree.exists(rp_name):
+528                 # Set gpu group uuid as the resource provider uuid. When nova
+529                 # compute requests to spawn an instance, it will send it to
+530                 # driver in `allocations`, then we could easily find the
+531                 # corresponding gpu group on the host
+532                 rp_tree.new_child(rp_name, root_name_or_uuid, uuid=grp_id)
+533 
+534             rp_tree.update_inventory(rp_name, inv)
+535 
+536     def _remove_children_rp(self, provider_tree, parent_uuid_or_name):
+537         children_rps = provider_tree.get_provider_uuids(parent_uuid_or_name)
+538         # keep root resource provider
+539         children_rps.pop(0)
+540         for children_rp in children_rps:
+541             rp_data = provider_tree.data(children_rp)
+542             if rp_data.name[:len(VGPU_RP_PREFIX)] == VGPU_RP_PREFIX:
+543                 provider_tree.remove(children_rp)
+544 
+545     def update_provider_tree(self, provider_tree, nodename):
+546         """Nested resource provider support. Update resource in provider tree.
+547         """
+548         host_stats = self.host_state.get_host_stats(refresh=True)
+549         self._update_compute_rp(nodename, provider_tree, host_stats)
+550         self._remove_children_rp(provider_tree, nodename)
+551         self._update_vgpu_rp(provider_tree, host_stats, nodename)
+552 
+553     def _update_compute_rp(self, nodename, rp_tree, host_stats):
+554         """Nested resource provider support. Update compute node information.
+555         If the resource provider is not exist, create it and attach the
+556         inventory to it.
+557         """
+558         vcpus = host_stats['host_cpu_info']['cpu_count']
+559         memory_mb = int(host_stats['host_memory_total'] / units.Mi)
+560         disk_gb = int(host_stats['disk_total'] / units.Gi)
+561 
+562         result = {
+563             fields.ResourceClass.VCPU: {
+564                 'total': vcpus,
+565                 'min_unit': 1,
+566                 'max_unit': vcpus,
+567                 'step_size': 1,
+568             },
+569             fields.ResourceClass.MEMORY_MB: {
+570                 'total': memory_mb,
+571                 'min_unit': 1,
+572                 'max_unit': memory_mb,
+573                 'step_size': 1,
+574             },
+575             fields.ResourceClass.DISK_GB: {
+576                 'total': disk_gb,
+577                 'min_unit': 1,
+578                 'max_unit': disk_gb,
+579                 'step_size': 1,
+580             },
+581         }
+582         if not rp_tree.exists(nodename):
+583             rp_tree.new_root(nodename, uuidutils.generate_uuid())
+584         rp_tree.update_inventory(nodename, result)
+585 
+586     def get_available_resource(self, nodename):
+587         """Retrieve resource information.
+588 
+589         This method is called when nova-compute launches, and
+590         as part of a periodic task that records the results in the DB.
+591 
+592         :param nodename: ignored in this driver
+593         :returns: dictionary describing resources
+594 
+595         """
+596         host_stats = self.host_state.get_host_stats(refresh=True)
+597 
+598         # Updating host information
+599         total_ram_mb = host_stats['host_memory_total'] / units.Mi
+600         # NOTE(belliott) memory-free-computed is a value provided by XenServer
+601         # for gauging free memory more conservatively than memory-free.
+602         free_ram_mb = host_stats['host_memory_free_computed'] / units.Mi
+603         total_disk_gb = host_stats['disk_total'] / units.Gi
+604         used_disk_gb = host_stats['disk_used'] / units.Gi
+605         allocated_disk_gb = host_stats['disk_allocated'] / units.Gi
+606         hyper_ver = versionutils.convert_version_to_int(
+607                                                 self._session.product_version)
+608         dic = {'vcpus': host_stats['host_cpu_info']['cpu_count'],
+609                'memory_mb': total_ram_mb,
+610                'local_gb': total_disk_gb,
+611                'vcpus_used': host_stats['vcpus_used'],
+612                'memory_mb_used': total_ram_mb - free_ram_mb,
+613                'local_gb_used': used_disk_gb,
+614                'hypervisor_type': 'XenServer',
+615                'hypervisor_version': hyper_ver,
+616                'hypervisor_hostname': host_stats['host_hostname'],
+617                'cpu_info': jsonutils.dumps(host_stats['cpu_model']),
+618                'disk_available_least': total_disk_gb - allocated_disk_gb,
+619                'supported_instances': host_stats['supported_instances'],
+620                'pci_passthrough_devices': jsonutils.dumps(
+621                    host_stats['pci_passthrough_devices']),
+622                'numa_topology': None}
+623 
+624         return dic
+625 
+626     def ensure_filtering_rules_for_instance(self, instance, network_info):
+627         # NOTE(salvatore-orlando): it enforces security groups on
+628         # host initialization and live migration.
+629         # In XenAPI we do not assume instances running upon host initialization
+630         return
+631 
+632     def check_can_live_migrate_destination(self, context, instance,
+633                 src_compute_info, dst_compute_info,
+634                 block_migration=False, disk_over_commit=False):
+635         """Check if it is possible to execute live migration.
+636 
+637         :param context: security context
+638         :param instance: nova.db.sqlalchemy.models.Instance object
+639         :param block_migration: if true, prepare for block migration
+640         :param disk_over_commit: if true, allow disk over commit
+641         :returns: a XenapiLiveMigrateData object
+642         """
+643         return self._vmops.check_can_live_migrate_destination(context,
+644                                                               instance,
+645                                                               block_migration,
+646                                                               disk_over_commit)
+647 
+648     def cleanup_live_migration_destination_check(self, context,
+649                                                  dest_check_data):
+650         """Do required cleanup on dest host after check_can_live_migrate calls
+651 
+652         :param context: security context
+653         :param dest_check_data: result of check_can_live_migrate_destination
+654         """
+655         pass
+656 
+657     def check_can_live_migrate_source(self, context, instance,
+658                                       dest_check_data, block_device_info=None):
+659         """Check if it is possible to execute live migration.
+660 
+661         This checks if the live migration can succeed, based on the
+662         results from check_can_live_migrate_destination.
+663 
+664         :param context: security context
+665         :param instance: nova.db.sqlalchemy.models.Instance
+666         :param dest_check_data: result of check_can_live_migrate_destination
+667                                 includes the block_migration flag
+668         :param block_device_info: result of _get_instance_block_device_info
+669         :returns: a XenapiLiveMigrateData object
+670         """
+671         return self._vmops.check_can_live_migrate_source(context, instance,
+672                                                          dest_check_data)
+673 
+674     def get_instance_disk_info(self, instance,
+675                                block_device_info=None):
+676         """Used by libvirt for live migration. We rely on xenapi
+677         checks to do this for us.
+678         """
+679         pass
+680 
+681     def live_migration(self, context, instance, dest,
+682                        post_method, recover_method, block_migration=False,
+683                        migrate_data=None):
+684         """Performs the live migration of the specified instance.
+685 
+686         :param context: security context
+687         :param instance:
+688             nova.db.sqlalchemy.models.Instance object
+689             instance object that is migrated.
+690         :param dest: destination host
+691         :param post_method:
+692             post operation method.
+693             expected nova.compute.manager._post_live_migration.
+694         :param recover_method:
+695             recovery method when any exception occurs.
+696             expected nova.compute.manager._rollback_live_migration.
+697         :param block_migration: if true, migrate VM disk.
+698         :param migrate_data: a XenapiLiveMigrateData object
+699         """
+700         self._vmops.live_migrate(context, instance, dest, post_method,
+701                                  recover_method, block_migration, migrate_data)
+702 
+703     def rollback_live_migration_at_destination(self, context, instance,
+704                                                network_info,
+705                                                block_device_info,
+706                                                destroy_disks=True,
+707                                                migrate_data=None):
+708         """Performs a live migration rollback.
+709 
+710         :param context: security context
+711         :param instance: instance object that was being migrated
+712         :param network_info: instance network information
+713         :param block_device_info: instance block device information
+714         :param destroy_disks:
+715             if true, destroy disks at destination during cleanup
+716         :param migrate_data: A XenapiLiveMigrateData object
+717         """
+718 
+719         # NOTE(johngarbutt) Destroying the VM is not appropriate here
+720         # and in the cases where it might make sense,
+721         # XenServer has already done it.
+722         # NOTE(sulo): The only cleanup we do explicitly is to forget
+723         # any volume that was attached to the destination during
+724         # live migration. XAPI should take care of all other cleanup.
+725         self._vmops.rollback_live_migration_at_destination(instance,
+726                                                            network_info,
+727                                                            block_device_info)
+728 
+729     def pre_live_migration(self, context, instance, block_device_info,
+730                            network_info, disk_info, migrate_data):
+731         """Preparation live migration.
+732 
+733         :param block_device_info:
+734             It must be the result of _get_instance_volume_bdms()
+735             at compute manager.
+736         :returns: a XenapiLiveMigrateData object
+737         """
+738         return self._vmops.pre_live_migration(context, instance,
+739                 block_device_info, network_info, disk_info, migrate_data)
+740 
+741     def post_live_migration(self, context, instance, block_device_info,
+742                             migrate_data=None):
+743         """Post operation of live migration at source host.
+744 
+745         :param context: security context
+746         :instance: instance object that was migrated
+747         :block_device_info: instance block device information
+748         :param migrate_data: a XenapiLiveMigrateData object
+749         """
+750         self._vmops.post_live_migration(context, instance, migrate_data)
+751 
+752     def post_live_migration_at_source(self, context, instance, network_info):
+753         """Unplug VIFs from networks at source.
+754 
+755         :param context: security context
+756         :param instance: instance object reference
+757         :param network_info: instance network information
+758         """
+759         self._vmops.post_live_migration_at_source(context, instance,
+760                                                   network_info)
+761 
+762     def post_live_migration_at_destination(self, context, instance,
+763                                            network_info,
+764                                            block_migration=False,
+765                                            block_device_info=None):
+766         """Post operation of live migration at destination host.
+767 
+768         :param context: security context
+769         :param instance:
+770             nova.db.sqlalchemy.models.Instance object
+771             instance object that is migrated.
+772         :param network_info: instance network information
+773         :param block_migration: if true, post operation of block_migration.
+774 
+775         """
+776         self._vmops.post_live_migration_at_destination(context, instance,
+777                 network_info, block_device_info, block_device_info)
+778 
+779     def unfilter_instance(self, instance, network_info):
+780         """Removes security groups configured for an instance."""
+781         return self._vmops.unfilter_instance(instance, network_info)
+782 
+783     def refresh_security_group_rules(self, security_group_id):
+784         """Updates security group rules for all instances associated with a
+785         given security group.
+786 
+787         Invoked when security group rules are updated.
+788         """
+789         return self._vmops.refresh_security_group_rules(security_group_id)
+790 
+791     def refresh_instance_security_rules(self, instance):
+792         """Updates security group rules for specified instance.
+793 
+794         Invoked when instances are added/removed to a security group
+795         or when a rule is added/removed to a security group.
+796         """
+797         return self._vmops.refresh_instance_security_rules(instance)
+798 
+799     def get_available_nodes(self, refresh=False):
+800         stats = self.host_state.get_host_stats(refresh=refresh)
+801         return [stats["hypervisor_hostname"]]
+802 
+803     def host_power_action(self, action):
+804         """The only valid values for 'action' on XenServer are 'reboot' or
+805         'shutdown', even though the API also accepts 'startup'. As this is
+806         not technically possible on XenServer, since the host is the same
+807         physical machine as the hypervisor, if this is requested, we need to
+808         raise an exception.
+809         """
+810         if action in ("reboot", "shutdown"):
+811             return self._host.host_power_action(action)
+812         else:
+813             msg = _("Host startup on XenServer is not supported.")
+814             raise NotImplementedError(msg)
+815 
+816     def set_host_enabled(self, enabled):
+817         """Sets the compute host's ability to accept new instances."""
+818         return self._host.set_host_enabled(enabled)
+819 
+820     def get_host_uptime(self):
+821         """Returns the result of calling "uptime" on the target host."""
+822         return self._host.get_host_uptime()
+823 
+824     def host_maintenance_mode(self, host, mode):
+825         """Start/Stop host maintenance window. On start, it triggers
+826         guest VMs evacuation.
+827         """
+828         return self._host.host_maintenance_mode(host, mode)
+829 
+830     def add_to_aggregate(self, context, aggregate, host, **kwargs):
+831         """Add a compute host to an aggregate."""
+832         return self._pool.add_to_aggregate(context, aggregate, host, **kwargs)
+833 
+834     def remove_from_aggregate(self, context, aggregate, host, **kwargs):
+835         """Remove a compute host from an aggregate."""
+836         return self._pool.remove_from_aggregate(context,
+837                                                 aggregate, host, **kwargs)
+838 
+839     def undo_aggregate_operation(self, context, op, aggregate,
+840                                   host, set_error=True):
+841         """Undo aggregate operation when pool error raised."""
+842         return self._pool.undo_aggregate_operation(context, op,
+843                 aggregate, host, set_error)
+844 
+845     def resume_state_on_host_boot(self, context, instance, network_info,
+846                                   block_device_info=None):
+847         """resume guest state when a host is booted."""
+848         self._vmops.power_on(instance)
+849 
+850     def get_per_instance_usage(self):
+851         """Get information about instance resource usage.
+852 
+853         :returns: dict of  nova uuid => dict of usage info
+854         """
+855         return self._vmops.get_per_instance_usage()
+856 
+857     def attach_interface(self, context, instance, image_meta, vif):
+858         """Use hotplug to add a network interface to a running instance.
+859 
+860         The counter action to this is :func:`detach_interface`.
+861 
+862         :param context: The request context.
+863         :param nova.objects.instance.Instance instance:
+864             The instance which will get an additional network interface.
+865         :param nova.objects.ImageMeta image_meta:
+866             The metadata of the image of the instance.
+867         :param nova.network.model.VIF vif:
+868             The object which has the information about the interface to attach.
+869 
+870         :raise nova.exception.NovaException: If the attach fails.
+871 
+872         :return: None
+873         """
+874         self._vmops.attach_interface(instance, vif)
+875 
+876     def detach_interface(self, context, instance, vif):
+877         """Use hotunplug to remove a network interface from a running instance.
+878 
+879         The counter action to this is :func:`attach_interface`.
+880 
+881         :param context: The request context.
+882         :param nova.objects.instance.Instance instance:
+883             The instance which gets a network interface removed.
+884         :param nova.network.model.VIF vif:
+885             The object which has the information about the interface to detach.
+886 
+887         :raise nova.exception.NovaException: If the detach fails.
+888 
+889         :return: None
+890         """
+891         self._vmops.detach_interface(instance, vif)

@@ -1,0 +1,421 @@
+Please review the code below to detect security defects. If any are found, please describe the security defect in detail and indicate the corresponding line number of code and solution. If none are found, please state '''No security defects are detected in the code'''.
+
+1 # Copyright 2011 OpenStack Foundation
+2 # Copyright 2010 United States Government as represented by the
+3 # Administrator of the National Aeronautics and Space Administration.
+4 # All Rights Reserved.
+5 #
+6 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
+7 #    not use this file except in compliance with the License. You may obtain
+8 #    a copy of the License at
+9 #
+10 #         http://www.apache.org/licenses/LICENSE-2.0
+11 #
+12 #    Unless required by applicable law or agreed to in writing, software
+13 #    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+14 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+15 #    License for the specific language governing permissions and limitations
+16 #    under the License.
+17 
+18 """RequestContext: context for requests that persist through all of nova."""
+19 
+20 from contextlib import contextmanager
+21 import copy
+22 
+23 from keystoneauth1.access import service_catalog as ksa_service_catalog
+24 from keystoneauth1 import plugin
+25 from oslo_context import context
+26 from oslo_db.sqlalchemy import enginefacade
+27 from oslo_log import log as logging
+28 from oslo_utils import timeutils
+29 import six
+30 
+31 from nova import exception
+32 from nova.i18n import _
+33 from nova import policy
+34 from nova import utils
+35 
+36 LOG = logging.getLogger(__name__)
+37 # TODO(melwitt): This cache should be cleared whenever WSGIService receives a
+38 # SIGHUP and periodically based on an expiration time. Currently, none of the
+39 # cell caches are purged, so neither is this one, for now.
+40 CELL_CACHE = {}
+41 
+42 
+43 class _ContextAuthPlugin(plugin.BaseAuthPlugin):
+44     """A keystoneauth auth plugin that uses the values from the Context.
+45 
+46     Ideally we would use the plugin provided by auth_token middleware however
+47     this plugin isn't serialized yet so we construct one from the serialized
+48     auth data.
+49     """
+50 
+51     def __init__(self, auth_token, sc):
+52         super(_ContextAuthPlugin, self).__init__()
+53 
+54         self.auth_token = auth_token
+55         self.service_catalog = ksa_service_catalog.ServiceCatalogV2(sc)
+56 
+57     def get_token(self, *args, **kwargs):
+58         return self.auth_token
+59 
+60     def get_endpoint(self, session, service_type=None, interface=None,
+61                      region_name=None, service_name=None, **kwargs):
+62         return self.service_catalog.url_for(service_type=service_type,
+63                                             service_name=service_name,
+64                                             interface=interface,
+65                                             region_name=region_name)
+66 
+67 
+68 @enginefacade.transaction_context_provider
+69 class RequestContext(context.RequestContext):
+70     """Security context and request information.
+71 
+72     Represents the user taking a given action within the system.
+73 
+74     """
+75 
+76     def __init__(self, user_id=None, project_id=None, is_admin=None,
+77                  read_deleted="no", remote_address=None, timestamp=None,
+78                  quota_class=None, user_name=None, project_name=None,
+79                  service_catalog=None, instance_lock_checked=False,
+80                  user_auth_plugin=None, **kwargs):
+81         """:param read_deleted: 'no' indicates deleted records are hidden,
+82                 'yes' indicates deleted records are visible,
+83                 'only' indicates that *only* deleted records are visible.
+84 
+85            :param overwrite: Set to False to ensure that the greenthread local
+86                 copy of the index is not overwritten.
+87 
+88            :param user_auth_plugin: The auth plugin for the current request's
+89                 authentication data.
+90         """
+91         if user_id:
+92             kwargs['user'] = user_id
+93         if project_id:
+94             kwargs['tenant'] = project_id
+95 
+96         super(RequestContext, self).__init__(is_admin=is_admin, **kwargs)
+97 
+98         self.read_deleted = read_deleted
+99         self.remote_address = remote_address
+100         if not timestamp:
+101             timestamp = timeutils.utcnow()
+102         if isinstance(timestamp, six.string_types):
+103             timestamp = timeutils.parse_strtime(timestamp)
+104         self.timestamp = timestamp
+105 
+106         if service_catalog:
+107             # Only include required parts of service_catalog
+108             self.service_catalog = [s for s in service_catalog
+109                 if s.get('type') in ('volume', 'volumev2', 'volumev3',
+110                                      'key-manager', 'placement')]
+111         else:
+112             # if list is empty or none
+113             self.service_catalog = []
+114 
+115         self.instance_lock_checked = instance_lock_checked
+116 
+117         # NOTE(markmc): this attribute is currently only used by the
+118         # rs_limits turnstile pre-processor.
+119         # See https://lists.launchpad.net/openstack/msg12200.html
+120         self.quota_class = quota_class
+121         self.user_name = user_name
+122         self.project_name = project_name
+123 
+124         # NOTE(dheeraj): The following attributes are used by cellsv2 to store
+125         # connection information for connecting to the target cell.
+126         # It is only manipulated using the target_cell contextmanager
+127         # provided by this module
+128         self.db_connection = None
+129         self.mq_connection = None
+130 
+131         self.user_auth_plugin = user_auth_plugin
+132         if self.is_admin is None:
+133             self.is_admin = policy.check_is_admin(self)
+134 
+135     def get_auth_plugin(self):
+136         if self.user_auth_plugin:
+137             return self.user_auth_plugin
+138         else:
+139             return _ContextAuthPlugin(self.auth_token, self.service_catalog)
+140 
+141     def _get_read_deleted(self):
+142         return self._read_deleted
+143 
+144     def _set_read_deleted(self, read_deleted):
+145         if read_deleted not in ('no', 'yes', 'only'):
+146             raise ValueError(_("read_deleted can only be one of 'no', "
+147                                "'yes' or 'only', not %r") % read_deleted)
+148         self._read_deleted = read_deleted
+149 
+150     def _del_read_deleted(self):
+151         del self._read_deleted
+152 
+153     read_deleted = property(_get_read_deleted, _set_read_deleted,
+154                             _del_read_deleted)
+155 
+156     # FIXME(dims): user_id and project_id duplicate information that is
+157     # already present in the oslo_context's RequestContext. We need to
+158     # get rid of them.
+159     @property
+160     def project_id(self):
+161         return self.tenant
+162 
+163     @project_id.setter
+164     def project_id(self, value):
+165         self.tenant = value
+166 
+167     @property
+168     def user_id(self):
+169         return self.user
+170 
+171     @user_id.setter
+172     def user_id(self, value):
+173         self.user = value
+174 
+175     def to_dict(self):
+176         values = super(RequestContext, self).to_dict()
+177         # FIXME(dims): defensive hasattr() checks need to be
+178         # removed once we figure out why we are seeing stack
+179         # traces
+180         values.update({
+181             'user_id': getattr(self, 'user_id', None),
+182             'project_id': getattr(self, 'project_id', None),
+183             'is_admin': getattr(self, 'is_admin', None),
+184             'read_deleted': getattr(self, 'read_deleted', 'no'),
+185             'remote_address': getattr(self, 'remote_address', None),
+186             'timestamp': utils.strtime(self.timestamp) if hasattr(
+187                 self, 'timestamp') else None,
+188             'request_id': getattr(self, 'request_id', None),
+189             'quota_class': getattr(self, 'quota_class', None),
+190             'user_name': getattr(self, 'user_name', None),
+191             'service_catalog': getattr(self, 'service_catalog', None),
+192             'project_name': getattr(self, 'project_name', None),
+193             'instance_lock_checked': getattr(self, 'instance_lock_checked',
+194                                              False)
+195         })
+196         # NOTE(tonyb): This can be removed once we're certain to have a
+197         # RequestContext contains 'is_admin_project', We can only get away with
+198         # this because we "know" the default value of 'is_admin_project' which
+199         # is very fragile.
+200         values.update({
+201             'is_admin_project': getattr(self, 'is_admin_project', True),
+202         })
+203         return values
+204 
+205     @classmethod
+206     def from_dict(cls, values):
+207         return cls(
+208             user_id=values.get('user_id'),
+209             user=values.get('user'),
+210             project_id=values.get('project_id'),
+211             tenant=values.get('tenant'),
+212             is_admin=values.get('is_admin'),
+213             read_deleted=values.get('read_deleted', 'no'),
+214             roles=values.get('roles'),
+215             remote_address=values.get('remote_address'),
+216             timestamp=values.get('timestamp'),
+217             request_id=values.get('request_id'),
+218             auth_token=values.get('auth_token'),
+219             quota_class=values.get('quota_class'),
+220             user_name=values.get('user_name'),
+221             project_name=values.get('project_name'),
+222             service_catalog=values.get('service_catalog'),
+223             instance_lock_checked=values.get('instance_lock_checked', False),
+224         )
+225 
+226     @classmethod
+227     def from_environ(cls, environ, **kwargs):
+228         ctx = super(RequestContext, cls).from_environ(environ, **kwargs)
+229 
+230         # the base oslo.context sets its user param and tenant param but not
+231         # our user_id and project_id param so fix those up.
+232         if ctx.user and not ctx.user_id:
+233             ctx.user_id = ctx.user
+234         if ctx.tenant and not ctx.project_id:
+235             ctx.project_id = ctx.tenant
+236 
+237         return ctx
+238 
+239     def elevated(self, read_deleted=None):
+240         """Return a version of this context with admin flag set."""
+241         context = copy.copy(self)
+242         # context.roles must be deepcopied to leave original roles
+243         # without changes
+244         context.roles = copy.deepcopy(self.roles)
+245         context.is_admin = True
+246 
+247         if 'admin' not in context.roles:
+248             context.roles.append('admin')
+249 
+250         if read_deleted is not None:
+251             context.read_deleted = read_deleted
+252 
+253         return context
+254 
+255     def can(self, action, target=None, fatal=True):
+256         """Verifies that the given action is valid on the target in this context.
+257 
+258         :param action: string representing the action to be checked.
+259         :param target: dictionary representing the object of the action
+260             for object creation this should be a dictionary representing the
+261             location of the object e.g. ``{'project_id': context.project_id}``.
+262             If None, then this default target will be considered:
+263             {'project_id': self.project_id, 'user_id': self.user_id}
+264         :param fatal: if False, will return False when an exception.Forbidden
+265            occurs.
+266 
+267         :raises nova.exception.Forbidden: if verification fails and fatal is
+268             True.
+269 
+270         :return: returns a non-False value (not necessarily "True") if
+271             authorized and False if not authorized and fatal is False.
+272         """
+273         if target is None:
+274             target = {'project_id': self.project_id,
+275                       'user_id': self.user_id}
+276 
+277         try:
+278             return policy.authorize(self, action, target)
+279         except exception.Forbidden:
+280             if fatal:
+281                 raise
+282             return False
+283 
+284     def to_policy_values(self):
+285         policy = super(RequestContext, self).to_policy_values()
+286         policy['is_admin'] = self.is_admin
+287         return policy
+288 
+289     def __str__(self):
+290         return "<Context %s>" % self.to_dict()
+291 
+292 
+293 def get_context():
+294     """A helper method to get a blank context.
+295 
+296     Note that overwrite is False here so this context will not update the
+297     greenthread-local stored context that is used when logging.
+298     """
+299     return RequestContext(user_id=None,
+300                           project_id=None,
+301                           is_admin=False,
+302                           overwrite=False)
+303 
+304 
+305 def get_admin_context(read_deleted="no"):
+306     # NOTE(alaski): This method should only be used when an admin context is
+307     # necessary for the entirety of the context lifetime. If that's not the
+308     # case please use get_context(), or create the RequestContext manually, and
+309     # use context.elevated() where necessary. Some periodic tasks may use
+310     # get_admin_context so that their database calls are not filtered on
+311     # project_id.
+312     return RequestContext(user_id=None,
+313                           project_id=None,
+314                           is_admin=True,
+315                           read_deleted=read_deleted,
+316                           overwrite=False)
+317 
+318 
+319 def is_user_context(context):
+320     """Indicates if the request context is a normal user."""
+321     if not context:
+322         return False
+323     if context.is_admin:
+324         return False
+325     if not context.user_id or not context.project_id:
+326         return False
+327     return True
+328 
+329 
+330 def require_context(ctxt):
+331     """Raise exception.Forbidden() if context is not a user or an
+332     admin context.
+333     """
+334     if not ctxt.is_admin and not is_user_context(ctxt):
+335         raise exception.Forbidden()
+336 
+337 
+338 def authorize_project_context(context, project_id):
+339     """Ensures a request has permission to access the given project."""
+340     if is_user_context(context):
+341         if not context.project_id:
+342             raise exception.Forbidden()
+343         elif context.project_id != project_id:
+344             raise exception.Forbidden()
+345 
+346 
+347 def authorize_user_context(context, user_id):
+348     """Ensures a request has permission to access the given user."""
+349     if is_user_context(context):
+350         if not context.user_id:
+351             raise exception.Forbidden()
+352         elif context.user_id != user_id:
+353             raise exception.Forbidden()
+354 
+355 
+356 def authorize_quota_class_context(context, class_name):
+357     """Ensures a request has permission to access the given quota class."""
+358     if is_user_context(context):
+359         if not context.quota_class:
+360             raise exception.Forbidden()
+361         elif context.quota_class != class_name:
+362             raise exception.Forbidden()
+363 
+364 
+365 def set_target_cell(context, cell_mapping):
+366     """Adds database connection information to the context
+367     for communicating with the given target_cell.
+368 
+369     This is used for permanently targeting a cell in a context.
+370     Use this when you want all subsequent code to target a cell.
+371 
+372     Passing None for cell_mapping will untarget the context.
+373 
+374     :param context: The RequestContext to add connection information
+375     :param cell_mapping: An objects.CellMapping object or None
+376     """
+377     global CELL_CACHE
+378     if cell_mapping is not None:
+379         # avoid circular import
+380         from nova import db
+381         from nova import rpc
+382         if cell_mapping.uuid not in CELL_CACHE:
+383             db_connection_string = cell_mapping.database_connection
+384             context.db_connection = db.create_context_manager(
+385                 db_connection_string)
+386             if not cell_mapping.transport_url.startswith('none'):
+387                 context.mq_connection = rpc.create_transport(
+388                     cell_mapping.transport_url)
+389             CELL_CACHE[cell_mapping.uuid] = (context.db_connection,
+390                                              context.mq_connection)
+391         else:
+392             context.db_connection = CELL_CACHE[cell_mapping.uuid][0]
+393             context.mq_connection = CELL_CACHE[cell_mapping.uuid][1]
+394     else:
+395         context.db_connection = None
+396         context.mq_connection = None
+397 
+398 
+399 @contextmanager
+400 def target_cell(context, cell_mapping):
+401     """Temporarily adds database connection information to the context
+402     for communicating with the given target cell.
+403 
+404     This context manager makes a temporary change to the context
+405     and restores it when complete.
+406 
+407     Passing None for cell_mapping will untarget the context temporarily.
+408 
+409     :param context: The RequestContext to add connection information
+410     :param cell_mapping: An objects.CellMapping object or None
+411     """
+412     original_db_connection = context.db_connection
+413     original_mq_connection = context.mq_connection
+414     set_target_cell(context, cell_mapping)
+415     try:
+416         yield context
+417     finally:
+418         context.db_connection = original_db_connection
+419         context.mq_connection = original_mq_connection

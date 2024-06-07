@@ -1,0 +1,177 @@
+I want you to act as a code reviewer of Neutron in OpenStack. Please review the code below to detect security defects. If any are found, please describe the security defect in detail and indicate the corresponding line number of code and solution. If none are found, please state '''No security defects are detected in the code'''.
+
+1 # Copyright (c) 2015 Red Hat Inc.
+2 #
+3 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
+4 #    not use this file except in compliance with the License. You may obtain
+5 #    a copy of the License at
+6 #
+7 #         http://www.apache.org/licenses/LICENSE-2.0
+8 #
+9 #    Unless required by applicable law or agreed to in writing, software
+10 #    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+11 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+12 #    License for the specific language governing permissions and limitations
+13 #    under the License.
+14 
+15 import os
+16 import sys
+17 import threading
+18 
+19 import httplib2
+20 import netaddr
+21 from oslo_config import cfg
+22 from oslo_log import log as logging
+23 from six.moves import queue
+24 
+25 from neutron._i18n import _
+26 from neutron.agent.l3 import ha
+27 from neutron.agent.linux import daemon
+28 from neutron.agent.linux import ip_lib
+29 from neutron.agent.linux import utils as agent_utils
+30 from neutron.common import config
+31 from neutron.conf.agent.l3 import keepalived
+32 from neutron import privileged
+33 
+34 
+35 LOG = logging.getLogger(__name__)
+36 
+37 
+38 class KeepalivedUnixDomainConnection(agent_utils.UnixDomainHTTPConnection):
+39     def __init__(self, *args, **kwargs):
+40         # Old style super initialization is required!
+41         agent_utils.UnixDomainHTTPConnection.__init__(
+42             self, *args, **kwargs)
+43         self.socket_path = (
+44             ha.L3AgentKeepalivedStateChangeServer.
+45             get_keepalived_state_change_socket_path(cfg.CONF))
+46 
+47 
+48 class MonitorDaemon(daemon.Daemon):
+49     def __init__(self, pidfile, router_id, user, group, namespace, conf_dir,
+50                  interface, cidr):
+51         self.router_id = router_id
+52         self.namespace = namespace
+53         self.conf_dir = conf_dir
+54         self.interface = interface
+55         self.cidr = cidr
+56         self.monitor = None
+57         self.event_stop = threading.Event()
+58         self.event_started = threading.Event()
+59         self.queue = queue.Queue()
+60         super(MonitorDaemon, self).__init__(pidfile, uuid=router_id,
+61                                             user=user, group=group)
+62 
+63     def run(self):
+64         self._thread_ip_monitor = threading.Thread(
+65             target=ip_lib.ip_monitor,
+66             args=(self.namespace, self.queue, self.event_stop,
+67                   self.event_started))
+68         self._thread_read_queue = threading.Thread(
+69             target=self.read_queue,
+70             args=(self.queue, self.event_stop, self.event_started))
+71         self._thread_ip_monitor.start()
+72         self._thread_read_queue.start()
+73         self.handle_initial_state()
+74         self._thread_read_queue.join()
+75 
+76     def read_queue(self, _queue, event_stop, event_started):
+77         event_started.wait()
+78         while not event_stop.is_set():
+79             try:
+80                 event = _queue.get(timeout=2)
+81             except queue.Empty:
+82                 event = None
+83             if not event:
+84                 continue
+85 
+86             if event['name'] == self.interface and event['cidr'] == self.cidr:
+87                 new_state = 'master' if event['event'] == 'added' else 'backup'
+88                 self.write_state_change(new_state)
+89                 self.notify_agent(new_state)
+90             elif event['name'] != self.interface and event['event'] == 'added':
+91                 # Send GARPs for all new router interfaces.
+92                 # REVISIT(jlibosva): keepalived versions 1.2.19 and below
+93                 # contain bug where gratuitous ARPs are not sent on receiving
+94                 # SIGHUP signal. This is a workaround to this bug. keepalived
+95                 # has this issue fixed since 1.2.20 but the version is not
+96                 # packaged in some distributions (RHEL/CentOS/Ubuntu Xenial).
+97                 # Remove this code once new keepalived versions are available.
+98                 self.send_garp(event)
+99 
+100     def handle_initial_state(self):
+101         try:
+102             state = 'backup'
+103             ip = ip_lib.IPDevice(self.interface, self.namespace)
+104             for address in ip.addr.list():
+105                 if address.get('cidr') == self.cidr:
+106                     state = 'master'
+107                     self.write_state_change(state)
+108                     self.notify_agent(state)
+109                     break
+110 
+111             LOG.debug('Initial status of router %s is %s',
+112                       self.router_id, state)
+113         except Exception:
+114             LOG.exception('Failed to get initial status of router %s',
+115                           self.router_id)
+116 
+117     def write_state_change(self, state):
+118         with open(os.path.join(
+119                 self.conf_dir, 'state'), 'w') as state_file:
+120             state_file.write(state)
+121         LOG.debug('Wrote router %s state %s', self.router_id, state)
+122 
+123     def notify_agent(self, state):
+124         resp, content = httplib2.Http().request(
+125             # Note that the message is sent via a Unix domain socket so that
+126             # the URL doesn't matter.
+127             'http://127.0.0.1/',
+128             headers={'X-Neutron-Router-Id': self.router_id,
+129                      'X-Neutron-State': state},
+130             connection_type=KeepalivedUnixDomainConnection)
+131 
+132         if resp.status != 200:
+133             raise Exception(_('Unexpected response: %s') % resp)
+134 
+135         LOG.debug('Notified agent router %s, state %s', self.router_id, state)
+136 
+137     def send_garp(self, event):
+138         """Send gratuitous ARP for given event."""
+139         ip_address = str(netaddr.IPNetwork(event['cidr']).ip)
+140         ip_lib.send_ip_addr_adv_notif(
+141             self.namespace,
+142             event['name'],
+143             ip_address,
+144             log_exception=False
+145         )
+146         LOG.debug('Sent GARP to %(ip_address)s from %(device_name)s',
+147                   {'ip_address': ip_address, 'device_name': event['name']})
+148 
+149     def handle_sigterm(self, signum, frame):
+150         self.event_stop.set()
+151         self._thread_read_queue.join(timeout=5)
+152         super(MonitorDaemon, self).handle_sigterm(signum, frame)
+153 
+154 
+155 def configure(conf):
+156     config.init(sys.argv[1:])
+157     conf.set_override('log_dir', cfg.CONF.conf_dir)
+158     conf.set_override('debug', True)
+159     conf.set_override('use_syslog', True)
+160     config.setup_logging()
+161     privileged.default.set_client_mode(False)
+162 
+163 
+164 def main():
+165     keepalived.register_cli_l3_agent_keepalived_opts()
+166     keepalived.register_l3_agent_keepalived_opts()
+167     configure(cfg.CONF)
+168     MonitorDaemon(cfg.CONF.pid_file,
+169                   cfg.CONF.router_id,
+170                   cfg.CONF.user,
+171                   cfg.CONF.group,
+172                   cfg.CONF.namespace,
+173                   cfg.CONF.conf_dir,
+174                   cfg.CONF.monitor_interface,
+175                   cfg.CONF.monitor_cidr).start()

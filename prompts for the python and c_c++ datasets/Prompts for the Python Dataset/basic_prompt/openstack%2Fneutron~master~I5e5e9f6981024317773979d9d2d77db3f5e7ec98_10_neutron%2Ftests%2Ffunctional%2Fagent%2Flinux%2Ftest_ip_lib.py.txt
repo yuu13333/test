@@ -1,0 +1,936 @@
+Please review the code below to detect security defects. If any are found, please describe the security defect in detail and indicate the corresponding line number of code and solution. If none are found, please state '''No security defects are detected in the code'''.
+
+1 # Copyright (c) 2014 Red Hat, Inc.
+2 # All Rights Reserved.
+3 #
+4 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
+5 #    not use this file except in compliance with the License. You may obtain
+6 #    a copy of the License at
+7 #
+8 #         http://www.apache.org/licenses/LICENSE-2.0
+9 #
+10 #    Unless required by applicable law or agreed to in writing, software
+11 #    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+12 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+13 #    License for the specific language governing permissions and limitations
+14 #    under the License.
+15 
+16 import collections
+17 import itertools
+18 import signal
+19 
+20 import netaddr
+21 from neutron_lib import constants
+22 from neutron_lib.utils import net
+23 from oslo_config import cfg
+24 from oslo_log import log as logging
+25 from oslo_serialization import jsonutils
+26 from oslo_utils import importutils
+27 from oslo_utils import uuidutils
+28 from pyroute2.iproute import linux as iproute_linux
+29 import testscenarios
+30 import testtools
+31 
+32 from neutron.agent.common import async_process
+33 from neutron.agent.linux import ip_lib
+34 from neutron.common import utils
+35 from neutron.conf.agent import common as config
+36 from neutron.privileged.agent.linux import ip_lib as priv_ip_lib
+37 from neutron.tests.common import net_helpers
+38 from neutron.tests.functional.agent.linux.bin import ip_monitor
+39 from neutron.tests.functional import base as functional_base
+40 
+41 LOG = logging.getLogger(__name__)
+42 Device = collections.namedtuple('Device',
+43                                 'name ip_cidrs mac_address namespace')
+44 
+45 WRONG_IP = '0.0.0.0'
+46 TEST_IP = '240.0.0.1'
+47 TEST_IP_NEIGH = '240.0.0.2'
+48 TEST_IP_SECONDARY = '240.0.0.3'
+49 
+50 
+51 class IpLibTestFramework(functional_base.BaseSudoTestCase):
+52     def setUp(self):
+53         super(IpLibTestFramework, self).setUp()
+54         self._configure()
+55 
+56     def _configure(self):
+57         config.register_interface_driver_opts_helper(cfg.CONF)
+58         cfg.CONF.set_override(
+59             'interface_driver',
+60             'neutron.agent.linux.interface.OVSInterfaceDriver')
+61         config.register_interface_opts()
+62         self.driver = importutils.import_object(cfg.CONF.interface_driver,
+63                                                 cfg.CONF)
+64 
+65     def generate_device_details(self, name=None, ip_cidrs=None,
+66                                 mac_address=None, namespace=None):
+67         if ip_cidrs is None:
+68             ip_cidrs = ["%s/24" % TEST_IP]
+69         return Device(name or utils.get_rand_name(),
+70                       ip_cidrs,
+71                       mac_address or
+72                       net.get_random_mac('fa:16:3e:00:00:00'.split(':')),
+73                       namespace or utils.get_rand_name())
+74 
+75     def _safe_delete_device(self, device):
+76         try:
+77             device.link.delete()
+78         except RuntimeError:
+79             LOG.debug('Could not delete %s, was it already deleted?', device)
+80 
+81     def manage_device(self, attr):
+82         """Create a tuntap with the specified attributes.
+83 
+84         The device is cleaned up at the end of the test.
+85 
+86         :param attr: A Device namedtuple
+87         :return: A tuntap ip_lib.IPDevice
+88         """
+89         ip = ip_lib.IPWrapper(namespace=attr.namespace)
+90         if attr.namespace:
+91             ip.netns.add(attr.namespace)
+92             self.addCleanup(ip.netns.delete, attr.namespace)
+93         tap_device = ip.add_tuntap(attr.name)
+94         self.addCleanup(self._safe_delete_device, tap_device)
+95         tap_device.link.set_address(attr.mac_address)
+96         self.driver.init_l3(attr.name, attr.ip_cidrs,
+97                             namespace=attr.namespace)
+98         tap_device.link.set_up()
+99         return tap_device
+100 
+101 
+102 class IpLibTestCase(IpLibTestFramework):
+103 
+104     def _check_routes(self, expected_routes, actual_routes):
+105         actual_routes = [{key: route[key] for key in expected_routes[0].keys()}
+106                          for route in actual_routes]
+107         self.assertEqual(expected_routes, actual_routes)
+108 
+109     def test_rules_lifecycle(self):
+110         PRIORITY = 32768
+111         TABLE = 16
+112         attr = self.generate_device_details()
+113         device = self.manage_device(attr)
+114 
+115         test_cases = {
+116             constants.IP_VERSION_4: [
+117                 {
+118                     'ip': '1.1.1.1',
+119                     'to': '8.8.8.0/24'
+120                 },
+121                 {
+122                     'ip': '1.1.1.1',
+123                     'iif': device.name,
+124                     'to': '7.7.7.0/24'
+125                 }
+126             ],
+127             constants.IP_VERSION_6: [
+128                 {
+129                     'ip': 'abcd::1',
+130                     'to': '1234::/64'
+131                 },
+132                 {
+133                     'ip': 'abcd::1',
+134                     'iif': device.name,
+135                     'to': '4567::/64'
+136                 }
+137             ]
+138         }
+139         expected_rules = {
+140             constants.IP_VERSION_4: [
+141                 {
+142                     'from': '1.1.1.1',
+143                     'to': '8.8.8.0/24',
+144                     'priority': str(PRIORITY),
+145                     'table': str(TABLE),
+146                     'type': 'unicast'
+147                 }, {
+148                     'from': '0.0.0.0/0',
+149                     'to': '7.7.7.0/24',
+150                     'iif': device.name,
+151                     'priority': str(PRIORITY),
+152                     'table': str(TABLE),
+153                     'type': 'unicast'
+154                 }
+155             ],
+156             constants.IP_VERSION_6: [
+157                 {
+158                     'from': 'abcd::1',
+159                     'to': '1234::/64',
+160                     'priority': str(PRIORITY),
+161                     'table': str(TABLE),
+162                     'type': 'unicast'
+163                 },
+164                 {
+165                     'from': '::/0',
+166                     'to': '4567::/64',
+167                     'iif': device.name,
+168                     'priority': str(PRIORITY),
+169                     'table': str(TABLE),
+170                     'type': 'unicast',
+171                 }
+172             ]
+173         }
+174 
+175         for ip_version, test_case in test_cases.items():
+176             for rule in test_case:
+177                 ip_lib.add_ip_rule(namespace=device.namespace, table=TABLE,
+178                                    priority=PRIORITY, **rule)
+179 
+180             rules = ip_lib.list_ip_rules(device.namespace, ip_version)
+181             for expected_rule in expected_rules[ip_version]:
+182                 self.assertIn(expected_rule, rules)
+183 
+184             for rule in test_case:
+185                 ip_lib.delete_ip_rule(device.namespace, table=TABLE,
+186                                       priority=PRIORITY, **rule)
+187 
+188             rules = priv_ip_lib.list_ip_rules(device.namespace, ip_version)
+189             for expected_rule in expected_rules[ip_version]:
+190                 self.assertNotIn(expected_rule, rules)
+191 
+192     def test_device_exists(self):
+193         attr = self.generate_device_details()
+194 
+195         self.assertFalse(
+196             ip_lib.device_exists(attr.name, namespace=attr.namespace))
+197 
+198         device = self.manage_device(attr)
+199 
+200         self.assertTrue(
+201             ip_lib.device_exists(device.name, namespace=attr.namespace))
+202 
+203         self.assertFalse(
+204             ip_lib.device_exists(attr.name, namespace='wrong_namespace'))
+205 
+206         device.link.delete()
+207 
+208         self.assertFalse(
+209             ip_lib.device_exists(attr.name, namespace=attr.namespace))
+210 
+211     def test_ipdevice_exists(self):
+212         attr = self.generate_device_details()
+213         device = self.manage_device(attr)
+214         self.assertTrue(device.exists())
+215         device.link.delete()
+216         self.assertFalse(device.exists())
+217 
+218     def test_vlan_exists(self):
+219         attr = self.generate_device_details()
+220         ip = ip_lib.IPWrapper(namespace=attr.namespace)
+221         ip.netns.add(attr.namespace)
+222         self.addCleanup(ip.netns.delete, attr.namespace)
+223         priv_ip_lib.create_interface(attr.name, attr.namespace, 'dummy')
+224         self.assertFalse(ip_lib.vlan_in_use(1999, namespace=attr.namespace))
+225         device = ip.add_vlan('vlan1999', attr.name, 1999)
+226         self.assertTrue(ip_lib.vlan_in_use(1999, namespace=attr.namespace))
+227         device.link.delete()
+228         self.assertFalse(ip_lib.vlan_in_use(1999, namespace=attr.namespace))
+229 
+230     def test_vxlan_exists(self):
+231         attr = self.generate_device_details()
+232         ip = ip_lib.IPWrapper(namespace=attr.namespace)
+233         ip.netns.add(attr.namespace)
+234         self.addCleanup(ip.netns.delete, attr.namespace)
+235         self.assertFalse(ip_lib.vxlan_in_use(9999, namespace=attr.namespace))
+236         device = ip.add_vxlan(attr.name, 9999)
+237         self.addCleanup(self._safe_delete_device, device)
+238         self.assertTrue(ip_lib.vxlan_in_use(9999, namespace=attr.namespace))
+239         device.link.delete()
+240         self.assertFalse(ip_lib.vxlan_in_use(9999, namespace=attr.namespace))
+241 
+242     def test_ipwrapper_get_device_by_ip_None(self):
+243         ip_wrapper = ip_lib.IPWrapper(namespace=None)
+244         self.assertIsNone(ip_wrapper.get_device_by_ip(ip=None))
+245 
+246     def test_ipwrapper_get_device_by_ip(self):
+247         # We need to pass both IP and cidr values to get_device_by_ip()
+248         # to make sure it filters correctly.
+249         test_ip = "%s/24" % TEST_IP
+250         test_ip_secondary = "%s/24" % TEST_IP_SECONDARY
+251         attr = self.generate_device_details(
+252             ip_cidrs=[test_ip, test_ip_secondary]
+253         )
+254         self.manage_device(attr)
+255         ip_wrapper = ip_lib.IPWrapper(namespace=attr.namespace)
+256         self.assertEqual(attr.name, ip_wrapper.get_device_by_ip(TEST_IP).name)
+257         self.assertEqual(attr.name,
+258                          ip_wrapper.get_device_by_ip(TEST_IP_SECONDARY).name)
+259         self.assertIsNone(ip_wrapper.get_device_by_ip(TEST_IP_NEIGH))
+260         # this is in the same subnet, so will match if we pass as cidr
+261         test_ip_neigh = "%s/24" % TEST_IP_NEIGH
+262         self.assertEqual(attr.name,
+263                          ip_wrapper.get_device_by_ip(test_ip_neigh).name)
+264         self.assertIsNone(ip_wrapper.get_device_by_ip(WRONG_IP))
+265 
+266     def test_device_exists_with_ips_and_mac(self):
+267         attr = self.generate_device_details()
+268         device = self.manage_device(attr)
+269         self.assertTrue(
+270             ip_lib.device_exists_with_ips_and_mac(*attr))
+271 
+272         wrong_ip_cidr = '10.0.0.1/8'
+273         wrong_mac_address = 'aa:aa:aa:aa:aa:aa'
+274 
+275         attr = self.generate_device_details(name='wrong_name')
+276         self.assertFalse(
+277             ip_lib.device_exists_with_ips_and_mac(*attr))
+278 
+279         attr = self.generate_device_details(ip_cidrs=[wrong_ip_cidr])
+280         self.assertFalse(ip_lib.device_exists_with_ips_and_mac(*attr))
+281 
+282         attr = self.generate_device_details(mac_address=wrong_mac_address)
+283         self.assertFalse(ip_lib.device_exists_with_ips_and_mac(*attr))
+284 
+285         attr = self.generate_device_details(namespace='wrong_namespace')
+286         self.assertFalse(ip_lib.device_exists_with_ips_and_mac(*attr))
+287 
+288         device.link.delete()
+289 
+290     def test_get_device_mac(self):
+291         attr = self.generate_device_details()
+292         device = self.manage_device(attr)
+293 
+294         mac_address = ip_lib.get_device_mac(attr.name,
+295                                             namespace=attr.namespace)
+296 
+297         self.assertEqual(attr.mac_address, mac_address)
+298 
+299         device.link.delete()
+300 
+301     def test_get_device_mac_too_long_name(self):
+302         name = utils.get_rand_name(
+303             max_length=constants.DEVICE_NAME_MAX_LEN + 5)
+304         attr = self.generate_device_details(name=name)
+305         device = self.manage_device(attr)
+306 
+307         mac_address = ip_lib.get_device_mac(attr.name,
+308                                             namespace=attr.namespace)
+309 
+310         self.assertEqual(attr.mac_address, mac_address)
+311 
+312         device.link.delete()
+313 
+314     def test_gateway_lifecycle(self):
+315         attr = self.generate_device_details(
+316             ip_cidrs=["%s/24" % TEST_IP, "fd00::1/64"]
+317         )
+318         metric = 1000
+319         device = self.manage_device(attr)
+320         gateways = {
+321             constants.IP_VERSION_4: attr.ip_cidrs[0].split('/')[0],
+322             constants.IP_VERSION_6: "fd00::ff"
+323         }
+324         expected_gateways = {
+325             constants.IP_VERSION_4: {
+326                 'priority': metric,
+327                 'via': gateways[constants.IP_VERSION_4]},
+328             constants.IP_VERSION_6: {
+329                 'priority': metric,
+330                 'via': gateways[constants.IP_VERSION_6]}}
+331 
+332         for ip_version, gateway_ip in gateways.items():
+333             device.route.add_gateway(gateway_ip, metric)
+334             self._check_routes(
+335                 [expected_gateways[ip_version]],
+336                 [device.route.get_gateway(ip_version=ip_version)])
+337             device.route.delete_gateway(gateway_ip)
+338             self.assertIsNone(
+339                 device.route.get_gateway(ip_version=ip_version))
+340 
+341     def test_gateway_flush(self):
+342         attr = self.generate_device_details(
+343             ip_cidrs=["%s/24" % TEST_IP, "fd00::1/64"]
+344         )
+345         device = self.manage_device(attr)
+346 
+347         gateways = {
+348             constants.IP_VERSION_4: attr.ip_cidrs[0].split('/')[0],
+349             constants.IP_VERSION_6: "fd00::ff"
+350         }
+351         for ip_version, gateway_ip in gateways.items():
+352             # Ensure that there is no gateway configured
+353             self.assertIsNone(
+354                 device.route.get_gateway(ip_version=ip_version))
+355 
+356             # Now lets add gateway
+357             device.route.add_gateway(gateway_ip, table="main")
+358             self.assertIsNotNone(
+359                 device.route.get_gateway(ip_version=ip_version))
+360 
+361             # Flush gateway and check that there is no any gateway configured
+362             device.route.flush(ip_version, table="main")
+363             self.assertIsNone(
+364                 device.route.get_gateway(ip_version=ip_version))
+365 
+366     def test_get_routing_table(self):
+367         attr = self.generate_device_details(
+368             ip_cidrs=["%s/24" % TEST_IP, "fd00::1/64"]
+369         )
+370         device = self.manage_device(attr)
+371         device_ip = attr.ip_cidrs[0].split('/')[0]
+372         destination = '8.8.8.0/24'
+373         device.route.add_route(destination, device_ip)
+374 
+375         destination6 = 'fd01::/64'
+376         device.route.add_route(destination6, "fd00::2")
+377 
+378         expected_routes = [{'nexthop': device_ip,
+379                             'device': attr.name,
+380                             'destination': destination,
+381                             'scope': 'universe'},
+382                            {'nexthop': None,
+383                             'device': attr.name,
+384                             'destination': str(
+385                                 netaddr.IPNetwork(attr.ip_cidrs[0]).cidr),
+386                             'scope': 'link'}]
+387 
+388         routes = ip_lib.get_routing_table(4, namespace=attr.namespace)
+389         self.assertItemsEqual(expected_routes, routes)
+390         self.assertIsInstance(routes, list)
+391 
+392         expected_routes6 = [{'nexthop': "fd00::2",
+393                              'device': attr.name,
+394                              'destination': destination6,
+395                              'scope': 'universe'},
+396                             {'nexthop': None,
+397                              'device': attr.name,
+398                              'destination': str(
+399                                  netaddr.IPNetwork(attr.ip_cidrs[1]).cidr),
+400                              'scope': 'universe'}]
+401         routes6 = ip_lib.get_routing_table(6, namespace=attr.namespace)
+402         self.assertItemsEqual(expected_routes6, routes6)
+403         self.assertIsInstance(routes6, list)
+404 
+405     def test_get_routing_table_no_namespace(self):
+406         with testtools.ExpectedException(ip_lib.NetworkNamespaceNotFound):
+407             ip_lib.get_routing_table(4, namespace="nonexistent-netns")
+408 
+409     def test_get_neigh_entries(self):
+410         attr = self.generate_device_details(
+411             ip_cidrs=["%s/24" % TEST_IP, "fd00::1/64"]
+412         )
+413         mac_address = net.get_random_mac('fa:16:3e:00:00:00'.split(':'))
+414         device = self.manage_device(attr)
+415         device.neigh.add(TEST_IP_NEIGH, mac_address)
+416 
+417         expected_neighs = [{'dst': TEST_IP_NEIGH,
+418                             'lladdr': mac_address,
+419                             'device': attr.name}]
+420 
+421         neighs = device.neigh.dump(4)
+422         self.assertItemsEqual(expected_neighs, neighs)
+423         self.assertIsInstance(neighs, list)
+424 
+425         device.neigh.delete(TEST_IP_NEIGH, mac_address)
+426         neighs = device.neigh.dump(4, dst=TEST_IP_NEIGH, lladdr=mac_address)
+427         self.assertEqual([], neighs)
+428 
+429     def test_get_neigh_entries_no_namespace(self):
+430         with testtools.ExpectedException(ip_lib.NetworkNamespaceNotFound):
+431             ip_lib.dump_neigh_entries(4, namespace="nonexistent-netns")
+432 
+433     def test_get_neigh_entries_no_interface(self):
+434         attr = self.generate_device_details(
+435             ip_cidrs=["%s/24" % TEST_IP, "fd00::1/64"]
+436         )
+437         self.manage_device(attr)
+438         with testtools.ExpectedException(ip_lib.NetworkInterfaceNotFound):
+439             ip_lib.dump_neigh_entries(4, device="nosuchdevice",
+440                                       namespace=attr.namespace)
+441 
+442     def test_delete_neigh_entries(self):
+443         attr = self.generate_device_details(
+444             ip_cidrs=["%s/24" % TEST_IP, "fd00::1/64"]
+445         )
+446         mac_address = net.get_random_mac('fa:16:3e:00:00:00'.split(':'))
+447         device = self.manage_device(attr)
+448 
+449         # trying to delete a non-existent entry shouldn't raise an error
+450         device.neigh.delete(TEST_IP_NEIGH, mac_address)
+451 
+452     def _check_for_device_name(self, ip, name, should_exist):
+453         exist = any(d for d in ip.get_devices() if d.name == name)
+454         self.assertEqual(should_exist, exist)
+455 
+456     def test_veth_exists(self):
+457         namespace1 = self.useFixture(net_helpers.NamespaceFixture())
+458         namespace2 = self.useFixture(net_helpers.NamespaceFixture())
+459         dev_name1 = utils.get_rand_name()
+460         dev_name2 = utils.get_rand_name()
+461 
+462         device1, device2 = namespace1.ip_wrapper.add_veth(
+463             dev_name1, dev_name2, namespace2.name)
+464         self.addCleanup(self._safe_delete_device, device1)
+465         self.addCleanup(self._safe_delete_device, device2)
+466 
+467         self._check_for_device_name(namespace1.ip_wrapper, dev_name1, True)
+468         self._check_for_device_name(namespace2.ip_wrapper, dev_name2, True)
+469         self._check_for_device_name(namespace1.ip_wrapper, dev_name2, False)
+470         self._check_for_device_name(namespace2.ip_wrapper, dev_name1, False)
+471 
+472         # As it is veth pair, remove of device1 should be enough to remove
+473         # both devices
+474         device1.link.delete()
+475         self._check_for_device_name(namespace1.ip_wrapper, dev_name1, False)
+476         self._check_for_device_name(namespace2.ip_wrapper, dev_name2, False)
+477 
+478     def test_macvtap_exists(self):
+479         namespace = self.useFixture(net_helpers.NamespaceFixture())
+480         src_dev_name = utils.get_rand_name()
+481         src_dev = namespace.ip_wrapper.add_dummy(src_dev_name)
+482         self.addCleanup(self._safe_delete_device, src_dev)
+483 
+484         dev_name = utils.get_rand_name()
+485         device = namespace.ip_wrapper.add_macvtap(dev_name, src_dev_name)
+486         self.addCleanup(self._safe_delete_device, device)
+487 
+488         self._check_for_device_name(namespace.ip_wrapper, dev_name, True)
+489         device.link.delete()
+490         self._check_for_device_name(namespace.ip_wrapper, dev_name, False)
+491 
+492     def test_dummy_exists(self):
+493         namespace = self.useFixture(net_helpers.NamespaceFixture())
+494         dev_name = utils.get_rand_name()
+495         device = namespace.ip_wrapper.add_dummy(dev_name)
+496         self.addCleanup(self._safe_delete_device, device)
+497         self._check_for_device_name(namespace.ip_wrapper, dev_name, True)
+498         device.link.delete()
+499         self._check_for_device_name(namespace.ip_wrapper, dev_name, False)
+500 
+501     def test_set_link_mtu(self):
+502         attr = self.generate_device_details()
+503         device = self.manage_device(attr)
+504         device.link.set_mtu(1450)
+505 
+506         self.assertEqual(1450, device.link.mtu)
+507 
+508         # Check if proper exception will be raised when wrong MTU value is
+509         # provided
+510         self.assertRaises(ip_lib.InvalidArgument, device.link.set_mtu, 1)
+511 
+512     def test_set_link_allmulticast_on(self):
+513         attr = self.generate_device_details()
+514         device = self.manage_device(attr)
+515 
+516         self.assertFalse(device.link.allmulticast)
+517         device.link.set_allmulticast_on()
+518         self.assertTrue(device.link.allmulticast)
+519 
+520     def test_set_link_netns(self):
+521         attr = self.generate_device_details()
+522         device = self.manage_device(attr)
+523         original_namespace = device.namespace
+524         original_ip_wrapper = ip_lib.IPWrapper(namespace=original_namespace)
+525         new_namespace = self.useFixture(net_helpers.NamespaceFixture())
+526 
+527         device.link.set_netns(new_namespace.name)
+528 
+529         self.assertEqual(new_namespace.name, device.namespace)
+530         self._check_for_device_name(
+531             new_namespace.ip_wrapper, device.name, True)
+532         self._check_for_device_name(
+533             original_ip_wrapper, device.name, False)
+534 
+535     def test_set_link_name(self):
+536         attr = self.generate_device_details()
+537         device = self.manage_device(attr)
+538         ip_wrapper = ip_lib.IPWrapper(namespace=device.namespace)
+539         original_name = device.name
+540         new_name = utils.get_rand_name()
+541 
+542         # device has to be DOWN to rename it
+543         device.link.set_down()
+544         device.link.set_name(new_name)
+545 
+546         self.assertEqual(new_name, device.name)
+547         self._check_for_device_name(ip_wrapper, new_name, True)
+548         self._check_for_device_name(ip_wrapper, original_name, False)
+549 
+550     def test_set_link_alias(self):
+551         attr = self.generate_device_details()
+552         device = self.manage_device(attr)
+553         alias = utils.get_rand_name()
+554 
+555         device.link.set_alias(alias)
+556 
+557         self.assertEqual(alias, device.link.alias)
+558 
+559     def _add_and_check_ips(self, device, ip_addresses):
+560         for cidr, scope, expected_broadcast in ip_addresses:
+561             # For IPv4 address add_broadcast flag will be set to True only
+562             # if expected_broadcast is given.
+563             # For IPv6 add_broadcast flag can be set to True always but
+564             # broadcast address will not be set, so expected_broadcast for
+565             # IPv6 should be always given as None.
+566             add_broadcast = True
+567             if cidr.version == constants.IP_VERSION_4:
+568                 add_broadcast = bool(expected_broadcast)
+569             device.addr.add(str(cidr), scope, add_broadcast)
+570 
+571         device_ips_info = [
+572             (netaddr.IPNetwork(ip_info['cidr']),
+573              ip_info['scope'],
+574              ip_info['broadcast']) for
+575             ip_info in device.addr.list()]
+576         self.assertItemsEqual(ip_addresses, device_ips_info)
+577 
+578     def _flush_ips(self, device, ip_version):
+579         device.addr.flush(ip_version)
+580         for ip_address in device.addr.list():
+581             cidr = netaddr.IPNetwork(ip_address['cidr'])
+582             self.assertNotEqual(ip_version, cidr.version)
+583 
+584     def test_add_ip_address(self):
+585         ip_addresses = [
+586             (netaddr.IPNetwork("10.10.10.10/30"), "global", '10.10.10.11'),
+587             (netaddr.IPNetwork("11.11.11.11/28"), "link", None),
+588             (netaddr.IPNetwork("2801::1/120"), "global", None),
+589             (netaddr.IPNetwork("fe80::/64"), "link", None)]
+590         attr = self.generate_device_details(ip_cidrs=[])
+591         device = self.manage_device(attr)
+592         self._add_and_check_ips(device, ip_addresses)
+593 
+594         # Now let's check if adding already existing IP address will raise
+595         # RuntimeError
+596         ip_address = ip_addresses[0]
+597         self.assertRaises(RuntimeError,
+598                           device.addr.add, str(ip_address[0]), ip_address[1])
+599 
+600     def test_delete_ip_address(self):
+601         attr = self.generate_device_details()
+602         cidr = attr.ip_cidrs[0]
+603         device = self.manage_device(attr)
+604 
+605         device_cidrs = [ip_info['cidr'] for ip_info in device.addr.list()]
+606         self.assertIn(cidr, device_cidrs)
+607 
+608         device.addr.delete(cidr)
+609         device_cidrs = [ip_info['cidr'] for ip_info in device.addr.list()]
+610         self.assertNotIn(cidr, device_cidrs)
+611 
+612         # Try to delete not existing IP address, it should be just fine and
+613         # finish without any error raised
+614         device.addr.delete(cidr)
+615 
+616     def test_flush_ip_addresses(self):
+617         ip_addresses = [
+618             (netaddr.IPNetwork("10.10.10.10/30"), "global", '10.10.10.11'),
+619             (netaddr.IPNetwork("11.11.11.11/28"), "link", None),
+620             (netaddr.IPNetwork("2801::1/120"), "global", None),
+621             (netaddr.IPNetwork("fe80::/64"), "link", None)]
+622         attr = self.generate_device_details(ip_cidrs=[])
+623         device = self.manage_device(attr)
+624 
+625         self._add_and_check_ips(device, ip_addresses)
+626         self._flush_ips(device, constants.IP_VERSION_4)
+627         self._flush_ips(device, constants.IP_VERSION_6)
+628 
+629 
+630 class TestSetIpNonlocalBind(functional_base.BaseSudoTestCase):
+631     def test_assigned_value(self):
+632         namespace = self.useFixture(net_helpers.NamespaceFixture())
+633         for expected in (0, 1):
+634             failed = ip_lib.set_ip_nonlocal_bind(expected, namespace.name)
+635             try:
+636                 observed = ip_lib.get_ip_nonlocal_bind(namespace.name)
+637             except RuntimeError as rte:
+638                 stat_message = (
+639                     'cannot stat /proc/sys/net/ipv4/ip_nonlocal_bind')
+640                 if stat_message in str(rte):
+641                     raise self.skipException(
+642                         "This kernel doesn't support %s in network "
+643                         "namespaces." % ip_lib.IP_NONLOCAL_BIND)
+644                 raise
+645 
+646             self.assertFalse(failed)
+647             self.assertEqual(expected, observed)
+648 
+649 
+650 class NamespaceTestCase(functional_base.BaseSudoTestCase):
+651 
+652     def setUp(self):
+653         super(NamespaceTestCase, self).setUp()
+654         self.namespace = 'test_ns_' + uuidutils.generate_uuid()
+655         ip_lib.create_network_namespace(self.namespace)
+656         self.addCleanup(self._delete_namespace)
+657 
+658     def _delete_namespace(self):
+659         ip_lib.delete_network_namespace(self.namespace)
+660 
+661     def test_network_namespace_exists_ns_exists(self):
+662         self.assertTrue(ip_lib.network_namespace_exists(self.namespace))
+663 
+664     def test_network_namespace_exists_ns_doesnt_exists(self):
+665         self.assertFalse(ip_lib.network_namespace_exists('another_ns'))
+666 
+667     def test_network_namespace_exists_ns_exists_try_is_ready(self):
+668         self.assertTrue(ip_lib.network_namespace_exists(self.namespace,
+669                                                         try_is_ready=True))
+670 
+671     def test_network_namespace_exists_ns_doesnt_exists_try_is_ready(self):
+672         self.assertFalse(ip_lib.network_namespace_exists('another_ns',
+673                                                          try_is_ready=True))
+674 
+675 
+676 class IpMonitorTestCase(testscenarios.WithScenarios,
+677                         functional_base.BaseLoggingTestCase):
+678 
+679     scenarios = [
+680         ('namespace', {'namespace': 'ns_' + uuidutils.generate_uuid()}),
+681         ('no_namespace', {'namespace': None})
+682     ]
+683 
+684     def setUp(self):
+685         super(IpMonitorTestCase, self).setUp()
+686         self.addCleanup(self._cleanup)
+687         if self.namespace:
+688             priv_ip_lib.create_netns(self.namespace)
+689         self.devices = [('int_' + uuidutils.generate_uuid())[
+690                         :constants.DEVICE_NAME_MAX_LEN] for _ in range(5)]
+691         self.ip_wrapper = ip_lib.IPWrapper(self.namespace)
+692         self.temp_file = self.get_temp_file_path('out_' + self.devices[0] +
+693                                                  '.tmp')
+694         self.proc = self._run_ip_monitor(ip_monitor)
+695 
+696     def _cleanup(self):
+697         self.proc.stop(block=True, kill_signal=signal.SIGTERM)
+698         if self.namespace:
+699             priv_ip_lib.remove_netns(self.namespace)
+700         else:
+701             for device in self.devices:
+702                 try:
+703                     priv_ip_lib.delete_interface(device, self.namespace)
+704                 except priv_ip_lib.NetworkInterfaceNotFound:
+705                     pass
+706 
+707     @staticmethod
+708     def _normalize_module_name(name):
+709         for suf in ['.pyc', '.pyo']:
+710             if name.endswith(suf):
+711                 return name[:-len(suf)] + '.py'
+712         return name
+713 
+714     def _run_ip_monitor(self, module):
+715         executable = self._normalize_module_name(module.__file__)
+716         proc = async_process.AsyncProcess(
+717             [executable, self.temp_file, str(self.namespace)],
+718             run_as_root=True)
+719         proc.start(block=True)
+720         return proc
+721 
+722     def _read_file(self, ip_addresses):
+723         try:
+724             registers = []
+725             with open(self.temp_file, 'r') as f:
+726                 data = f.read()
+727                 for line in data.splitlines():
+728                     register = jsonutils.loads(line)
+729                     registers.append({'name': register['name'],
+730                                       'cidr': register['cidr'],
+731                                       'event': register['event']})
+732             for ip_address in ip_addresses:
+733                 if ip_address not in registers:
+734                     return False
+735             return True
+736         except (OSError, IOError) as e:
+737             return False
+738 
+739     def _check_read_file(self, ip_addresses):
+740         try:
+741             utils.wait_until_true(lambda: self._read_file(ip_addresses),
+742                                   timeout=30)
+743         except utils.WaitTimeout:
+744             with open(self.temp_file, 'r') as f:
+745                 registers = f.read()
+746             self.fail('Defined IP addresses: %s, IP addresses registered: %s' %
+747                       (ip_addresses, registers))
+748 
+749     def _handle_ip_addresses(self, event, ip_addresses):
+750         for ip_address in (_ip for _ip in ip_addresses
+751                            if _ip['event'] == event):
+752             ip_device = ip_lib.IPDevice(ip_address['name'], self.namespace)
+753             if event == 'removed':
+754                 ip_device.addr.delete(ip_address['cidr'])
+755             if event == 'added':
+756                 ip_device.addr.add(ip_address['cidr'])
+757 
+758     def test_add_remove_ip_address_and_interface(self):
+759         for device in self.devices:
+760             self.ip_wrapper.add_dummy(device)
+761         utils.wait_until_true(lambda: self._read_file({}), timeout=30)
+762         ip_addresses = [
+763             {'cidr': '192.168.250.1/24', 'event': 'added',
+764              'name': self.devices[0]},
+765             {'cidr': '192.168.250.2/24', 'event': 'added',
+766              'name': self.devices[1]},
+767             {'cidr': '192.168.250.3/24', 'event': 'added',
+768              'name': self.devices[2]},
+769             {'cidr': '192.168.250.10/24', 'event': 'added',
+770              'name': self.devices[3]},
+771             {'cidr': '192.168.250.10/24', 'event': 'removed',
+772              'name': self.devices[3]},
+773             {'cidr': '2001:db8::1/64', 'event': 'added',
+774              'name': self.devices[4]},
+775             {'cidr': '2001:db8::2/64', 'event': 'added',
+776              'name': self.devices[4]}]
+777 
+778         self._handle_ip_addresses('added', ip_addresses)
+779         self._handle_ip_addresses('removed', ip_addresses)
+780         self._check_read_file(ip_addresses)
+781 
+782         ip_device = ip_lib.IPDevice(self.devices[4], self.namespace)
+783         ip_device.link.delete()
+784         ip_addresses = [
+785             {'cidr': '2001:db8::1/64', 'event': 'removed',
+786              'name': self.devices[4]},
+787             {'cidr': '2001:db8::2/64', 'event': 'removed',
+788              'name': self.devices[4]}]
+789         self._check_read_file(ip_addresses)
+790 
+791     def test_interface_added_after_initilization(self):
+792         for device in self.devices[:len(self.devices) - 1]:
+793             self.ip_wrapper.add_dummy(device)
+794         utils.wait_until_true(lambda: self._read_file({}), timeout=30)
+795         ip_addresses = [
+796             {'cidr': '192.168.250.21/24', 'event': 'added',
+797              'name': self.devices[0]},
+798             {'cidr': '192.168.250.22/24', 'event': 'added',
+799              'name': self.devices[1]}]
+800 
+801         self._handle_ip_addresses('added', ip_addresses)
+802         self._check_read_file(ip_addresses)
+803 
+804         self.ip_wrapper.add_dummy(self.devices[-1])
+805         ip_addresses.append({'cidr': '192.168.250.23/24', 'event': 'added',
+806                              'name': self.devices[-1]})
+807 
+808         self._handle_ip_addresses('added', [ip_addresses[-1]])
+809         self._check_read_file(ip_addresses)
+810 
+811 
+812 class IpRouteCommandTestCase(functional_base.BaseSudoTestCase):
+813 
+814     def setUp(self):
+815         super(IpRouteCommandTestCase, self).setUp()
+816         self.namespace = 'test_ns_' + uuidutils.generate_uuid()
+817         ip_lib.create_network_namespace(self.namespace)
+818         self.addCleanup(self._delete_namespace)
+819         ip_lib.IPWrapper(self.namespace).add_dummy('test_device')
+820         self.device = ip_lib.IPDevice('test_device', namespace=self.namespace)
+821         self.device.link.set_up()
+822         self.device_cidr_ipv4 = '192.168.100.1/24'
+823         self.device_cidr_ipv6 = '2020::1/64'
+824         self.device.addr.add(self.device_cidr_ipv4)
+825         self.device.addr.add(self.device_cidr_ipv6)
+826         self.cidrs = ['192.168.0.0/24', '10.0.0.0/8', '2001::/64', 'faaa::/96']
+827 
+828     def _delete_namespace(self):
+829         ip_lib.delete_network_namespace(self.namespace)
+830 
+831     def _assert_route(self, routes, table=None, source_prefix=None,
+832                       cidr=None, scope=None, via=None, metric=None):
+833         if cidr:
+834             ip_version = utils.get_ip_version(cidr)
+835         else:
+836             ip_version = utils.get_ip_version(via)
+837             cidr = constants.IP_ANY[ip_version]
+838         if constants.IP_VERSION_6 == ip_version:
+839             scope = ip_lib.IP_ADDRESS_SCOPE[0]
+840         elif not scope:
+841             scope = 'global' if via else 'link'
+842         if ip_version == constants.IP_VERSION_6 and not metric:
+843             metric = 1024
+844         table = table or iproute_linux.DEFAULT_TABLE
+845         table = ip_lib.IP_RULE_TABLES_NAMES.get(table, table)
+846         cmp = {'table': table,
+847                'cidr': cidr,
+848                'source_prefix': source_prefix,
+849                'scope': scope,
+850                'device': 'test_device',
+851                'via': via,
+852                'priority': metric}
+853         if cmp in routes:
+854             return True
+855         else:
+856             raise self.fail('Route not found: %s' % cmp)
+857 
+858     def test_add_route_table(self):
+859         tables = (None, 1, 253, 254, 255)
+860         for cidr in self.cidrs:
+861             for table in tables:
+862                 self.device.route.add_route(cidr, table=table)
+863                 ip_version = utils.get_ip_version(cidr)
+864                 routes = self.device.route.list_routes(ip_version,
+865                                                        table=table)
+866                 self._assert_route(routes, cidr=cidr, table=table)
+867 
+868     def test_add_route_via(self):
+869         gateway_ipv4 = str(netaddr.IPNetwork(self.device_cidr_ipv4).ip)
+870         gateway_ipv6 = str(netaddr.IPNetwork(self.device_cidr_ipv6).ip + 1)
+871         for cidr in self.cidrs:
+872             ip_version = utils.get_ip_version(cidr)
+873             gateway = (gateway_ipv4 if ip_version == constants.IP_VERSION_4
+874                        else gateway_ipv6)
+875             self.device.route.add_route(cidr, via=gateway)
+876             routes = self.device.route.list_routes(ip_version)
+877             self._assert_route(routes, cidr=cidr, via=gateway)
+878 
+879     def test_add_route_metric(self):
+880         metrics = (None, 1, 10, 255)
+881         for cidr in self.cidrs:
+882             for metric in metrics:
+883                 self.device.route.add_route(cidr, metric=metric)
+884                 ip_version = utils.get_ip_version(cidr)
+885                 routes = self.device.route.list_routes(ip_version)
+886                 self._assert_route(routes, cidr=cidr, metric=metric)
+887 
+888     def test_add_route_scope(self):
+889         for cidr in self.cidrs:
+890             for scope in ip_lib.IP_ADDRESS_SCOPE_NAME:
+891                 self.device.route.add_route(cidr, scope=scope)
+892                 ip_version = utils.get_ip_version(cidr)
+893                 routes = self.device.route.list_routes(ip_version)
+894                 self._assert_route(routes, cidr=cidr, scope=scope)
+895 
+896     def test_add_route_gateway(self):
+897         gateways = (str(netaddr.IPNetwork(self.device_cidr_ipv4).ip),
+898                     str(netaddr.IPNetwork(self.device_cidr_ipv6).ip + 1))
+899         for gateway in gateways:
+900             ip_version = utils.get_ip_version(gateway)
+901             self.device.route.add_gateway(gateway)
+902             routes = self.device.route.list_routes(ip_version)
+903             self._assert_route(routes, cidr=None, via=gateway,
+904                                scope='global')
+905 
+906     def test_list_onlink_routes_ipv4(self):
+907         cidr_ipv4 = []
+908         for cidr in self.cidrs:
+909             if utils.get_ip_version(cidr) == constants.IP_VERSION_4:
+910                 cidr_ipv4.append(cidr)
+911                 self.device.route.add_onlink_route(cidr)
+912 
+913         routes = self.device.route.list_onlink_routes(constants.IP_VERSION_4)
+914         self.assertEqual(len(cidr_ipv4), len(routes))
+915         for cidr in cidr_ipv4:
+916             self._assert_route(routes, cidr=cidr)
+917 
+918     def test_get_gateway(self):
+919         gateways = (str(netaddr.IPNetwork(self.device_cidr_ipv4).ip),
+920                     str(netaddr.IPNetwork(self.device_cidr_ipv6).ip + 1))
+921         scopes = ('global', 'site', 'link')
+922         metrics = (None, 1, 255)
+923         tables = (None, 1, 254, 255)
+924         for gateway, scope, metric, table in itertools.product(
+925                 gateways, scopes, metrics, tables):
+926             ip_version = utils.get_ip_version(gateway)
+927             self.device.route.add_gateway(gateway, scope=scope, metric=metric,
+928                                           table=table)
+929             self.assertEqual(gateway, self.device.route.get_gateway(
+930                 ip_version=ip_version, table=table)['via'])
+931             routes = self.device.route.list_routes(ip_version, table=table)
+932             self._assert_route(routes, cidr=None, via=gateway, scope=scope,
+933                                metric=metric, table=table)
+934             self.device.route.delete_gateway(gateway, table=table)

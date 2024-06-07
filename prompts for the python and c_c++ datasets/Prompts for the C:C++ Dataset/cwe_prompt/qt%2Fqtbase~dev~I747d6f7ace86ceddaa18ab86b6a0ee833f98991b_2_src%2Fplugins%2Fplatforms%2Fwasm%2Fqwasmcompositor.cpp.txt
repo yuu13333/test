@@ -1,0 +1,811 @@
+Please review the code below for security defects using the CWE (Common Weakness Enumeration) as a reference standard. If any are found, please describe the security defect in detail and indicate the corresponding line number of code and solution. If none are detected, state: 'No security defects are detected in the code'.
+
+1 /****************************************************************************
+2 **
+3 ** Copyright (C) 2018 The Qt Company Ltd.
+4 ** Contact: https://www.qt.io/licensing/
+5 **
+6 ** This file is part of the plugins of the Qt Toolkit.
+7 **
+8 ** $QT_BEGIN_LICENSE:GPL$
+9 ** Commercial License Usage
+10 ** Licensees holding valid commercial Qt licenses may use this file in
+11 ** accordance with the commercial license agreement provided with the
+12 ** Software or, alternatively, in accordance with the terms contained in
+13 ** a written agreement between you and The Qt Company. For licensing terms
+14 ** and conditions see https://www.qt.io/terms-conditions. For further
+15 ** information use the contact form at https://www.qt.io/contact-us.
+16 **
+17 ** GNU General Public License Usage
+18 ** Alternatively, this file may be used under the terms of the GNU
+19 ** General Public License version 3 or (at your option) any later version
+20 ** approved by the KDE Free Qt Foundation. The licenses are as published by
+21 ** the Free Software Foundation and appearing in the file LICENSE.GPL3
+22 ** included in the packaging of this file. Please review the following
+23 ** information to ensure the GNU General Public License requirements will
+24 ** be met: https://www.gnu.org/licenses/gpl-3.0.html.
+25 **
+26 ** $QT_END_LICENSE$
+27 **
+28 ****************************************************************************/
+29 
+30 #include "qwasmcompositor.h"
+31 #include "qwasmeventdispatcher.h"
+32 #include "qwasmwindow.h"
+33 #include "qwasmstylepixmaps_p.h"
+34 
+35 #include <QtOpenGL/qopengltexture.h>
+36 
+37 #include <QtGui/private/qwindow_p.h>
+38 #include <QtGui/qopenglcontext.h>
+39 #include <QtGui/qopenglfunctions.h>
+40 #include <QtGui/qoffscreensurface.h>
+41 #include <QtGui/qpainter.h>
+42 #include <private/qpixmapcache_p.h>
+43 
+44 #include <private/qguiapplication_p.h>
+45 
+46 #include <qpa/qwindowsysteminterface.h>
+47 #include <QtCore/qcoreapplication.h>
+48 #include <QtGui/qguiapplication.h>
+49 
+50 Q_GUI_EXPORT int qt_defaultDpiX();
+51 
+52 QWasmCompositedWindow::QWasmCompositedWindow()
+53     : window(nullptr)
+54     , parentWindow(nullptr)
+55     , flushPending(false)
+56     , visible(false)
+57 {
+58 }
+59 
+60 QWasmCompositor::QWasmCompositor(QWasmScreen *screen)
+61     :QObject(screen)
+62     , m_blitter(new QOpenGLTextureBlitter)
+63     , m_needComposit(false)
+64     , m_inFlush(false)
+65     , m_inResize(false)
+66     , m_isEnabled(true)
+67     , m_targetDevicePixelRatio(1)
+68 {
+69 }
+70 
+71 QWasmCompositor::~QWasmCompositor()
+72 {
+73     if (m_requestAnimationFrameId != -1)
+74         emscripten_cancel_animation_frame(m_requestAnimationFrameId);
+75     destroy();
+76 }
+77 
+78 void QWasmCompositor::destroy()
+79 {
+80     // Destroy OpenGL resources. This is done here in a separate function
+81     // which can be called while screen() still returns a valid screen
+82     // (which it might not, during destruction). A valid QScreen is
+83     // a requirement for QOffscreenSurface on Wasm since the native
+84     // context is tied to a single canvas.
+85     if (m_context) {
+86         QOffscreenSurface offScreenSurface(screen()->screen());
+87         offScreenSurface.setFormat(m_context->format());
+88         offScreenSurface.create();
+89         m_context->makeCurrent(&offScreenSurface);
+90         for (QWasmWindow *window : m_windowStack)
+91             window->destroy();
+92         m_blitter.reset(nullptr);
+93         m_context.reset(nullptr);
+94     }
+95 
+96     m_isEnabled = false; // prevent frame() from creating a new m_context
+97 }
+98 
+99 void QWasmCompositor::setEnabled(bool enabled)
+100 {
+101     m_isEnabled = enabled;
+102 }
+103 
+104 void QWasmCompositor::addWindow(QWasmWindow *window, QWasmWindow *parentWindow)
+105 {
+106     QWasmCompositedWindow compositedWindow;
+107     compositedWindow.window = window;
+108     compositedWindow.parentWindow = parentWindow;
+109     m_compositedWindows.insert(window, compositedWindow);
+110 
+111     if (parentWindow == 0)
+112         m_windowStack.append(window);
+113     else
+114         m_compositedWindows[parentWindow].childWindows.append(window);
+115 
+116     if (!QGuiApplication::focusWindow()) {
+117         window->requestActivateWindow();
+118     }
+119     notifyTopWindowChanged(window);
+120 }
+121 
+122 void QWasmCompositor::removeWindow(QWasmWindow *window)
+123 {
+124     QWasmWindow *platformWindow = m_compositedWindows[window].parentWindow;
+125 
+126     if (platformWindow) {
+127         QWasmWindow *parentWindow = window;
+128         m_compositedWindows[parentWindow].childWindows.removeAll(window);
+129     }
+130 
+131     m_windowStack.removeAll(window);
+132     m_compositedWindows.remove(window);
+133 
+134     if (!m_windowStack.isEmpty() && !QGuiApplication::focusWindow()) {
+135         auto lastWindow = m_windowStack.last();
+136         lastWindow->requestActivateWindow();
+137         notifyTopWindowChanged(lastWindow);
+138     }
+139 }
+140 
+141 void QWasmCompositor::setVisible(QWasmWindow *window, bool visible)
+142 {
+143     QWasmCompositedWindow &compositedWindow = m_compositedWindows[window];
+144     if (compositedWindow.visible == visible)
+145         return;
+146 
+147     compositedWindow.visible = visible;
+148     compositedWindow.flushPending = true;
+149     if (visible)
+150         compositedWindow.damage = compositedWindow.window->geometry();
+151     else
+152         m_globalDamage = compositedWindow.window->geometry(); // repaint previously covered area.
+153 
+154     requestUpdateWindow(window, QWasmCompositor::ExposeEventDelivery);
+155 }
+156 
+157 void QWasmCompositor::raise(QWasmWindow *window)
+158 {
+159     if (m_compositedWindows.size() <= 1)
+160         return;
+161 
+162     QWasmCompositedWindow &compositedWindow = m_compositedWindows[window];
+163     compositedWindow.damage = compositedWindow.window->geometry();
+164     m_windowStack.removeAll(window);
+165     m_windowStack.append(window);
+166 
+167     notifyTopWindowChanged(window);
+168 }
+169 
+170 void QWasmCompositor::lower(QWasmWindow *window)
+171 {
+172     if (m_compositedWindows.size() <= 1)
+173         return;
+174 
+175     m_windowStack.removeAll(window);
+176     m_windowStack.prepend(window);
+177     QWasmCompositedWindow &compositedWindow = m_compositedWindows[window];
+178     m_globalDamage = compositedWindow.window->geometry(); // repaint previously covered area.
+179 
+180     notifyTopWindowChanged(window);
+181 }
+182 
+183 void QWasmCompositor::setParent(QWasmWindow *window, QWasmWindow *parent)
+184 {
+185     m_compositedWindows[window].parentWindow = parent;
+186 
+187     requestUpdate();
+188 }
+189 
+190 int QWasmCompositor::windowCount() const
+191 {
+192     return m_windowStack.count();
+193 }
+194 
+195 QWindow *QWasmCompositor::windowAt(QPoint globalPoint, int padding) const
+196 {
+197     int index = m_windowStack.count() - 1;
+198     // qDebug() << "window at" << "point" << p << "window count" << index;
+199 
+200     while (index >= 0) {
+201         const QWasmCompositedWindow &compositedWindow = m_compositedWindows[m_windowStack.at(index)];
+202         //qDebug() << "windwAt testing" << compositedWindow.window <<
+203 
+204         QRect geometry = compositedWindow.window->windowFrameGeometry()
+205                          .adjusted(-padding, -padding, padding, padding);
+206 
+207         if (compositedWindow.visible && geometry.contains(globalPoint))
+208             return m_windowStack.at(index)->window();
+209         --index;
+210     }
+211 
+212     return 0;
+213 }
+214 
+215 QWindow *QWasmCompositor::keyWindow() const
+216 {
+217     return m_windowStack.at(m_windowStack.count() - 1)->window();
+218 }
+219 
+220 void QWasmCompositor::blit(QOpenGLTextureBlitter *blitter, QWasmScreen *screen, const QOpenGLTexture *texture, QRect targetGeometry)
+221 {
+222     QMatrix4x4 m;
+223     m.translate(-1.0f, -1.0f);
+224 
+225     m.scale(2.0f / (float)screen->geometry().width(),
+226             2.0f / (float)screen->geometry().height());
+227 
+228     m.translate((float)targetGeometry.width() / 2.0f,
+229                 (float)-targetGeometry.height() / 2.0f);
+230 
+231     m.translate(targetGeometry.x(), screen->geometry().height() - targetGeometry.y());
+232 
+233     m.scale(0.5f * (float)targetGeometry.width(),
+234             0.5f * (float)targetGeometry.height());
+235 
+236     blitter->blit(texture->textureId(), m, QOpenGLTextureBlitter::OriginTopLeft);
+237 }
+238 
+239 void QWasmCompositor::drawWindowContent(QOpenGLTextureBlitter *blitter, QWasmScreen *screen, QWasmWindow *window)
+240 {
+241     QWasmBackingStore *backingStore = window->backingStore();
+242     if (!backingStore)
+243         return;
+244 
+245     QOpenGLTexture const *texture = backingStore->getUpdatedTexture();
+246     QPoint windowCanvasPosition = window->geometry().topLeft() - screen->geometry().topLeft();
+247     QRect windowCanvasGeometry = QRect(windowCanvasPosition, window->geometry().size());
+248     blit(blitter, screen, texture, windowCanvasGeometry);
+249 }
+250 
+251 QPalette QWasmCompositor::makeWindowPalette()
+252 {
+253     QPalette palette;
+254     palette.setColor(QPalette::Active, QPalette::Highlight,
+255                      palette.color(QPalette::Active, QPalette::Highlight));
+256     palette.setColor(QPalette::Active, QPalette::Base,
+257                      palette.color(QPalette::Active, QPalette::Highlight));
+258     palette.setColor(QPalette::Inactive, QPalette::Highlight,
+259                      palette.color(QPalette::Inactive, QPalette::Dark));
+260     palette.setColor(QPalette::Inactive, QPalette::Base,
+261                      palette.color(QPalette::Inactive, QPalette::Dark));
+262     palette.setColor(QPalette::Inactive, QPalette::HighlightedText,
+263                      palette.color(QPalette::Inactive, QPalette::Window));
+264 
+265     return palette;
+266 }
+267 
+268 QRect QWasmCompositor::titlebarRect(QWasmTitleBarOptions tb, QWasmCompositor::SubControls subcontrol)
+269 {
+270     QRect ret;
+271     const int controlMargin = 2;
+272     const int controlHeight = tb.rect.height() - controlMargin *2;
+273     const int delta = controlHeight + controlMargin;
+274     int offset = 0;
+275 
+276     bool isMinimized = tb.state & Qt::WindowMinimized;
+277     bool isMaximized = tb.state & Qt::WindowMaximized;
+278 
+279     ret = tb.rect;
+280     switch (subcontrol) {
+281     case SC_TitleBarLabel:
+282         if (tb.flags & Qt::WindowSystemMenuHint)
+283             ret.adjust(delta, 0, -delta, 0);
+284         break;
+285     case SC_TitleBarCloseButton:
+286         if (tb.flags & Qt::WindowSystemMenuHint) {
+287             ret.adjust(0, 0, -delta, 0);
+288             offset += delta;
+289         }
+290         break;
+291     case SC_TitleBarMaxButton:
+292         if (!isMaximized && tb.flags & Qt::WindowMaximizeButtonHint) {
+293             ret.adjust(0, 0, -delta*2, 0);
+294             offset += (delta +delta);
+295         }
+296         break;
+297     case SC_TitleBarNormalButton:
+298         if (isMinimized && (tb.flags & Qt::WindowMinimizeButtonHint)) {
+299             offset += delta;
+300         } else if (isMaximized && (tb.flags & Qt::WindowMaximizeButtonHint)) {
+301             ret.adjust(0, 0, -delta*2, 0);
+302             offset += (delta +delta);
+303         }
+304         break;
+305     case SC_TitleBarSysMenu:
+306         if (tb.flags & Qt::WindowSystemMenuHint) {
+307             ret.setRect(tb.rect.left() + controlMargin, tb.rect.top() + controlMargin,
+308                         controlHeight, controlHeight);
+309         }
+310         break;
+311     default:
+312         break;
+313     };
+314 
+315     if (subcontrol != SC_TitleBarLabel && subcontrol != SC_TitleBarSysMenu) {
+316         ret.setRect(tb.rect.right() - offset, tb.rect.top() + controlMargin,
+317                     controlHeight, controlHeight);
+318     }
+319 
+320     if (qApp->layoutDirection() == Qt::LeftToRight)
+321         return ret;
+322 
+323     QRect rect = ret;
+324     rect.translate(2 * (tb.rect.right() - ret.right()) +
+325                    ret.width() - tb.rect.width(), 0);
+326 
+327     return rect;
+328 }
+329 
+330 void QWasmCompositor::requestUpdateAllWindows()
+331 {
+332     m_requestUpdateAllWindows = true;
+333     requestUpdate();
+334 }
+335 
+336 void QWasmCompositor::requestUpdateWindow(QWasmWindow *window, UpdateRequestDeliveryType updateType)
+337 {
+338     auto it = m_requestUpdateWindows.find(window);
+339     if (it == m_requestUpdateWindows.end()) {
+340         m_requestUpdateWindows.insert(window, updateType);
+341     } else {
+342         // Already registered, but upgrade ExposeEventDeliveryType to UpdateRequestDeliveryType.
+343         // if needed, to make sure QWindow::updateRequest's are matched.
+344         if (it.value() == ExposeEventDelivery && updateType == UpdateRequestDelivery)
+345             it.value() = UpdateRequestDelivery;
+346     }
+347 
+348     requestUpdate();
+349 }
+350 
+351 // Requests an upate/new frame using RequestAnimationFrame
+352 void QWasmCompositor::requestUpdate()
+353 {
+354     if (m_requestAnimationFrameId != -1)
+355         return;
+356 
+357     static auto frame = [](double frameTime, void *context) -> int {
+358         Q_UNUSED(frameTime);
+359         QWasmCompositor *compositor = reinterpret_cast<QWasmCompositor *>(context);
+360         compositor->m_requestAnimationFrameId = -1;
+361         compositor->deliverUpdateRequests();
+362         return 0;
+363     };
+364     m_requestAnimationFrameId = emscripten_request_animation_frame(frame, this);
+365 }
+366 
+367 void QWasmCompositor::deliverUpdateRequests()
+368 {
+369     // We may get new update requests during the window content update below:
+370     // prepare for recording the new update set by setting aside the current
+371     // update set.
+372     auto requestUpdateWindows = m_requestUpdateWindows;
+373     m_requestUpdateWindows.clear();
+374     bool requestUpdateAllWindows = m_requestUpdateAllWindows;
+375     m_requestUpdateAllWindows = false;
+376 
+377     // Update window content, either all windows or a spesific set of windows. Use the correct update
+378     // type: QWindow subclasses expect that requested and delivered updateRequests matches exactly.
+379     m_inDeliverUpdateRequest = true;
+380     if (requestUpdateAllWindows) {
+381         for (QWasmWindow *window : m_windowStack) {
+382             auto it = requestUpdateWindows.find(window);
+383             UpdateRequestDeliveryType updateType =
+384                 (it == m_requestUpdateWindows.end() ? ExposeEventDelivery : it.value());
+385             deliverUpdateRequest(window, updateType);
+386         }
+387     } else {
+388         for (auto it = requestUpdateWindows.constBegin(); it != requestUpdateWindows.constEnd(); ++it) {
+389             auto *window = it.key();
+390             UpdateRequestDeliveryType updateType = it.value();
+391             deliverUpdateRequest(window, updateType);
+392         }
+393     }
+394     m_inDeliverUpdateRequest = false;
+395 
+396     // Compose window content
+397     frame();
+398 }
+399 
+400 void QWasmCompositor::deliverUpdateRequest(QWasmWindow *window, UpdateRequestDeliveryType updateType)
+401 {
+402     // update by deliverUpdateRequest and expose event accordingly.
+403     if (updateType == UpdateRequestDelivery) {
+404         window->QPlatformWindow::deliverUpdateRequest();
+405     } else {
+406         QWindow *qwindow = window->window();
+407         QWindowSystemInterface::handleExposeEvent<QWindowSystemInterface::SynchronousDelivery>(
+408             qwindow, QRect(QPoint(0, 0), qwindow->geometry().size()));
+409     }
+410 }
+411 
+412 void QWasmCompositor::handleBackingStoreFlush()
+413 {
+414     // Request update to flush the updated backing store content,
+415     // unless we are currently processing an update, in which case
+416     // the new content will flushed as a part of that update.
+417     if (!m_inDeliverUpdateRequest)
+418         requestUpdate();
+419 }
+420 
+421 int dpiScaled(qreal value)
+422 {
+423     return value * (qreal(qt_defaultDpiX()) / 96.0);
+424 }
+425 
+426 QWasmCompositor::QWasmTitleBarOptions QWasmCompositor::makeTitleBarOptions(const QWasmWindow *window)
+427 {
+428     int width = window->windowFrameGeometry().width();
+429     int border = window->borderWidth();
+430 
+431     QWasmTitleBarOptions titleBarOptions;
+432 
+433     titleBarOptions.rect = QRect(border, border, width - 2 * border, window->titleHeight());
+434     titleBarOptions.flags = window->window()->flags();
+435     titleBarOptions.state = window->window()->windowState();
+436 
+437     bool isMaximized = titleBarOptions.state & Qt::WindowMaximized; // this gets reset when maximized
+438 
+439     if (titleBarOptions.flags & (Qt::WindowTitleHint))
+440         titleBarOptions.subControls |= SC_TitleBarLabel;
+441     if (titleBarOptions.flags & Qt::WindowMaximizeButtonHint) {
+442         if (isMaximized)
+443             titleBarOptions.subControls |= SC_TitleBarNormalButton;
+444         else
+445             titleBarOptions.subControls |= SC_TitleBarMaxButton;
+446     }
+447     if (titleBarOptions.flags & Qt::WindowSystemMenuHint) {
+448         titleBarOptions.subControls |= SC_TitleBarCloseButton;
+449         titleBarOptions.subControls |= SC_TitleBarSysMenu;
+450     }
+451 
+452 
+453     titleBarOptions.palette = QWasmCompositor::makeWindowPalette();
+454 
+455     if (window->window()->isActive())
+456         titleBarOptions.palette.setCurrentColorGroup(QPalette::Active);
+457     else
+458         titleBarOptions.palette.setCurrentColorGroup(QPalette::Inactive);
+459 
+460     if (window->activeSubControl() != QWasmCompositor::SC_None)
+461         titleBarOptions.subControls = window->activeSubControl();
+462 
+463     if (!window->window()->title().isEmpty())
+464         titleBarOptions.titleBarOptionsString = window->window()->title();
+465 
+466     titleBarOptions.windowIcon = window->window()->icon();
+467 
+468     return titleBarOptions;
+469 }
+470 
+471 void QWasmCompositor::drawWindowDecorations(QOpenGLTextureBlitter *blitter, QWasmScreen *screen, QWasmWindow *window)
+472 {
+473     int width = window->windowFrameGeometry().width();
+474     int height = window->windowFrameGeometry().height();
+475     qreal dpr = window->devicePixelRatio();
+476 
+477     QImage image(QSize(width * dpr, height * dpr), QImage::Format_RGB32);
+478     image.setDevicePixelRatio(dpr);
+479     QPainter painter(&image);
+480     painter.fillRect(QRect(0, 0, width, height), painter.background());
+481 
+482     QWasmTitleBarOptions titleBarOptions = makeTitleBarOptions(window);
+483 
+484     drawTitlebarWindow(titleBarOptions, &painter);
+485 
+486     QWasmFrameOptions frameOptions;
+487     frameOptions.rect = QRect(0, 0, width, height);
+488     frameOptions.lineWidth = dpiScaled(4.);
+489 
+490     drawFrameWindow(frameOptions, &painter);
+491 
+492     painter.end();
+493 
+494     QOpenGLTexture texture(QOpenGLTexture::Target2D);
+495     texture.setMinificationFilter(QOpenGLTexture::Nearest);
+496     texture.setMagnificationFilter(QOpenGLTexture::Nearest);
+497     texture.setWrapMode(QOpenGLTexture::ClampToEdge);
+498     texture.setData(image, QOpenGLTexture::DontGenerateMipMaps);
+499     texture.create();
+500     texture.bind();
+501 
+502     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, image.width(), image.height(), GL_RGBA, GL_UNSIGNED_BYTE,
+503                     image.constScanLine(0));
+504 
+505     blit(blitter, screen, &texture, QRect(window->windowFrameGeometry().topLeft(), QSize(width, height)));
+506 }
+507 
+508 void QWasmCompositor::drawFrameWindow(QWasmFrameOptions options, QPainter *painter)
+509 {
+510     int x = options.rect.x();
+511     int y = options.rect.y();
+512     int w = options.rect.width();
+513     int h = options.rect.height();
+514     const QColor &c1 = options.palette.light().color();
+515     const QColor &c2 = options.palette.shadow().color();
+516     const QColor &c3 = options.palette.midlight().color();
+517     const QColor &c4 = options.palette.dark().color();
+518     const QBrush *fill = nullptr;
+519 
+520     const qreal devicePixelRatio = painter->device()->devicePixelRatio();
+521     if (!qFuzzyCompare(devicePixelRatio, qreal(1))) {
+522         const qreal inverseScale = qreal(1) / devicePixelRatio;
+523         painter->scale(inverseScale, inverseScale);
+524         x = qRound(devicePixelRatio * x);
+525         y = qRound(devicePixelRatio * y);
+526         w = qRound(devicePixelRatio * w);
+527         h = qRound(devicePixelRatio * h);
+528     }
+529 
+530     QPen oldPen = painter->pen();
+531     QPoint a[3] = { QPoint(x, y+h-2), QPoint(x, y), QPoint(x+w-2, y) };
+532     painter->setPen(c1);
+533     painter->drawPolyline(a, 3);
+534     QPoint b[3] = { QPoint(x, y+h-1), QPoint(x+w-1, y+h-1), QPoint(x+w-1, y) };
+535     painter->setPen(c2);
+536     painter->drawPolyline(b, 3);
+537     if (w > 4 && h > 4) {
+538         QPoint c[3] = { QPoint(x+1, y+h-3), QPoint(x+1, y+1), QPoint(x+w-3, y+1) };
+539         painter->setPen(c3);
+540         painter->drawPolyline(c, 3);
+541         QPoint d[3] = { QPoint(x+1, y+h-2), QPoint(x+w-2, y+h-2), QPoint(x+w-2, y+1) };
+542         painter->setPen(c4);
+543         painter->drawPolyline(d, 3);
+544         if (fill)
+545             painter->fillRect(QRect(x+2, y+2, w-4, h-4), *fill);
+546     }
+547     painter->setPen(oldPen);
+548 }
+549 
+550 //from commonstyle.cpp
+551 static QPixmap cachedPixmapFromXPM(const char * const *xpm)
+552 {
+553     QPixmap result;
+554     const QString tag = QString::asprintf("xpm:0x%p", static_cast<const void*>(xpm));
+555     if (!QPixmapCache::find(tag, &result)) {
+556         result = QPixmap(xpm);
+557         QPixmapCache::insert(tag, result);
+558     }
+559     return result;
+560 }
+561 
+562 void QWasmCompositor::drawItemPixmap(QPainter *painter, const QRect &rect, int alignment,
+563                                       const QPixmap &pixmap) const
+564 {
+565     qreal scale = pixmap.devicePixelRatio();
+566     QSize size =  pixmap.size() / scale;
+567     int x = rect.x();
+568     int y = rect.y();
+569     int w = size.width();
+570     int h = size.height();
+571     if ((alignment & Qt::AlignVCenter) == Qt::AlignVCenter)
+572         y += rect.size().height()/2 - h/2;
+573     else if ((alignment & Qt::AlignBottom) == Qt::AlignBottom)
+574         y += rect.size().height() - h;
+575     if ((alignment & Qt::AlignRight) == Qt::AlignRight)
+576         x += rect.size().width() - w;
+577     else if ((alignment & Qt::AlignHCenter) == Qt::AlignHCenter)
+578         x += rect.size().width()/2 - w/2;
+579 
+580     QRect aligned = QRect(x, y, w, h);
+581     QRect inter = aligned.intersected(rect);
+582 
+583     painter->drawPixmap(inter.x(), inter.y(), pixmap, inter.x() - aligned.x(), inter.y() - aligned.y(), inter.width() * scale, inter.height() *scale);
+584 }
+585 
+586 
+587 void QWasmCompositor::drawTitlebarWindow(QWasmTitleBarOptions tb, QPainter *painter)
+588 {
+589     QRect ir;
+590     if (tb.subControls.testFlag(SC_TitleBarLabel)) {
+591         QColor left = tb.palette.highlight().color();
+592         QColor right = tb.palette.base().color();
+593 
+594         QBrush fillBrush(left);
+595         if (left != right) {
+596             QPoint p1(tb.rect.x(), tb.rect.top() + tb.rect.height()/2);
+597             QPoint p2(tb.rect.right(), tb.rect.top() + tb.rect.height()/2);
+598             QLinearGradient lg(p1, p2);
+599             lg.setColorAt(0, left);
+600             lg.setColorAt(1, right);
+601             fillBrush = lg;
+602         }
+603 
+604         painter->fillRect(tb.rect, fillBrush);
+605         ir = titlebarRect(tb, SC_TitleBarLabel);
+606         painter->setPen(tb.palette.highlightedText().color());
+607         painter->drawText(ir.x() + 2, ir.y(), ir.width() - 2, ir.height(),
+608                           Qt::AlignLeft | Qt::AlignVCenter | Qt::TextSingleLine, tb.titleBarOptionsString);
+609     } // SC_TitleBarLabel
+610 
+611     QPixmap pixmap;
+612 
+613     if (tb.subControls.testFlag(SC_TitleBarCloseButton)
+614             && tb.flags & Qt::WindowSystemMenuHint) {
+615         ir = titlebarRect(tb, SC_TitleBarCloseButton);
+616         pixmap = cachedPixmapFromXPM(qt_close_xpm).scaled(QSize(10, 10));
+617         drawItemPixmap(painter, ir, Qt::AlignCenter, pixmap);
+618     } //SC_TitleBarCloseButton
+619 
+620     if (tb.subControls.testFlag(SC_TitleBarMaxButton)
+621             && tb.flags & Qt::WindowMaximizeButtonHint
+622             && !(tb.state & Qt::WindowMaximized)) {
+623         ir = titlebarRect(tb, SC_TitleBarMaxButton);
+624         pixmap = cachedPixmapFromXPM(qt_maximize_xpm).scaled(QSize(10, 10));
+625         drawItemPixmap(painter, ir, Qt::AlignCenter, pixmap);
+626     } //SC_TitleBarMaxButton
+627 
+628     bool drawNormalButton = (tb.subControls & SC_TitleBarNormalButton)
+629             && (((tb.flags & Qt::WindowMinimizeButtonHint)
+630                  && (tb.flags & Qt::WindowMinimized))
+631                 || ((tb.flags & Qt::WindowMaximizeButtonHint)
+632                     && (tb.flags & Qt::WindowMaximized)));
+633 
+634     if (drawNormalButton) {
+635         ir = titlebarRect(tb, SC_TitleBarNormalButton);
+636         pixmap = cachedPixmapFromXPM(qt_normalizeup_xpm).scaled( QSize(10, 10));
+637 
+638         drawItemPixmap(painter, ir, Qt::AlignCenter, pixmap);
+639     } // SC_TitleBarNormalButton
+640 
+641     if (tb.subControls & SC_TitleBarSysMenu && tb.flags & Qt::WindowSystemMenuHint) {
+642         ir = titlebarRect(tb, SC_TitleBarSysMenu);
+643         if (!tb.windowIcon.isNull()) {
+644             tb.windowIcon.paint(painter, ir, Qt::AlignCenter);
+645         } else {
+646             pixmap = cachedPixmapFromXPM(qt_menu_xpm).scaled(QSize(10, 10));
+647             drawItemPixmap(painter, ir, Qt::AlignCenter, pixmap);
+648         }
+649     }
+650 }
+651 
+652 void QWasmCompositor::drawShadePanel(QWasmTitleBarOptions options, QPainter *painter)
+653 {
+654     int lineWidth = 1;
+655     QPalette palette = options.palette;
+656     const QBrush *fill = &options.palette.brush(QPalette::Button);
+657 
+658     int x = options.rect.x();
+659     int y = options.rect.y();
+660     int w = options.rect.width();
+661     int h = options.rect.height();
+662 
+663     const qreal devicePixelRatio = painter->device()->devicePixelRatio();
+664     if (!qFuzzyCompare(devicePixelRatio, qreal(1))) {
+665         const qreal inverseScale = qreal(1) / devicePixelRatio;
+666         painter->scale(inverseScale, inverseScale);
+667 
+668         x = qRound(devicePixelRatio * x);
+669         y = qRound(devicePixelRatio * y);
+670         w = qRound(devicePixelRatio * w);
+671         h = qRound(devicePixelRatio * h);
+672         lineWidth = qRound(devicePixelRatio * lineWidth);
+673     }
+674 
+675     QColor shade = palette.dark().color();
+676     QColor light = palette.light().color();
+677 
+678     if (fill) {
+679         if (fill->color() == shade)
+680             shade = palette.shadow().color();
+681         if (fill->color() == light)
+682             light = palette.midlight().color();
+683     }
+684     QPen oldPen = painter->pen();
+685     QList<QLineF> lines;
+686     lines.reserve(2*lineWidth);
+687 
+688     painter->setPen(light);
+689     int x1, y1, x2, y2;
+690     int i;
+691     x1 = x;
+692     y1 = y2 = y;
+693     x2 = x + w - 2;
+694     for (i = 0; i < lineWidth; i++)                // top shadow
+695         lines << QLineF(x1, y1++, x2--, y2++);
+696 
+697     x2 = x1;
+698     y1 = y + h - 2;
+699     for (i = 0; i < lineWidth; i++)               // left shado
+700         lines << QLineF(x1++, y1, x2++, y2--);
+701 
+702     painter->drawLines(lines);
+703     lines.clear();
+704     painter->setPen(shade);
+705     x1 = x;
+706     y1 = y2 = y+h-1;
+707     x2 = x+w-1;
+708     for (i=0; i<lineWidth; i++) {                // bottom shadow
+709         lines << QLineF(x1++, y1--, x2, y2--);
+710     }
+711     x1 = x2;
+712     y1 = y;
+713     y2 = y + h - lineWidth - 1;
+714     for (i = 0; i < lineWidth; i++)                // right shadow
+715         lines << QLineF(x1--, y1++, x2--, y2);
+716 
+717     painter->drawLines(lines);
+718     if (fill)                                // fill with fill color
+719         painter->fillRect(x+lineWidth, y+lineWidth, w-lineWidth*2, h-lineWidth*2, *fill);
+720     painter->setPen(oldPen);                        // restore pen
+721 
+722 }
+723 
+724 void QWasmCompositor::drawWindow(QOpenGLTextureBlitter *blitter, QWasmScreen *screen, QWasmWindow *window)
+725 {
+726     if (window->window()->type() != Qt::Popup && !(window->m_windowState & Qt::WindowFullScreen))
+727         drawWindowDecorations(blitter, screen, window);
+728     drawWindowContent(blitter, screen, window);
+729 }
+730 
+731 void QWasmCompositor::frame()
+732 {
+733     if (!m_isEnabled || m_windowStack.empty() || !screen())
+734         return;
+735 
+736     QWasmWindow *someWindow = nullptr;
+737 
+738     for (QWasmWindow *window : qAsConst(m_windowStack)) {
+739         if (window->window()->surfaceClass() == QSurface::Window
+740                 && qt_window_private(static_cast<QWindow *>(window->window()))->receivedExpose) {
+741             someWindow = window;
+742             break;
+743         }
+744     }
+745 
+746     if (!someWindow)
+747         return;
+748 
+749     if (m_context.isNull()) {
+750         m_context.reset(new QOpenGLContext());
+751         m_context->setFormat(someWindow->window()->requestedFormat());
+752         m_context->setScreen(screen()->screen());
+753         m_context->create();
+754     }
+755 
+756     bool ok = m_context->makeCurrent(someWindow->window());
+757     if (!ok)
+758         return;
+759 
+760     if (!m_blitter->isCreated())
+761         m_blitter->create();
+762 
+763     qreal dpr = screen()->devicePixelRatio();
+764     glViewport(0, 0, screen()->geometry().width() * dpr, screen()->geometry().height() * dpr);
+765 
+766     m_context->functions()->glClearColor(0.2, 0.2, 0.2, 1.0);
+767     m_context->functions()->glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+768 
+769     m_blitter->bind();
+770     m_blitter->setRedBlueSwizzle(true);
+771 
+772     for (QWasmWindow *window : qAsConst(m_windowStack)) {
+773         QWasmCompositedWindow &compositedWindow = m_compositedWindows[window];
+774 
+775         if (!compositedWindow.visible)
+776             continue;
+777 
+778         drawWindow(m_blitter.data(), screen(), window);
+779     }
+780 
+781     m_blitter->release();
+782 
+783     if (someWindow && someWindow->window()->surfaceType() == QSurface::OpenGLSurface)
+784         m_context->swapBuffers(someWindow->window());
+785 }
+786 
+787 void QWasmCompositor::notifyTopWindowChanged(QWasmWindow *window)
+788 {
+789     QWindow *modalWindow;
+790     bool blocked = QGuiApplicationPrivate::instance()->isWindowBlocked(window->window(), &modalWindow);
+791 
+792     if (blocked) {
+793         modalWindow->requestActivate();
+794         raise(static_cast<QWasmWindow*>(modalWindow->handle()));
+795         return;
+796     }
+797 
+798     requestUpdate();
+799 }
+800 
+801 QWasmScreen *QWasmCompositor::screen()
+802 {
+803     return static_cast<QWasmScreen *>(parent());
+804 }
+805 
+806 QOpenGLContext *QWasmCompositor::context()
+807 {
+808     return m_context.data();
+809 }

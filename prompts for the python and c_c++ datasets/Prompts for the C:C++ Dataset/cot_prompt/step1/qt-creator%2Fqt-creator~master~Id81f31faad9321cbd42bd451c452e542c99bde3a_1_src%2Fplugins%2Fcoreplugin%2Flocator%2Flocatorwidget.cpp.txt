@@ -1,0 +1,1042 @@
+Based on the given code from a commit, please generate supplementary code files according to the commit message.
+####commit message
+Prevent locator widgets from running in parallel
+
+We make a promise to locator filters that their prepareSearch() and
+matchesFor() methods are never run in parallel, and never more than a
+single matchesFor() call is running at the same time.
+
+This broke with the introduction of multiple locator widgets (in
+multiple windows).
+
+Extend the existing code that makes a locator widget "wait" for a
+running search to cancel and finish, to wait for any locator widget to
+cancel and finish. Introduce a shared future watcher for that purpose.
+
+Change-Id: Id81f31faad9321cbd42bd451c452e542c99bde3a
+
+####code 
+1 /****************************************************************************
+2 **
+3 ** Copyright (C) 2016 The Qt Company Ltd.
+4 ** Contact: https://www.qt.io/licensing/
+5 **
+6 ** This file is part of Qt Creator.
+7 **
+8 ** Commercial License Usage
+9 ** Licensees holding valid commercial Qt licenses may use this file in
+10 ** accordance with the commercial license agreement provided with the
+11 ** Software or, alternatively, in accordance with the terms contained in
+12 ** a written agreement between you and The Qt Company. For licensing terms
+13 ** and conditions see https://www.qt.io/terms-conditions. For further
+14 ** information use the contact form at https://www.qt.io/contact-us.
+15 **
+16 ** GNU General Public License Usage
+17 ** Alternatively, this file may be used under the terms of the GNU
+18 ** General Public License version 3 as published by the Free Software
+19 ** Foundation with exceptions as appearing in the file LICENSE.GPL3-EXCEPT
+20 ** included in the packaging of this file. Please review the following
+21 ** information to ensure the GNU General Public License requirements will
+22 ** be met: https://www.gnu.org/licenses/gpl-3.0.html.
+23 **
+24 ****************************************************************************/
+25 
+26 #include "locatorwidget.h"
+27 
+28 #include "ilocatorfilter.h"
+29 #include "locator.h"
+30 #include "locatorconstants.h"
+31 #include "locatorsearchutils.h"
+32 
+33 #include <coreplugin/icore.h>
+34 #include <coreplugin/modemanager.h>
+35 #include <coreplugin/actionmanager/actionmanager.h>
+36 #include <coreplugin/fileiconprovider.h>
+37 #include <coreplugin/icontext.h>
+38 #include <coreplugin/mainwindow.h>
+39 #include <utils/algorithm.h>
+40 #include <utils/appmainwindow.h>
+41 #include <utils/fancylineedit.h>
+42 #include <utils/highlightingitemdelegate.h>
+43 #include <utils/hostosinfo.h>
+44 #include <utils/itemviews.h>
+45 #include <utils/progressindicator.h>
+46 #include <utils/qtcassert.h>
+47 #include <utils/runextensions.h>
+48 #include <utils/stylehelper.h>
+49 #include <utils/utilsicons.h>
+50 
+51 #include <QAction>
+52 #include <QApplication>
+53 #include <QColor>
+54 #include <QEvent>
+55 #include <QFileInfo>
+56 #include <QHBoxLayout>
+57 #include <QHeaderView>
+58 #include <QKeyEvent>
+59 #include <QMenu>
+60 #include <QScreen>
+61 #include <QScrollBar>
+62 #include <QTimer>
+63 #include <QToolTip>
+64 #include <QTreeView>
+65 
+66 Q_DECLARE_METATYPE(Core::LocatorFilterEntry)
+67 
+68 using namespace Utils;
+69 
+70 const int LocatorEntryRole = int(HighlightingItemRole::User);
+71 
+72 namespace Core {
+73 namespace Internal {
+74 
+75 QFutureWatcher<void> LocatorWidget::m_sharedWatcher;
+76 LocatorWidget *LocatorWidget::m_sharedWatcherOrigin = nullptr;
+77 
+78 /* A model to represent the Locator results. */
+79 class LocatorModel : public QAbstractListModel
+80 {
+81 public:
+82 
+83     enum Columns {
+84         DisplayNameColumn,
+85         ExtraInfoColumn,
+86         ColumnCount
+87     };
+88 
+89     LocatorModel(QObject *parent = nullptr)
+90         : QAbstractListModel(parent)
+91         , mBackgroundColor(Utils::creatorTheme()->color(Utils::Theme::TextColorHighlightBackground))
+92         , mForegroundColor(Utils::creatorTheme()->color(Utils::Theme::TextColorNormal))
+93     {}
+94 
+95     void clear();
+96     int rowCount(const QModelIndex &parent = QModelIndex()) const override;
+97     int columnCount(const QModelIndex &parent = QModelIndex()) const override;
+98     QVariant data(const QModelIndex &index, int role = Qt::DisplayRole) const override;
+99 
+100     void addEntries(const QList<LocatorFilterEntry> &entries);
+101 
+102 private:
+103     mutable QList<LocatorFilterEntry> mEntries;
+104     bool hasExtraInfo = false;
+105     QColor mBackgroundColor;
+106     QColor mForegroundColor;
+107 };
+108 
+109 class CompletionDelegate : public HighlightingItemDelegate
+110 {
+111 public:
+112     CompletionDelegate(QObject *parent);
+113 
+114     QSize sizeHint(const QStyleOptionViewItem &option, const QModelIndex &index) const override;
+115 };
+116 
+117 class CompletionList : public Utils::TreeView
+118 {
+119 public:
+120     CompletionList(QWidget *parent = nullptr);
+121 
+122     void setModel(QAbstractItemModel *model) override;
+123 
+124     void resizeHeaders();
+125 
+126     void next();
+127     void previous();
+128 
+129     void showCurrentItemToolTip();
+130 
+131     void keyPressEvent(QKeyEvent *event) override;
+132     bool eventFilter(QObject *watched, QEvent *event) override;
+133 
+134 private:
+135     QMetaObject::Connection m_updateSizeConnection;
+136 };
+137 
+138 class TopLeftLocatorPopup final : public LocatorPopup
+139 {
+140 public:
+141     TopLeftLocatorPopup(LocatorWidget *locatorWidget)
+142         : LocatorPopup(locatorWidget, locatorWidget) {
+143         doUpdateGeometry();
+144     }
+145 
+146 protected:
+147     void doUpdateGeometry() override;
+148     void inputLostFocus() override;
+149 };
+150 
+151 class CenteredLocatorPopup final : public LocatorPopup
+152 {
+153 public:
+154     CenteredLocatorPopup(LocatorWidget *locatorWidget, QWidget *parent)
+155         : LocatorPopup(locatorWidget, parent) {
+156         doUpdateGeometry();
+157     }
+158 
+159 protected:
+160     void doUpdateGeometry() override;
+161 };
+162 
+163 // =========== LocatorModel ===========
+164 
+165 void LocatorModel::clear()
+166 {
+167     beginResetModel();
+168     mEntries.clear();
+169     hasExtraInfo = false;
+170     endResetModel();
+171 }
+172 
+173 int LocatorModel::rowCount(const QModelIndex & parent) const
+174 {
+175     if (parent.isValid())
+176         return 0;
+177     return mEntries.size();
+178 }
+179 
+180 int LocatorModel::columnCount(const QModelIndex &parent) const
+181 {
+182     if (parent.isValid())
+183         return 0;
+184     return hasExtraInfo ? ColumnCount : 1;
+185 }
+186 
+187 QVariant LocatorModel::data(const QModelIndex &index, int role) const
+188 {
+189     if (!index.isValid() || index.row() >= mEntries.size())
+190         return QVariant();
+191 
+192     switch (role) {
+193     case Qt::DisplayRole:
+194         if (index.column() == DisplayNameColumn)
+195             return mEntries.at(index.row()).displayName;
+196         else if (index.column() == ExtraInfoColumn)
+197             return mEntries.at(index.row()).extraInfo;
+198         break;
+199     case Qt::ToolTipRole:
+200         if (mEntries.at(index.row()).extraInfo.isEmpty())
+201             return QVariant(mEntries.at(index.row()).displayName);
+202         else
+203             return QVariant(mEntries.at(index.row()).displayName
+204                             + "\n\n" + mEntries.at(index.row()).extraInfo);
+205         break;
+206     case Qt::DecorationRole:
+207         if (index.column() == DisplayNameColumn) {
+208             LocatorFilterEntry &entry = mEntries[index.row()];
+209             if (!entry.displayIcon && !entry.fileName.isEmpty())
+210                 entry.displayIcon = FileIconProvider::icon(QFileInfo(entry.fileName));
+211             return entry.displayIcon ? entry.displayIcon.value() : QIcon();
+212         }
+213         break;
+214     case Qt::ForegroundRole:
+215         if (index.column() == ExtraInfoColumn)
+216             return QColor(Qt::darkGray);
+217         break;
+218     case LocatorEntryRole:
+219         return QVariant::fromValue(mEntries.at(index.row()));
+220     case int(HighlightingItemRole::StartColumn):
+221     case int(HighlightingItemRole::Length): {
+222         LocatorFilterEntry &entry = mEntries[index.row()];
+223         const int highlightColumn = entry.highlightInfo.dataType == LocatorFilterEntry::HighlightInfo::DisplayName
+224                                                                  ? DisplayNameColumn
+225                                                                  : ExtraInfoColumn;
+226         if (highlightColumn == index.column()) {
+227             const bool startIndexRole = role == int(HighlightingItemRole::StartColumn);
+228             return startIndexRole ? QVariant::fromValue(entry.highlightInfo.starts)
+229                                   : QVariant::fromValue(entry.highlightInfo.lengths);
+230         }
+231         break;
+232     }
+233     case int(HighlightingItemRole::Background):
+234         return mBackgroundColor;
+235     case int(HighlightingItemRole::Foreground):
+236         return mForegroundColor;
+237     }
+238 
+239     return QVariant();
+240 }
+241 
+242 void LocatorModel::addEntries(const QList<LocatorFilterEntry> &entries)
+243 {
+244     beginInsertRows(QModelIndex(), mEntries.size(), mEntries.size() + entries.size() - 1);
+245     mEntries.append(entries);
+246     endInsertRows();
+247     if (hasExtraInfo)
+248         return;
+249     if (Utils::anyOf(entries, [](const LocatorFilterEntry &e) { return !e.extraInfo.isEmpty();})) {
+250         beginInsertColumns(QModelIndex(), 1, 1);
+251         hasExtraInfo = true;
+252         endInsertColumns();
+253     }
+254 }
+255 
+256 // =========== CompletionList ===========
+257 
+258 CompletionList::CompletionList(QWidget *parent)
+259     : Utils::TreeView(parent)
+260 {
+261     // on macOS and Windows the popup doesn't really get focus, so fake the selection color
+262     // which would then just be a very light gray, but should look as if it had focus
+263     QPalette p = palette();
+264     p.setBrush(QPalette::Inactive,
+265                QPalette::Highlight,
+266                p.brush(QPalette::Normal, QPalette::Highlight));
+267     setPalette(p);
+268 
+269     setItemDelegate(new CompletionDelegate(this));
+270     setRootIsDecorated(false);
+271     setUniformRowHeights(true);
+272     header()->hide();
+273     header()->setStretchLastSection(true);
+274     // This is too slow when done on all results
+275     //header()->setSectionResizeMode(QHeaderView::ResizeToContents);
+276     if (Utils::HostOsInfo::isMacHost()) {
+277         if (horizontalScrollBar())
+278             horizontalScrollBar()->setAttribute(Qt::WA_MacMiniSize);
+279         if (verticalScrollBar())
+280             verticalScrollBar()->setAttribute(Qt::WA_MacMiniSize);
+281     }
+282     installEventFilter(this);
+283 }
+284 
+285 void CompletionList::setModel(QAbstractItemModel *newModel)
+286 {
+287     const auto updateSize = [this] {
+288         if (model() && model()->rowCount() > 0) {
+289             const QSize shint = sizeHintForIndex(model()->index(0, 0));
+290             setFixedHeight(shint.height() * 17 + frameWidth() * 2);
+291             disconnect(m_updateSizeConnection);
+292         }
+293     };
+294 
+295     if (model()) {
+296         disconnect(model(), nullptr, this, nullptr);
+297     }
+298     QTreeView::setModel(newModel);
+299     if (newModel) {
+300         connect(newModel, &QAbstractItemModel::columnsInserted,
+301                 this, &CompletionList::resizeHeaders);
+302         m_updateSizeConnection = connect(newModel, &QAbstractItemModel::rowsInserted,
+303                                          this, updateSize);
+304     }
+305 }
+306 
+307 void LocatorPopup::doUpdateGeometry()
+308 {
+309     m_tree->resizeHeaders();
+310 }
+311 
+312 void TopLeftLocatorPopup::doUpdateGeometry()
+313 {
+314     QTC_ASSERT(parentWidget(), return);
+315     const QSize size = preferredSize();
+316     const int border = m_tree->frameWidth();
+317     const QRect rect(parentWidget()->mapToGlobal(QPoint(-border, -size.height() - border)), size);
+318     setGeometry(rect);
+319     LocatorPopup::doUpdateGeometry();
+320 }
+321 
+322 void CenteredLocatorPopup::doUpdateGeometry()
+323 {
+324     QTC_ASSERT(parentWidget(), return);
+325     const QSize size = preferredSize();
+326     const QSize parentSize = parentWidget()->size();
+327     const QPoint local((parentSize.width() - size.width()) / 2,
+328                         parentSize.height() / 2 - size.height());
+329     const QPoint pos = parentWidget()->mapToGlobal(local);
+330     QRect rect(pos, size);
+331     // invisible widget doesn't have the right screen set yet, so use the parent widget to
+332     // check for available geometry
+333     const QRect available = parentWidget()->screen()->availableGeometry();
+334     if (rect.right() > available.right())
+335         rect.moveRight(available.right());
+336     if (rect.bottom() > available.bottom())
+337         rect.moveBottom(available.bottom());
+338     if (rect.top() < available.top())
+339         rect.moveTop(available.top());
+340     if (rect.left() < available.left())
+341         rect.moveLeft(available.left());
+342     setGeometry(rect);
+343     LocatorPopup::doUpdateGeometry();
+344 }
+345 
+346 void LocatorPopup::updateWindow()
+347 {
+348     QWidget *w = parentWidget() ? parentWidget()->window() : nullptr;
+349     if (m_window != w) {
+350         if (m_window)
+351             m_window->removeEventFilter(this);
+352         m_window = w;
+353         if (m_window)
+354             m_window->installEventFilter(this);
+355     }
+356 }
+357 
+358 bool LocatorPopup::event(QEvent *event)
+359 {
+360     if (event->type() == QEvent::ParentChange)
+361         updateWindow();
+362     else if (event->type() == QEvent::Show)
+363         // make sure the popup has correct position before it becomes visible
+364         doUpdateGeometry();
+365     else if (event->type() == QEvent::LayoutRequest)
+366         // completion list resizes after first items are shown --> LayoutRequest
+367         QMetaObject::invokeMethod(this, &LocatorPopup::doUpdateGeometry, Qt::QueuedConnection);
+368     return QWidget::event(event);
+369 }
+370 
+371 bool LocatorPopup::eventFilter(QObject *watched, QEvent *event)
+372 {
+373     if (watched == m_window && event->type() == QEvent::Resize)
+374         doUpdateGeometry();
+375     return QWidget::eventFilter(watched, event);
+376 }
+377 
+378 QSize LocatorPopup::preferredSize()
+379 {
+380     static const int MIN_WIDTH = 730;
+381     const QSize windowSize = m_window ? m_window->size() : QSize(MIN_WIDTH, 0);
+382 
+383     const int width = qMax(MIN_WIDTH, windowSize.width() * 2 / 3);
+384     return QSize(width, sizeHint().height());
+385 }
+386 
+387 void TopLeftLocatorPopup::inputLostFocus()
+388 {
+389     if (!isActiveWindow())
+390         hide();
+391 }
+392 
+393 void LocatorPopup::inputLostFocus()
+394 {
+395 }
+396 
+397 void CompletionList::resizeHeaders()
+398 {
+399     header()->resizeSection(0, width() / 2);
+400     header()->resizeSection(1, 0); // last section is auto resized because of stretchLastSection
+401 }
+402 
+403 LocatorPopup::LocatorPopup(LocatorWidget *locatorWidget, QWidget *parent)
+404     : QWidget(parent),
+405       m_tree(new CompletionList(this)),
+406       m_inputWidget(locatorWidget)
+407 {
+408     if (Utils::HostOsInfo::isMacHost())
+409         m_tree->setFrameStyle(QFrame::NoFrame); // tool tip already includes a frame
+410     m_tree->setModel(locatorWidget->model());
+411 
+412     auto layout = new QVBoxLayout;
+413     layout->setSizeConstraint(QLayout::SetMinimumSize);
+414     setLayout(layout);
+415     layout->setContentsMargins(0, 0, 0, 0);
+416     layout->setSpacing(0);
+417     layout->addWidget(m_tree);
+418 
+419     connect(locatorWidget, &LocatorWidget::parentChanged, this, &LocatorPopup::updateWindow);
+420     connect(locatorWidget, &LocatorWidget::showPopup, this, &LocatorPopup::show);
+421     connect(locatorWidget, &LocatorWidget::hidePopup, this, &LocatorPopup::close);
+422     connect(locatorWidget, &LocatorWidget::lostFocus, this, &LocatorPopup::inputLostFocus,
+423             Qt::QueuedConnection);
+424     connect(locatorWidget, &LocatorWidget::selectRow, m_tree, [this](int row) {
+425         m_tree->setCurrentIndex(m_tree->model()->index(row, 0));
+426     });
+427     connect(locatorWidget, &LocatorWidget::showCurrentItemToolTip,
+428             m_tree, &CompletionList::showCurrentItemToolTip);
+429     connect(locatorWidget, &LocatorWidget::handleKey, this, [this](QKeyEvent *keyEvent) {
+430         QApplication::sendEvent(m_tree, keyEvent);
+431     }, Qt::DirectConnection); // must be handled directly before event is deleted
+432     connect(m_tree, &QAbstractItemView::activated, locatorWidget,
+433             [this, locatorWidget](const QModelIndex &index) {
+434                 if (isVisible())
+435                     locatorWidget->scheduleAcceptEntry(index);
+436             });
+437 }
+438 
+439 CompletionList *LocatorPopup::completionList() const
+440 {
+441     return m_tree;
+442 }
+443 
+444 LocatorWidget *LocatorPopup::inputWidget() const
+445 {
+446     return m_inputWidget;
+447 }
+448 
+449 void LocatorPopup::focusOutEvent(QFocusEvent *event) {
+450     if (event->reason() == Qt::ActiveWindowFocusReason)
+451         hide();
+452     QWidget::focusOutEvent(event);
+453 }
+454 
+455 void CompletionList::next() {
+456     int index = currentIndex().row();
+457     ++index;
+458     if (index >= model()->rowCount(QModelIndex())) {
+459         // wrap
+460         index = 0;
+461     }
+462     setCurrentIndex(model()->index(index, 0));
+463 }
+464 
+465 void CompletionList::previous() {
+466     int index = currentIndex().row();
+467     --index;
+468     if (index < 0) {
+469         // wrap
+470         index = model()->rowCount(QModelIndex()) - 1;
+471     }
+472     setCurrentIndex(model()->index(index, 0));
+473 }
+474 
+475 void CompletionList::showCurrentItemToolTip()
+476 {
+477     QTC_ASSERT(model(), return);
+478     if (!isVisible())
+479         return;
+480     const QModelIndex index = currentIndex();
+481     if (index.isValid()) {
+482         QToolTip::showText(mapToGlobal(pos() + visualRect(index).topRight()),
+483                            model()->data(index, Qt::ToolTipRole).toString());
+484     }
+485 }
+486 
+487 void CompletionList::keyPressEvent(QKeyEvent *event)
+488 {
+489     switch (event->key()) {
+490     case Qt::Key_Tab:
+491     case Qt::Key_Down:
+492         next();
+493         return;
+494     case Qt::Key_Backtab:
+495     case Qt::Key_Up:
+496         previous();
+497         return;
+498     case Qt::Key_P:
+499     case Qt::Key_N:
+500         if (event->modifiers() == Qt::KeyboardModifiers(Utils::HostOsInfo::controlModifier())) {
+501             if (event->key() == Qt::Key_P)
+502                 previous();
+503             else
+504                 next();
+505             return;
+506         }
+507         break;
+508     case Qt::Key_Return:
+509     case Qt::Key_Enter:
+510         // emit activated even if current index is not valid
+511         // if there are no results yet, this allows activating the first entry when it is available
+512         // (see LocatorWidget::addSearchResults)
+513         if (event->modifiers() == 0) {
+514             emit activated(currentIndex());
+515             return;
+516         }
+517         break;
+518     }
+519     Utils::TreeView::keyPressEvent(event);
+520 }
+521 
+522 bool CompletionList::eventFilter(QObject *watched, QEvent *event)
+523 {
+524     if (watched == this && event->type() == QEvent::ShortcutOverride) {
+525         auto ke = static_cast<QKeyEvent *>(event);
+526         switch (ke->key()) {
+527         case Qt::Key_Escape:
+528             if (!ke->modifiers()) {
+529                 event->accept();
+530                 return true;
+531             }
+532             break;
+533         case Qt::Key_P:
+534         case Qt::Key_N:
+535             if (ke->modifiers() == Qt::KeyboardModifiers(Utils::HostOsInfo::controlModifier())) {
+536                 event->accept();
+537                 return true;
+538             }
+539             break;
+540         }
+541     }
+542     return Utils::TreeView::eventFilter(watched, event);
+543 }
+544 
+545 // =========== LocatorWidget ===========
+546 
+547 LocatorWidget::LocatorWidget(Locator *locator) :
+548     m_locatorModel(new LocatorModel(this)),
+549     m_filterMenu(new QMenu(this)),
+550     m_refreshAction(new QAction(tr("Refresh"), this)),
+551     m_configureAction(new QAction(ICore::msgShowOptionsDialog(), this)),
+552     m_fileLineEdit(new Utils::FancyLineEdit)
+553 {
+554     setAttribute(Qt::WA_Hover);
+555     setFocusProxy(m_fileLineEdit);
+556     resize(200, 90);
+557     QSizePolicy sizePolicy(QSizePolicy::MinimumExpanding, QSizePolicy::Preferred);
+558     sizePolicy.setHorizontalStretch(0);
+559     sizePolicy.setVerticalStretch(0);
+560     setSizePolicy(sizePolicy);
+561     setMinimumSize(QSize(200, 0));
+562 
+563     auto layout = new QHBoxLayout(this);
+564     setLayout(layout);
+565     layout->setContentsMargins(0, 0, 0, 0);
+566     layout->addWidget(m_fileLineEdit);
+567 
+568     const QIcon icon = Utils::Icons::MAGNIFIER.icon();
+569     m_fileLineEdit->setFiltering(true);
+570     m_fileLineEdit->setButtonIcon(Utils::FancyLineEdit::Left, icon);
+571     m_fileLineEdit->setButtonToolTip(Utils::FancyLineEdit::Left, tr("Options"));
+572     m_fileLineEdit->setFocusPolicy(Qt::ClickFocus);
+573     m_fileLineEdit->setButtonVisible(Utils::FancyLineEdit::Left, true);
+574     // We set click focus since otherwise you will always get two popups
+575     m_fileLineEdit->setButtonFocusPolicy(Utils::FancyLineEdit::Left, Qt::ClickFocus);
+576     m_fileLineEdit->setAttribute(Qt::WA_MacShowFocusRect, false);
+577 
+578     m_fileLineEdit->installEventFilter(this);
+579     this->installEventFilter(this);
+580 
+581     m_filterMenu->addAction(m_refreshAction);
+582     m_filterMenu->addAction(m_configureAction);
+583 
+584     m_fileLineEdit->setButtonMenu(Utils::FancyLineEdit::Left, m_filterMenu);
+585 
+586     connect(m_refreshAction, &QAction::triggered, locator, [locator]() {
+587         locator->refresh(Locator::filters());
+588     });
+589     connect(m_configureAction, &QAction::triggered, this, &LocatorWidget::showConfigureDialog);
+590     connect(m_fileLineEdit, &QLineEdit::textChanged,
+591         this, &LocatorWidget::showPopupDelayed);
+592 
+593     m_entriesWatcher = new QFutureWatcher<LocatorFilterEntry>(this);
+594     connect(m_entriesWatcher, &QFutureWatcher<LocatorFilterEntry>::resultsReadyAt,
+595             this, &LocatorWidget::addSearchResults);
+596     connect(m_entriesWatcher, &QFutureWatcher<LocatorFilterEntry>::finished,
+597             this, &LocatorWidget::handleSearchFinished);
+598 
+599     m_showPopupTimer.setInterval(100);
+600     m_showPopupTimer.setSingleShot(true);
+601     connect(&m_showPopupTimer, &QTimer::timeout, this, &LocatorWidget::showPopupNow);
+602 
+603     m_progressIndicator = new Utils::ProgressIndicator(Utils::ProgressIndicatorSize::Small,
+604                                                        m_fileLineEdit);
+605     m_progressIndicator->raise();
+606     m_progressIndicator->hide();
+607     m_showProgressTimer.setSingleShot(true);
+608     m_showProgressTimer.setInterval(50); // don't show progress for < 50ms tasks
+609     connect(&m_showProgressTimer, &QTimer::timeout, [this]() { setProgressIndicatorVisible(true);});
+610 
+611     Command *locateCmd = ActionManager::command(Constants::LOCATE);
+612     if (QTC_GUARD(locateCmd)) {
+613         connect(locateCmd, &Command::keySequenceChanged, this, [this,locateCmd] {
+614             updatePlaceholderText(locateCmd);
+615         });
+616         updatePlaceholderText(locateCmd);
+617     }
+618 
+619     connect(qApp, &QApplication::focusChanged, this, &LocatorWidget::updatePreviousFocusWidget);
+620 
+621     connect(locator, &Locator::filtersChanged, this, &LocatorWidget::updateFilterList);
+622     connect(locator, &Locator::aboutToShutdownOccurred, this, [this]() {
+623         m_shuttingDown = true;
+624         if (m_entriesWatcher->isRunning()) {
+625             m_entriesWatcher->cancel();
+626             m_entriesWatcher->waitForFinished();
+627         }
+628     });
+629     updateFilterList();
+630 }
+631 
+632 void LocatorWidget::updatePlaceholderText(Command *command)
+633 {
+634     QTC_ASSERT(command, return);
+635     if (command->keySequence().isEmpty())
+636         m_fileLineEdit->setPlaceholderText(tr("Type to locate"));
+637     else
+638         m_fileLineEdit->setPlaceholderText(tr("Type to locate (%1)").arg(
+639                                         command->keySequence().toString(QKeySequence::NativeText)));
+640 }
+641 
+642 void LocatorWidget::updateFilterList()
+643 {
+644     m_filterMenu->clear();
+645     const QList<ILocatorFilter *> filters = Locator::filters();
+646     for (ILocatorFilter *filter : filters) {
+647         Command *cmd = ActionManager::command(filter->actionId());
+648         if (cmd)
+649             m_filterMenu->addAction(cmd->action());
+650     }
+651     m_filterMenu->addSeparator();
+652     m_filterMenu->addAction(m_refreshAction);
+653     m_filterMenu->addAction(m_configureAction);
+654 }
+655 
+656 bool LocatorWidget::isInMainWindow() const
+657 {
+658     return window() == ICore::mainWindow();
+659 }
+660 
+661 void LocatorWidget::updatePreviousFocusWidget(QWidget *previous, QWidget *current)
+662 {
+663     const auto isInLocator = [this](QWidget *w) { return w == this || isAncestorOf(w); };
+664     if (isInLocator(current) && !isInLocator(previous))
+665         m_previousFocusWidget = previous;
+666 }
+667 
+668 static void resetFocus(QPointer<QWidget> previousFocus, bool isInMainWindow)
+669 {
+670     if (previousFocus) {
+671         previousFocus->setFocus();
+672         ICore::raiseWindow(previousFocus);
+673     } else if (isInMainWindow) {
+674         ModeManager::setFocusToCurrentMode();
+675     }
+676 }
+677 
+678 bool LocatorWidget::eventFilter(QObject *obj, QEvent *event)
+679 {
+680     if (obj == m_fileLineEdit && event->type() == QEvent::ShortcutOverride) {
+681         auto keyEvent = static_cast<QKeyEvent *>(event);
+682         switch (keyEvent->key()) {
+683         case Qt::Key_P:
+684         case Qt::Key_N:
+685             if (keyEvent->modifiers() == Qt::KeyboardModifiers(Utils::HostOsInfo::controlModifier())) {
+686                 event->accept();
+687                 return true;
+688             }
+689         }
+690     } else if (obj == m_fileLineEdit && event->type() == QEvent::KeyPress) {
+691         if (m_possibleToolTipRequest)
+692             m_possibleToolTipRequest = false;
+693         if (QToolTip::isVisible())
+694             QToolTip::hideText();
+695 
+696         auto keyEvent = static_cast<QKeyEvent *>(event);
+697         switch (keyEvent->key()) {
+698         case Qt::Key_PageUp:
+699         case Qt::Key_PageDown:
+700         case Qt::Key_Down:
+701         case Qt::Key_Tab:
+702         case Qt::Key_Up:
+703         case Qt::Key_Backtab:
+704             emit showPopup();
+705             emit handleKey(keyEvent);
+706             return true;
+707         case Qt::Key_Home:
+708         case Qt::Key_End:
+709             if (Utils::HostOsInfo::isMacHost()
+710                     != (keyEvent->modifiers() == Qt::KeyboardModifiers(Qt::ControlModifier))) {
+711                 emit showPopup();
+712                 emit handleKey(keyEvent);
+713                 return true;
+714             }
+715             break;
+716         case Qt::Key_Enter:
+717         case Qt::Key_Return:
+718             emit handleKey(keyEvent);
+719             return true;
+720         case Qt::Key_Escape:
+721             emit hidePopup();
+722             return true;
+723         case Qt::Key_Alt:
+724             if (keyEvent->modifiers() == Qt::AltModifier) {
+725                 m_possibleToolTipRequest = true;
+726                 return true;
+727             }
+728             break;
+729         case Qt::Key_P:
+730         case Qt::Key_N:
+731             if (keyEvent->modifiers() == Qt::KeyboardModifiers(Utils::HostOsInfo::controlModifier())) {
+732                 emit showPopup();
+733                 emit handleKey(keyEvent);
+734                 return true;
+735             }
+736             break;
+737         default:
+738             break;
+739         }
+740     } else if (obj == m_fileLineEdit && event->type() == QEvent::KeyRelease) {
+741         auto keyEvent = static_cast<QKeyEvent *>(event);
+742         if (m_possibleToolTipRequest) {
+743             m_possibleToolTipRequest = false;
+744             if ((keyEvent->key() == Qt::Key_Alt)
+745                     && (keyEvent->modifiers() == Qt::NoModifier)) {
+746                 emit showCurrentItemToolTip();
+747                 return true;
+748             }
+749         }
+750     } else if (obj == m_fileLineEdit && event->type() == QEvent::FocusOut) {
+751         emit lostFocus();
+752     } else if (obj == m_fileLineEdit && event->type() == QEvent::FocusIn) {
+753         auto fev = static_cast<QFocusEvent *>(event);
+754         if (fev->reason() != Qt::ActiveWindowFocusReason)
+755             showPopupNow();
+756     } else if (obj == this && event->type() == QEvent::ParentChange) {
+757         emit parentChanged();
+758     } else if (obj == this && event->type() == QEvent::ShortcutOverride) {
+759         auto ke = static_cast<QKeyEvent *>(event);
+760         switch (ke->key()) {
+761         case Qt::Key_Escape:
+762             if (!ke->modifiers()) {
+763                 event->accept();
+764                 QMetaObject::invokeMethod(this, [focus = m_previousFocusWidget,
+765                                           isInMainWindow = isInMainWindow()] {
+766                     resetFocus(focus, isInMainWindow);
+767                 }, Qt::QueuedConnection);
+768                 return true;
+769             }
+770             break;
+771         case Qt::Key_Alt:
+772             if (ke->modifiers() == Qt::AltModifier) {
+773                 event->accept();
+774                 return true;
+775             }
+776             break;
+777         default:
+778             break;
+779         }
+780     }
+781     return QWidget::eventFilter(obj, event);
+782 }
+783 
+784 void LocatorWidget::showPopupDelayed()
+785 {
+786     m_updateRequested = true;
+787     m_showPopupTimer.start();
+788 }
+789 
+790 void LocatorWidget::showPopupNow()
+791 {
+792     m_showPopupTimer.stop();
+793     updateCompletionList(m_fileLineEdit->text());
+794     emit showPopup();
+795 }
+796 
+797 QList<ILocatorFilter *> LocatorWidget::filtersFor(const QString &text, QString &searchText)
+798 {
+799     const int length = text.size();
+800     int firstNonSpace;
+801     for (firstNonSpace = 0; firstNonSpace < length; ++firstNonSpace) {
+802         if (!text.at(firstNonSpace).isSpace())
+803             break;
+804     }
+805     const int whiteSpace = text.indexOf(QChar::Space, firstNonSpace);
+806     const QList<ILocatorFilter *> filters = Utils::filtered(Locator::filters(),
+807                                                             &ILocatorFilter::isEnabled);
+808     if (whiteSpace >= 0) {
+809         const QString prefix = text.mid(firstNonSpace, whiteSpace - firstNonSpace).toLower();
+810         QList<ILocatorFilter *> prefixFilters;
+811         for (ILocatorFilter *filter : filters) {
+812             if (prefix == filter->shortcutString()) {
+813                 searchText = text.mid(whiteSpace).trimmed();
+814                 prefixFilters << filter;
+815             }
+816         }
+817         if (!prefixFilters.isEmpty())
+818             return prefixFilters;
+819     }
+820     searchText = text.trimmed();
+821     return Utils::filtered(filters, &ILocatorFilter::isIncludedByDefault);
+822 }
+823 
+824 void LocatorWidget::setProgressIndicatorVisible(bool visible)
+825 {
+826     if (!visible) {
+827         m_progressIndicator->hide();
+828         return;
+829     }
+830     const QSize iconSize = m_progressIndicator->sizeHint();
+831     m_progressIndicator->setGeometry(m_fileLineEdit->button(Utils::FancyLineEdit::Right)->geometry().x()
+832                                      - iconSize.width(),
+833                                      (m_fileLineEdit->height() - iconSize.height()) / 2 /*center*/,
+834                                      iconSize.width(),
+835                                      iconSize.height());
+836     m_progressIndicator->show();
+837 }
+838 
+839 void LocatorWidget::updateCompletionList(const QString &text)
+840 {
+841     if (m_shuttingDown)
+842         return;
+843 
+844     m_updateRequested = true;
+845     if (m_sharedWatcher.future().isRunning()) {
+846         // Cancel the old future. We may not just block the UI thread to wait for the search to
+847         // actually cancel.
+848         m_requestedCompletionText = text;
+849         if (m_sharedWatcherOrigin == this) {
+850             // This locator widget is currently running. Make handleSearchFinished trigger another
+851             // update.
+852             m_rerunAfterFinished = true;
+853         } else {
+854             // Another locator widget is running. Trigger another update when that is finished.
+855             m_sharedWatcher.disconnect(this);
+856             connect(&m_sharedWatcher, &QFutureWatcherBase::finished, this, [this] {
+857                 m_sharedWatcher.disconnect(this);
+858                 QMetaObject::invokeMethod(
+859                     this,
+860                     [this] {
+861                         const QString text = m_requestedCompletionText;
+862                         m_requestedCompletionText.clear();
+863                         updateCompletionList(text);
+864                     },
+865                     Qt::QueuedConnection);
+866             });
+867         }
+868         m_sharedWatcher.future().cancel();
+869         return;
+870     }
+871 
+872     m_showProgressTimer.start();
+873     m_needsClearResult = true;
+874     QString searchText;
+875     const QList<ILocatorFilter *> filters = filtersFor(text, searchText);
+876 
+877     for (ILocatorFilter *filter : filters)
+878         filter->prepareSearch(searchText);
+879     QFuture<LocatorFilterEntry> future = Utils::runAsync(&runSearch, filters, searchText);
+880     m_sharedWatcher.setFuture(future);
+881     m_sharedWatcherOrigin = this;
+882     m_entriesWatcher->setFuture(future);
+883 }
+884 
+885 void LocatorWidget::handleSearchFinished()
+886 {
+887     m_showProgressTimer.stop();
+888     setProgressIndicatorVisible(false);
+889     m_updateRequested = false;
+890     if (m_rowRequestedForAccept) {
+891         acceptEntry(m_rowRequestedForAccept.value());
+892         m_rowRequestedForAccept.reset();
+893         return;
+894     }
+895     if (m_rerunAfterFinished) {
+896         m_rerunAfterFinished = false;
+897         const QString text = m_requestedCompletionText;
+898         m_requestedCompletionText.clear();
+899         updateCompletionList(text);
+900         return;
+901     }
+902 
+903     if (m_needsClearResult) {
+904         m_locatorModel->clear();
+905         m_needsClearResult = false;
+906     }
+907 }
+908 
+909 void LocatorWidget::scheduleAcceptEntry(const QModelIndex &index)
+910 {
+911     if (m_updateRequested) {
+912         // don't just accept the selected entry, since the list is not up to date
+913         // accept will be called after the update finished
+914         m_rowRequestedForAccept = index.row();
+915         // do not wait for the rest of the search to finish
+916         m_entriesWatcher->future().cancel();
+917     } else {
+918         acceptEntry(index.row());
+919     }
+920 }
+921 
+922 void LocatorWidget::acceptEntry(int row)
+923 {
+924     if (row < 0 || row >= m_locatorModel->rowCount())
+925         return;
+926     const QModelIndex index = m_locatorModel->index(row, 0);
+927     if (!index.isValid())
+928         return;
+929     const LocatorFilterEntry entry = m_locatorModel->data(index, LocatorEntryRole).value<LocatorFilterEntry>();
+930     Q_ASSERT(entry.filter != nullptr);
+931     QString newText;
+932     int selectionStart = -1;
+933     int selectionLength = 0;
+934     QWidget *focusBeforeAccept = QApplication::focusWidget();
+935     entry.filter->accept(entry, &newText, &selectionStart, &selectionLength);
+936     if (newText.isEmpty()) {
+937         emit hidePopup();
+938         if (QApplication::focusWidget() == focusBeforeAccept)
+939             resetFocus(m_previousFocusWidget, isInMainWindow());
+940     } else {
+941         showText(newText, selectionStart, selectionLength);
+942     }
+943 }
+944 
+945 void LocatorWidget::showText(const QString &text, int selectionStart, int selectionLength)
+946 {
+947     if (!text.isEmpty())
+948         m_fileLineEdit->setText(text);
+949     m_fileLineEdit->setFocus();
+950     showPopupNow();
+951     ICore::raiseWindow(window());
+952 
+953     if (selectionStart >= 0) {
+954         m_fileLineEdit->setSelection(selectionStart, selectionLength);
+955         if (selectionLength == 0) // make sure the cursor is at the right position (Mac-vs.-rest difference)
+956             m_fileLineEdit->setCursorPosition(selectionStart);
+957     } else {
+958         m_fileLineEdit->selectAll();
+959     }
+960 }
+961 
+962 QString LocatorWidget::currentText() const
+963 {
+964     return m_fileLineEdit->text();
+965 }
+966 
+967 QAbstractItemModel *LocatorWidget::model() const
+968 {
+969     return m_locatorModel;
+970 }
+971 
+972 void LocatorWidget::showConfigureDialog()
+973 {
+974     ICore::showOptionsDialog(Constants::FILTER_OPTIONS_PAGE);
+975 }
+976 
+977 void LocatorWidget::addSearchResults(int firstIndex, int endIndex)
+978 {
+979     if (m_needsClearResult) {
+980         m_locatorModel->clear();
+981         m_needsClearResult = false;
+982     }
+983     const bool selectFirst = m_locatorModel->rowCount() == 0;
+984     QList<LocatorFilterEntry> entries;
+985     for (int i = firstIndex; i < endIndex; ++i)
+986         entries.append(m_entriesWatcher->resultAt(i));
+987     m_locatorModel->addEntries(entries);
+988     if (selectFirst) {
+989         emit selectRow(0);
+990         if (m_rowRequestedForAccept)
+991             m_rowRequestedForAccept = 0;
+992     }
+993 }
+994 
+995 LocatorWidget *createStaticLocatorWidget(Locator *locator)
+996 {
+997     auto widget = new LocatorWidget(locator);
+998     auto popup = new TopLeftLocatorPopup(widget); // owned by widget
+999     popup->setWindowFlags(Qt::ToolTip);
+1000     return widget;
+1001 }
+1002 
+1003 LocatorPopup *createLocatorPopup(Locator *locator, QWidget *parent)
+1004 {
+1005     auto widget = new LocatorWidget(locator);
+1006     auto popup = new CenteredLocatorPopup(widget, parent);
+1007     popup->layout()->addWidget(widget);
+1008     popup->setWindowFlags(Qt::Popup);
+1009     popup->setAttribute(Qt::WA_DeleteOnClose);
+1010     return popup;
+1011 }
+1012 
+1013 CompletionDelegate::CompletionDelegate(QObject *parent)
+1014     : HighlightingItemDelegate(0, parent)
+1015 {
+1016 }
+1017 
+1018 QSize CompletionDelegate::sizeHint(const QStyleOptionViewItem &option, const QModelIndex &index) const
+1019 {
+1020     return HighlightingItemDelegate::sizeHint(option, index) + QSize(0, 2);
+1021 }
+1022 
+1023 } // namespace Internal
+1024 } // namespace Core

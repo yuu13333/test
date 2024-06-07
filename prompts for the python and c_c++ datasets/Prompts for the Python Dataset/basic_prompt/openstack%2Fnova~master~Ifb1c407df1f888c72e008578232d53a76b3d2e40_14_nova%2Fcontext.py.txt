@@ -1,0 +1,567 @@
+Please review the code below to detect security defects. If any are found, please describe the security defect in detail and indicate the corresponding line number of code and solution. If none are found, please state '''No security defects are detected in the code'''.
+
+1 # Copyright 2011 OpenStack Foundation
+2 # Copyright 2010 United States Government as represented by the
+3 # Administrator of the National Aeronautics and Space Administration.
+4 # All Rights Reserved.
+5 #
+6 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
+7 #    not use this file except in compliance with the License. You may obtain
+8 #    a copy of the License at
+9 #
+10 #         http://www.apache.org/licenses/LICENSE-2.0
+11 #
+12 #    Unless required by applicable law or agreed to in writing, software
+13 #    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+14 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+15 #    License for the specific language governing permissions and limitations
+16 #    under the License.
+17 
+18 """RequestContext: context for requests that persist through all of nova."""
+19 
+20 from contextlib import contextmanager
+21 import copy
+22 import warnings
+23 
+24 import futurist
+25 import futurist.waiters
+26 from keystoneauth1.access import service_catalog as ksa_service_catalog
+27 from keystoneauth1 import plugin
+28 from oslo_context import context
+29 from oslo_db.sqlalchemy import enginefacade
+30 from oslo_log import log as logging
+31 from oslo_utils import timeutils
+32 import six
+33 
+34 from nova import exception
+35 from nova.i18n import _
+36 from nova import objects
+37 from nova import policy
+38 from nova import utils
+39 
+40 LOG = logging.getLogger(__name__)
+41 # TODO(melwitt): This cache should be cleared whenever WSGIService receives a
+42 # SIGHUP and periodically based on an expiration time. Currently, none of the
+43 # cell caches are purged, so neither is this one, for now.
+44 CELL_CACHE = {}
+45 # NOTE(melwitt): Used for the scatter-gather utility to indicate we timed out
+46 # waiting for a result from a cell.
+47 did_not_respond_sentinel = object()
+48 # FIXME(danms): Keep a global cache of the cells we find the
+49 # first time we look. This needs to be refreshed on a timer or
+50 # trigger.
+51 CELLS = []
+52 # Timeout value for waiting for cells to respond
+53 CELL_TIMEOUT = 60
+54 
+55 
+56 def create_executor():
+57     return futurist.ThreadPoolExecutor()
+58 
+59 
+60 EXECUTOR = create_executor()
+61 
+62 
+63 class _ContextAuthPlugin(plugin.BaseAuthPlugin):
+64     """A keystoneauth auth plugin that uses the values from the Context.
+65 
+66     Ideally we would use the plugin provided by auth_token middleware however
+67     this plugin isn't serialized yet so we construct one from the serialized
+68     auth data.
+69     """
+70 
+71     def __init__(self, auth_token, sc):
+72         super(_ContextAuthPlugin, self).__init__()
+73 
+74         self.auth_token = auth_token
+75         self.service_catalog = ksa_service_catalog.ServiceCatalogV2(sc)
+76 
+77     def get_token(self, *args, **kwargs):
+78         return self.auth_token
+79 
+80     def get_endpoint(self, session, service_type=None, interface=None,
+81                      region_name=None, service_name=None, **kwargs):
+82         return self.service_catalog.url_for(service_type=service_type,
+83                                             service_name=service_name,
+84                                             interface=interface,
+85                                             region_name=region_name)
+86 
+87 
+88 @enginefacade.transaction_context_provider
+89 class RequestContext(context.RequestContext):
+90     """Security context and request information.
+91 
+92     Represents the user taking a given action within the system.
+93 
+94     """
+95 
+96     def __init__(self, user_id=None, project_id=None, is_admin=None,
+97                  read_deleted="no", remote_address=None, timestamp=None,
+98                  quota_class=None, service_catalog=None,
+99                  user_auth_plugin=None, **kwargs):
+100         """:param read_deleted: 'no' indicates deleted records are hidden,
+101                 'yes' indicates deleted records are visible,
+102                 'only' indicates that *only* deleted records are visible.
+103 
+104            :param overwrite: Set to False to ensure that the greenthread local
+105                 copy of the index is not overwritten.
+106 
+107            :param instance_lock_checked: This is not used and will be removed
+108                 in a future release.
+109 
+110            :param user_auth_plugin: The auth plugin for the current request's
+111                 authentication data.
+112         """
+113         if user_id:
+114             kwargs['user_id'] = user_id
+115         if project_id:
+116             kwargs['project_id'] = project_id
+117 
+118         if kwargs.pop('instance_lock_checked', None) is not None:
+119             # TODO(mriedem): Let this be a hard failure in 19.0.0 (S).
+120             warnings.warn("The 'instance_lock_checked' kwarg to "
+121                           "nova.context.RequestContext is no longer used and "
+122                           "will be removed in a future version.")
+123 
+124         super(RequestContext, self).__init__(is_admin=is_admin, **kwargs)
+125 
+126         self.read_deleted = read_deleted
+127         self.remote_address = remote_address
+128         if not timestamp:
+129             timestamp = timeutils.utcnow()
+130         if isinstance(timestamp, six.string_types):
+131             timestamp = timeutils.parse_strtime(timestamp)
+132         self.timestamp = timestamp
+133 
+134         if service_catalog:
+135             # Only include required parts of service_catalog
+136             self.service_catalog = [s for s in service_catalog
+137                 if s.get('type') in ('image', 'block-storage', 'volumev3',
+138                                      'key-manager', 'placement', 'network')]
+139         else:
+140             # if list is empty or none
+141             self.service_catalog = []
+142 
+143         # NOTE(markmc): this attribute is currently only used by the
+144         # rs_limits turnstile pre-processor.
+145         # See https://lists.launchpad.net/openstack/msg12200.html
+146         self.quota_class = quota_class
+147 
+148         # NOTE(dheeraj): The following attributes are used by cellsv2 to store
+149         # connection information for connecting to the target cell.
+150         # It is only manipulated using the target_cell contextmanager
+151         # provided by this module
+152         self.db_connection = None
+153         self.mq_connection = None
+154         self.cell_uuid = None
+155 
+156         self.user_auth_plugin = user_auth_plugin
+157         if self.is_admin is None:
+158             self.is_admin = policy.check_is_admin(self)
+159 
+160     def get_auth_plugin(self):
+161         if self.user_auth_plugin:
+162             return self.user_auth_plugin
+163         else:
+164             return _ContextAuthPlugin(self.auth_token, self.service_catalog)
+165 
+166     def _get_read_deleted(self):
+167         return self._read_deleted
+168 
+169     def _set_read_deleted(self, read_deleted):
+170         if read_deleted not in ('no', 'yes', 'only'):
+171             raise ValueError(_("read_deleted can only be one of 'no', "
+172                                "'yes' or 'only', not %r") % read_deleted)
+173         self._read_deleted = read_deleted
+174 
+175     def _del_read_deleted(self):
+176         del self._read_deleted
+177 
+178     read_deleted = property(_get_read_deleted, _set_read_deleted,
+179                             _del_read_deleted)
+180 
+181     def to_dict(self):
+182         values = super(RequestContext, self).to_dict()
+183         # FIXME(dims): defensive hasattr() checks need to be
+184         # removed once we figure out why we are seeing stack
+185         # traces
+186         values.update({
+187             'user_id': getattr(self, 'user_id', None),
+188             'project_id': getattr(self, 'project_id', None),
+189             'is_admin': getattr(self, 'is_admin', None),
+190             'read_deleted': getattr(self, 'read_deleted', 'no'),
+191             'remote_address': getattr(self, 'remote_address', None),
+192             'timestamp': utils.strtime(self.timestamp) if hasattr(
+193                 self, 'timestamp') else None,
+194             'request_id': getattr(self, 'request_id', None),
+195             'quota_class': getattr(self, 'quota_class', None),
+196             'user_name': getattr(self, 'user_name', None),
+197             'service_catalog': getattr(self, 'service_catalog', None),
+198             'project_name': getattr(self, 'project_name', None),
+199         })
+200         # NOTE(tonyb): This can be removed once we're certain to have a
+201         # RequestContext contains 'is_admin_project', We can only get away with
+202         # this because we "know" the default value of 'is_admin_project' which
+203         # is very fragile.
+204         values.update({
+205             'is_admin_project': getattr(self, 'is_admin_project', True),
+206         })
+207         return values
+208 
+209     @classmethod
+210     def from_dict(cls, values):
+211         return super(RequestContext, cls).from_dict(
+212             values,
+213             user_id=values.get('user_id'),
+214             project_id=values.get('project_id'),
+215             # TODO(sdague): oslo.context has show_deleted, if
+216             # possible, we should migrate to that in the future so we
+217             # don't need to be different here.
+218             read_deleted=values.get('read_deleted', 'no'),
+219             remote_address=values.get('remote_address'),
+220             timestamp=values.get('timestamp'),
+221             quota_class=values.get('quota_class'),
+222             service_catalog=values.get('service_catalog'),
+223         )
+224 
+225     def elevated(self, read_deleted=None):
+226         """Return a version of this context with admin flag set."""
+227         context = copy.copy(self)
+228         # context.roles must be deepcopied to leave original roles
+229         # without changes
+230         context.roles = copy.deepcopy(self.roles)
+231         context.is_admin = True
+232 
+233         if 'admin' not in context.roles:
+234             context.roles.append('admin')
+235 
+236         if read_deleted is not None:
+237             context.read_deleted = read_deleted
+238 
+239         return context
+240 
+241     def can(self, action, target=None, fatal=True):
+242         """Verifies that the given action is valid on the target in this
+243         context.
+244 
+245         :param action: string representing the action to be checked.
+246         :param target: dictionary representing the object of the action
+247             for object creation this should be a dictionary representing the
+248             location of the object e.g. ``{'project_id': context.project_id}``.
+249             If None, then this default target will be considered:
+250             {'project_id': self.project_id, 'user_id': self.user_id}
+251         :param fatal: if False, will return False when an exception.Forbidden
+252            occurs.
+253 
+254         :raises nova.exception.Forbidden: if verification fails and fatal is
+255             True.
+256 
+257         :return: returns a non-False value (not necessarily "True") if
+258             authorized and False if not authorized and fatal is False.
+259         """
+260         if target is None:
+261             target = {'project_id': self.project_id,
+262                       'user_id': self.user_id}
+263 
+264         try:
+265             return policy.authorize(self, action, target)
+266         except exception.Forbidden:
+267             if fatal:
+268                 raise
+269             return False
+270 
+271     def to_policy_values(self):
+272         policy = super(RequestContext, self).to_policy_values()
+273         policy['is_admin'] = self.is_admin
+274         return policy
+275 
+276     def __str__(self):
+277         return "<Context %s>" % self.to_dict()
+278 
+279 
+280 def get_context():
+281     """A helper method to get a blank context.
+282 
+283     Note that overwrite is False here so this context will not update the
+284     greenthread-local stored context that is used when logging.
+285     """
+286     return RequestContext(user_id=None,
+287                           project_id=None,
+288                           is_admin=False,
+289                           overwrite=False)
+290 
+291 
+292 def get_admin_context(read_deleted="no"):
+293     # NOTE(alaski): This method should only be used when an admin context is
+294     # necessary for the entirety of the context lifetime. If that's not the
+295     # case please use get_context(), or create the RequestContext manually, and
+296     # use context.elevated() where necessary. Some periodic tasks may use
+297     # get_admin_context so that their database calls are not filtered on
+298     # project_id.
+299     return RequestContext(user_id=None,
+300                           project_id=None,
+301                           is_admin=True,
+302                           read_deleted=read_deleted,
+303                           overwrite=False)
+304 
+305 
+306 def is_user_context(context):
+307     """Indicates if the request context is a normal user."""
+308     if not context:
+309         return False
+310     if context.is_admin:
+311         return False
+312     if not context.user_id or not context.project_id:
+313         return False
+314     return True
+315 
+316 
+317 def require_context(ctxt):
+318     """Raise exception.Forbidden() if context is not a user or an
+319     admin context.
+320     """
+321     if not ctxt.is_admin and not is_user_context(ctxt):
+322         raise exception.Forbidden()
+323 
+324 
+325 def authorize_project_context(context, project_id):
+326     """Ensures a request has permission to access the given project."""
+327     if is_user_context(context):
+328         if not context.project_id:
+329             raise exception.Forbidden()
+330         elif context.project_id != project_id:
+331             raise exception.Forbidden()
+332 
+333 
+334 def authorize_user_context(context, user_id):
+335     """Ensures a request has permission to access the given user."""
+336     if is_user_context(context):
+337         if not context.user_id:
+338             raise exception.Forbidden()
+339         elif context.user_id != user_id:
+340             raise exception.Forbidden()
+341 
+342 
+343 def authorize_quota_class_context(context, class_name):
+344     """Ensures a request has permission to access the given quota class."""
+345     if is_user_context(context):
+346         if not context.quota_class:
+347             raise exception.Forbidden()
+348         elif context.quota_class != class_name:
+349             raise exception.Forbidden()
+350 
+351 
+352 def set_target_cell(context, cell_mapping):
+353     """Adds database connection information to the context
+354     for communicating with the given target_cell.
+355 
+356     This is used for permanently targeting a cell in a context.
+357     Use this when you want all subsequent code to target a cell.
+358 
+359     Passing None for cell_mapping will untarget the context.
+360 
+361     :param context: The RequestContext to add connection information
+362     :param cell_mapping: An objects.CellMapping object or None
+363     """
+364     global CELL_CACHE
+365     if cell_mapping is not None:
+366         # avoid circular import
+367         from nova.db import api as db
+368         from nova import rpc
+369 
+370         # Synchronize access to the cache by multiple API workers.
+371         @utils.synchronized(cell_mapping.uuid)
+372         def get_or_set_cached_cell_and_set_connections():
+373             try:
+374                 cell_tuple = CELL_CACHE[cell_mapping.uuid]
+375             except KeyError:
+376                 db_connection_string = cell_mapping.database_connection
+377                 context.db_connection = db.create_context_manager(
+378                     db_connection_string)
+379                 if not cell_mapping.transport_url.startswith('none'):
+380                     context.mq_connection = rpc.create_transport(
+381                         cell_mapping.transport_url)
+382                 context.cell_uuid = cell_mapping.uuid
+383                 CELL_CACHE[cell_mapping.uuid] = (context.db_connection,
+384                                                  context.mq_connection)
+385             else:
+386                 context.db_connection = cell_tuple[0]
+387                 context.mq_connection = cell_tuple[1]
+388                 context.cell_uuid = cell_mapping.uuid
+389 
+390         get_or_set_cached_cell_and_set_connections()
+391     else:
+392         context.db_connection = None
+393         context.mq_connection = None
+394         context.cell_uuid = None
+395 
+396 
+397 @contextmanager
+398 def target_cell(context, cell_mapping):
+399     """Yields a new context with connection information for a specific cell.
+400 
+401     This function yields a copy of the provided context, which is targeted to
+402     the referenced cell for MQ and DB connections.
+403 
+404     Passing None for cell_mapping will yield an untargetd copy of the context.
+405 
+406     :param context: The RequestContext to add connection information
+407     :param cell_mapping: An objects.CellMapping object or None
+408     """
+409     # Create a sanitized copy of context by serializing and deserializing it
+410     # (like we would do over RPC). This help ensure that we have a clean
+411     # copy of the context with all the tracked attributes, but without any
+412     # of the hidden/private things we cache on a context. We do this to avoid
+413     # unintentional sharing of cached thread-local data across threads.
+414     # Specifically, this won't include any oslo_db-set transaction context, or
+415     # any existing cell targeting.
+416     cctxt = RequestContext.from_dict(context.to_dict())
+417     set_target_cell(cctxt, cell_mapping)
+418     yield cctxt
+419 
+420 
+421 def scatter_gather_cells(context, cell_mappings, timeout, fn, *args, **kwargs):
+422     """Target cells in parallel and return their results.
+423 
+424     The first parameter in the signature of the function to call for each cell
+425     should be of type RequestContext.
+426 
+427     :param context: The RequestContext for querying cells
+428     :param cell_mappings: The CellMappings to target in parallel
+429     :param timeout: The total time in seconds to wait for all the results to be
+430                     gathered
+431     :param fn: The function to call for each cell
+432     :param args: The args for the function to call for each cell, not including
+433                  the RequestContext
+434     :param kwargs: The kwargs for the function to call for each cell
+435     :returns: A dict {cell_uuid: result} containing the joined results. The
+436               did_not_respond_sentinel will be returned if a cell did not
+437               respond within the timeout. The exception object will
+438               be returned if the call to a cell raised an exception. The
+439               exception will be logged.
+440     """
+441     results = {}
+442 
+443     def gather_result(cell_uuid, fn, *args, **kwargs):
+444         try:
+445             result = fn(*args, **kwargs)
+446         except Exception as e:
+447             # Only log the exception traceback for non-nova exceptions.
+448             if not isinstance(e, exception.NovaException):
+449                 LOG.exception('Error gathering result from cell %s', cell_uuid)
+450             result = e.__class__(e.args)
+451         return result
+452 
+453     for cell_mapping in cell_mappings:
+454         results[cell_mapping.uuid] = None
+455         with target_cell(context, cell_mapping) as cctxt:
+456             future = EXECUTOR.submit(gather_result, cell_mapping, fn, cctxt,
+457                                      *args, **kwargs)
+458         results[cell_mapping.uuid] = future
+459 
+460     # Wait for all futures to be done or until the timeout expires.
+461     futurist.waiters.wait_for_all(results.values(), timeout=timeout)
+462 
+463     # Fill in results from the futures or timeouts.
+464     for cell_uuid, future in results.items():
+465         if future.done():
+466             results[cell_uuid] = future.result()
+467         else:
+468             # NOTE(melwitt): Running futures cannot be canceled, so this will
+469             # return False in most cases, but we will try it anyway.
+470             # The futurist.ThreadPoolExecutor runs threads with daemon=True, so
+471             # they will not block a shutdown and can be left to exit on their
+472             # own while we are running.
+473             future.cancel()
+474             results[cell_uuid] = did_not_respond_sentinel
+475             LOG.warning('Timed out waiting for response from cell %s',
+476                         cell_uuid)
+477 
+478     return results
+479 
+480 
+481 def load_cells():
+482     global CELLS
+483     if not CELLS:
+484         CELLS = objects.CellMappingList.get_all(get_admin_context())
+485         LOG.debug('Found %(count)i cells: %(cells)s',
+486                   dict(count=len(CELLS),
+487                        cells=','.join([c.identity for c in CELLS])))
+488 
+489     if not CELLS:
+490         LOG.error('No cells are configured, unable to continue')
+491 
+492 
+493 def is_cell_failure_sentinel(record):
+494     return (record is did_not_respond_sentinel or
+495             isinstance(record, Exception))
+496 
+497 
+498 def scatter_gather_skip_cell0(context, fn, *args, **kwargs):
+499     """Target all cells except cell0 in parallel and return their results.
+500 
+501     The first parameter in the signature of the function to call for
+502     each cell should be of type RequestContext. There is a timeout for
+503     waiting on all results to be gathered.
+504 
+505     :param context: The RequestContext for querying cells
+506     :param fn: The function to call for each cell
+507     :param args: The args for the function to call for each cell, not including
+508                  the RequestContext
+509     :param kwargs: The kwargs for the function to call for each cell
+510     :returns: A dict {cell_uuid: result} containing the joined results. The
+511               did_not_respond_sentinel will be returned if a cell did not
+512               respond within the timeout. The exception object will
+513               be returned if the call to a cell raised an exception. The
+514               exception will be logged.
+515     """
+516     load_cells()
+517     cell_mappings = [cell for cell in CELLS if not cell.is_cell0()]
+518     return scatter_gather_cells(context, cell_mappings, CELL_TIMEOUT,
+519                                 fn, *args, **kwargs)
+520 
+521 
+522 def scatter_gather_single_cell(context, cell_mapping, fn, *args, **kwargs):
+523     """Target the provided cell and return its results or sentinels in case of
+524     failure.
+525 
+526     The first parameter in the signature of the function to call for each cell
+527     should be of type RequestContext.
+528 
+529     :param context: The RequestContext for querying cells
+530     :param cell_mapping: The CellMapping to target
+531     :param fn: The function to call for each cell
+532     :param args: The args for the function to call for each cell, not including
+533                  the RequestContext
+534     :param kwargs: The kwargs for the function to call for this cell
+535     :returns: A dict {cell_uuid: result} containing the joined results. The
+536               did_not_respond_sentinel will be returned if the cell did not
+537               respond within the timeout. The exception object will
+538               be returned if the call to the cell raised an exception. The
+539               exception will be logged.
+540     """
+541     return scatter_gather_cells(context, [cell_mapping], CELL_TIMEOUT, fn,
+542                                 *args, **kwargs)
+543 
+544 
+545 def scatter_gather_all_cells(context, fn, *args, **kwargs):
+546     """Target all cells in parallel and return their results.
+547 
+548     The first parameter in the signature of the function to call for
+549     each cell should be of type RequestContext. There is a timeout for
+550     waiting on all results to be gathered.
+551 
+552     :param context: The RequestContext for querying cells
+553     :param fn: The function to call for each cell
+554     :param args: The args for the function to call for each cell, not including
+555                  the RequestContext
+556     :param kwargs: The kwargs for the function to call for each cell
+557     :returns: A dict {cell_uuid: result} containing the joined results. The
+558               did_not_respond_sentinel will be returned if a cell did not
+559               respond within the timeout. The exception object will
+560               be returned if the call to a cell raised an exception. The
+561               exception will be logged.
+562     """
+563     load_cells()
+564     return scatter_gather_cells(context, CELLS, CELL_TIMEOUT,
+565                                 fn, *args, **kwargs)

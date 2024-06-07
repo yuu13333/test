@@ -1,0 +1,529 @@
+Please review the code below for security defects using the CWE (Common Weakness Enumeration) as a reference standard. If any are found, please describe the security defect in detail and indicate the corresponding line number of code and solution. If none are detected, state: 'No security defects are detected in the code'.
+
+1 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
+2 #    not use this file except in compliance with the License. You may obtain
+3 #    a copy of the License at
+4 #
+5 #         http://www.apache.org/licenses/LICENSE-2.0
+6 #
+7 #    Unless required by applicable law or agreed to in writing, software
+8 #    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+9 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+10 #    License for the specific language governing permissions and limitations
+11 #    under the License.
+12 
+13 import mock
+14 
+15 from nova import context as nova_context
+16 from nova import exception
+17 from nova import objects
+18 from nova.scheduler import weights
+19 from nova.tests import fixtures as nova_fixtures
+20 from nova.tests.functional import integrated_helpers
+21 from nova.tests.unit.image import fake as fake_image
+22 from nova import utils
+23 
+24 
+25 class HostNameWeigher(weights.BaseHostWeigher):
+26     # TestMultiCellMigrate creates host1 in cell1 and host2 in cell2.
+27     # Something about migrating from host1 to host2 teases out failures
+28     # which probably has to do with cell1 being the default cell DB in
+29     # our base test class setup, so prefer host1 to make the tests
+30     # deterministic.
+31     _weights = {'host1': 100, 'host2': 50}
+32 
+33     def _weigh_object(self, host_state, weight_properties):
+34         # Any undefined host gets no weight.
+35         return self._weights.get(host_state.host, 0)
+36 
+37 
+38 class TestMultiCellMigrate(integrated_helpers.ProviderUsageBaseTestCase):
+39     """Tests for cross-cell cold migration (resize)"""
+40 
+41     NUMBER_OF_CELLS = 2
+42     compute_driver = 'fake.MediumFakeDriver'
+43 
+44     def setUp(self):
+45         # Use our custom weigher defined above to make sure that we have
+46         # a predictable scheduling sort order during server create.
+47         self.flags(weight_classes=[__name__ + '.HostNameWeigher'],
+48                    group='filter_scheduler')
+49         super(TestMultiCellMigrate, self).setUp()
+50         self.cinder = self.useFixture(nova_fixtures.CinderFixture(self))
+51 
+52         self._enable_cross_cell_resize()
+53         self.created_images = []  # list of image IDs created during resize
+54 
+55         # Adjust the polling interval and timeout for long RPC calls.
+56         self.flags(rpc_response_timeout=1)
+57         self.flags(long_rpc_timeout=60)
+58 
+59         # Set up 2 compute services in different cells
+60         self.host_to_cell_mappings = {
+61             'host1': 'cell1', 'host2': 'cell2'}
+62 
+63         for host in sorted(self.host_to_cell_mappings):
+64             cell_name = self.host_to_cell_mappings[host]
+65             # Start the compute service on the given host in the given cell.
+66             self._start_compute(host, cell_name=cell_name)
+67             # Create an aggregate where the AZ name is the cell name.
+68             agg_id = self._create_aggregate(
+69                 cell_name, availability_zone=cell_name)
+70             # Add the host to the aggregate.
+71             body = {'add_host': {'host': host}}
+72             self.admin_api.post_aggregate_action(agg_id, body)
+73 
+74     def _enable_cross_cell_resize(self):
+75         # Enable cross-cell resize policy since it defaults to not allow
+76         # anyone to perform that type of operation. For these tests we'll
+77         # just allow admins to perform cross-cell resize.
+78         # TODO(mriedem): Uncomment this when the policy rule is added and
+79         # used in the compute API _allow_cross_cell_resize method. For now
+80         # we just stub that method to return True.
+81         # self.policy_fixture.set_rules({
+82         #     servers_policies.CROSS_CELL_RESIZE:
+83         #         base_policies.RULE_ADMIN_API},
+84         #     overwrite=False)
+85         self.stub_out('nova.compute.api.API._allow_cross_cell_resize',
+86                       lambda *a, **kw: True)
+87 
+88     def assertFlavorMatchesAllocation(self, flavor, allocation,
+89                                       volume_backed=False):
+90         self.assertEqual(flavor['vcpus'], allocation['VCPU'])
+91         self.assertEqual(flavor['ram'], allocation['MEMORY_MB'])
+92         # Volume-backed instances won't have DISK_GB allocations.
+93         if volume_backed:
+94             self.assertNotIn('DISK_GB', allocation)
+95         else:
+96             self.assertEqual(flavor['disk'], allocation['DISK_GB'])
+97 
+98     def assert_instance_fields_match_flavor(self, instance, flavor):
+99         self.assertEqual(instance.memory_mb, flavor['ram'])
+100         self.assertEqual(instance.vcpus, flavor['vcpus'])
+101         self.assertEqual(instance.root_gb, flavor['disk'])
+102         self.assertEqual(
+103             instance.ephemeral_gb, flavor['OS-FLV-EXT-DATA:ephemeral'])
+104 
+105     def _count_volume_attachments(self, server_id):
+106         attachment_ids = self.cinder.attachment_ids_for_instance(server_id)
+107         return len(attachment_ids)
+108 
+109     def assert_quota_usage(self, expected_num_instances):
+110         limits = self.api.get_limits()['absolute']
+111         self.assertEqual(expected_num_instances, limits['totalInstancesUsed'])
+112 
+113     def _create_server(self, flavor, volume_backed=False):
+114         """Creates a server and waits for it to be ACTIVE
+115 
+116         :param flavor: dict form of the flavor to use
+117         :param volume_backed: True if the server should be volume-backed
+118         :returns: server dict response from the GET /servers/{server_id} API
+119         """
+120         # Provide a VIF tag for the pre-existing port. Since VIF tags are
+121         # stored in the virtual_interfaces table in the cell DB, we want to
+122         # make sure those survive the resize to another cell.
+123         networks = [{
+124             'port': self.neutron.port_1['id'],
+125             'tag': 'private'
+126         }]
+127         image_uuid = fake_image.get_valid_image_id()
+128         server = self._build_minimal_create_server_request(
+129             self.api, 'test_cross_cell_resize',
+130             image_uuid=image_uuid,
+131             flavor_id=flavor['id'],
+132             networks=networks)
+133         # Put a tag on the server to make sure that survives the resize.
+134         server['tags'] = ['test']
+135         if volume_backed:
+136             bdms = [{
+137                 'boot_index': 0,
+138                 'uuid': nova_fixtures.CinderFixture.IMAGE_BACKED_VOL,
+139                 'source_type': 'volume',
+140                 'destination_type': 'volume',
+141                 'tag': 'root'
+142             }]
+143             server['block_device_mapping_v2'] = bdms
+144             # We don't need the imageRef for volume-backed servers.
+145             server.pop('imageRef', None)
+146 
+147         server = self.api.post_server({'server': server})
+148         server = self._wait_for_state_change(self.admin_api, server, 'ACTIVE')
+149         # For volume-backed make sure there is one attachment to start.
+150         if volume_backed:
+151             self.assertEqual(1, self._count_volume_attachments(server['id']),
+152                              self.cinder.volume_to_attachment)
+153         return server
+154 
+155     def stub_image_create(self):
+156         """Stubs the _FakeImageService.create method to track created images"""
+157         original_create = self.image_service.create
+158 
+159         def image_create_snooper(*args, **kwargs):
+160             image = original_create(*args, **kwargs)
+161             self.created_images.append(image['id'])
+162             return image
+163 
+164         _p = mock.patch.object(
+165             self.image_service, 'create', side_effect=image_create_snooper)
+166         _p.start()
+167         self.addCleanup(_p.stop)
+168 
+169     def _resize_and_validate(self, volume_backed=False, stopped=False,
+170                              target_host=None):
+171         """Creates and resizes the server to another cell. Validates various
+172         aspects of the server and its related records (allocations, migrations,
+173         actions, VIF tags, etc).
+174 
+175         :param volume_backed: True if the server should be volume-backed, False
+176             if image-backed.
+177         :param stopped: True if the server should be stopped prior to resize,
+178             False if the server should be ACTIVE
+179         :param target_host: If not None, triggers a cold migration to the
+180             specified host.
+181         :returns: tuple of:
+182             - server response object
+183             - source compute node resource provider uuid
+184             - target compute node resource provider uuid
+185             - old flavor
+186             - new flavor
+187         """
+188         # Create the server.
+189         flavors = self.api.get_flavors()
+190         old_flavor = flavors[0]
+191         server = self._create_server(old_flavor, volume_backed=volume_backed)
+192         original_host = server['OS-EXT-SRV-ATTR:host']
+193         image_uuid = None if volume_backed else server['image']['id']
+194 
+195         # Our HostNameWeigher ensures the server starts in cell1, so we expect
+196         # the server AZ to be cell1 as well.
+197         self.assertEqual('cell1', server['OS-EXT-AZ:availability_zone'])
+198 
+199         if stopped:
+200             # Stop the server before resizing it.
+201             self.api.post_server_action(server['id'], {'os-stop': None})
+202             self._wait_for_state_change(self.api, server, 'SHUTOFF')
+203 
+204         # Before resizing make sure quota usage is only 1 for total instances.
+205         self.assert_quota_usage(expected_num_instances=1)
+206 
+207         if target_host:
+208             # Cold migrate the server to the target host.
+209             new_flavor = old_flavor  # flavor does not change for cold migrate
+210             body = {'migrate': {'host': target_host}}
+211             expected_host = target_host
+212         else:
+213             # Resize it which should migrate the server to the host in the
+214             # other cell.
+215             new_flavor = flavors[1]
+216             body = {'resize': {'flavorRef': new_flavor['id']}}
+217             expected_host = 'host1' if original_host == 'host2' else 'host2'
+218 
+219         self.stub_image_create()
+220 
+221         self.api.post_server_action(server['id'], body)
+222         # Wait for the server to be resized and then verify the host has
+223         # changed to be the host in the other cell.
+224         server = self._wait_for_state_change(self.api, server, 'VERIFY_RESIZE')
+225         self.assertEqual(expected_host, server['OS-EXT-SRV-ATTR:host'])
+226         # Assert that the instance is only listed one time from the API (to
+227         # make sure it's not listed out of both cells).
+228         # Note that we only get one because of _get_unique_filter_method in
+229         # compute.api.API.get_all() which keys off uuid.
+230         servers = self.api.get_servers()
+231         self.assertEqual(1, len(servers),
+232                          'Unexpected number of servers: %s' % servers)
+233         self.assertEqual(expected_host, servers[0]['OS-EXT-SRV-ATTR:host'])
+234 
+235         # And that there is only one migration record.
+236         migrations = self.api.api_get(
+237             '/os-migrations?instance_uuid=%s' % server['id']
+238         ).body['migrations']
+239         self.assertEqual(1, len(migrations),
+240                          'Unexpected number of migrations records: %s' %
+241                          migrations)
+242         migration = migrations[0]
+243         self.assertEqual('finished', migration['status'])
+244 
+245         # There should be at least two actions, one for create and one for the
+246         # resize. There will be a third action if the server was stopped.
+247         actions = self.api.api_get(
+248             '/servers/%s/os-instance-actions' % server['id']
+249         ).body['instanceActions']
+250         expected_num_of_actions = 3 if stopped else 2
+251         self.assertEqual(expected_num_of_actions, len(actions), actions)
+252         # Each action should have events (make sure these were copied from
+253         # the source cell to the target cell).
+254         for action in actions:
+255             detail = self.api.api_get(
+256                 '/servers/%s/os-instance-actions/%s' % (
+257                     server['id'], action['request_id'])).body['instanceAction']
+258             self.assertNotEqual(0, len(detail['events']), detail)
+259 
+260         # The tag should still be present on the server.
+261         self.assertEqual(1, len(server['tags']),
+262                          'Server tags not found in target cell.')
+263         self.assertEqual('test', server['tags'][0])
+264 
+265         # Confirm the source node has allocations for the old flavor and the
+266         # target node has allocations for the new flavor.
+267         source_rp_uuid = self._get_provider_uuid_by_host(original_host)
+268         # The source node allocations should be on the migration record.
+269         source_allocations = self._get_allocations_by_provider_uuid(
+270             source_rp_uuid)[migration['uuid']]['resources']
+271         self.assertFlavorMatchesAllocation(
+272             old_flavor, source_allocations, volume_backed=volume_backed)
+273 
+274         target_rp_uuid = self._get_provider_uuid_by_host(expected_host)
+275         # The target node allocations should be on the instance record.
+276         target_allocations = self._get_allocations_by_provider_uuid(
+277             target_rp_uuid)[server['id']]['resources']
+278         self.assertFlavorMatchesAllocation(
+279             new_flavor, target_allocations, volume_backed=volume_backed)
+280 
+281         # The instance, in the target cell DB, should have the old and new
+282         # flavor stored with it with the values we expect at this point.
+283         target_cell_name = self.host_to_cell_mappings[expected_host]
+284         self.assertEqual(
+285             target_cell_name, server['OS-EXT-AZ:availability_zone'])
+286         target_cell = self.cell_mappings[target_cell_name]
+287         admin_context = nova_context.get_admin_context()
+288         with nova_context.target_cell(admin_context, target_cell) as cctxt:
+289             inst = objects.Instance.get_by_uuid(
+290                 cctxt, server['id'], expected_attrs=['flavor'])
+291             self.assertIsNotNone(
+292                 inst.old_flavor,
+293                 'instance.old_flavor not saved in target cell')
+294             self.assertIsNotNone(
+295                 inst.new_flavor,
+296                 'instance.new_flavor not saved in target cell')
+297             self.assertEqual(inst.flavor.flavorid, inst.new_flavor.flavorid)
+298             if target_host:  # cold migrate so flavor does not change
+299                 self.assertEqual(
+300                     inst.flavor.flavorid, inst.old_flavor.flavorid)
+301             else:
+302                 self.assertNotEqual(
+303                     inst.flavor.flavorid, inst.old_flavor.flavorid)
+304             self.assertEqual(old_flavor['id'], inst.old_flavor.flavorid)
+305             self.assertEqual(new_flavor['id'], inst.new_flavor.flavorid)
+306             # Assert the ComputeManager._set_instance_info fields
+307             # are correct after the resize.
+308             self.assert_instance_fields_match_flavor(inst, new_flavor)
+309             # The availability_zone field in the DB should also be updated.
+310             self.assertEqual(target_cell_name, inst.availability_zone)
+311 
+312         # Assert the VIF tag was carried through to the target cell DB.
+313         interface_attachments = self.api.get_port_interfaces(server['id'])
+314         self.assertEqual(1, len(interface_attachments))
+315         self.assertEqual('private', interface_attachments[0]['tag'])
+316 
+317         if volume_backed:
+318             # Assert the BDM tag was carried through to the target cell DB.
+319             volume_attachments = self.api.get_server_volumes(server['id'])
+320             self.assertEqual(1, len(volume_attachments))
+321             self.assertEqual('root', volume_attachments[0]['tag'])
+322 
+323         # Make sure the guest is no longer tracked on the source node.
+324         source_guest_uuids = (
+325             self.computes[original_host].manager.driver.list_instance_uuids())
+326         self.assertNotIn(server['id'], source_guest_uuids)
+327         # And the guest is on the target node hypervisor.
+328         target_guest_uuids = (
+329             self.computes[expected_host].manager.driver.list_instance_uuids())
+330         self.assertIn(server['id'], target_guest_uuids)
+331 
+332         # The source hypervisor continues to report usage in the hypervisors
+333         # API because even though the guest was destroyed there, the instance
+334         # resources are still claimed on that node in case the user reverts.
+335         self.assert_hypervisor_usage(source_rp_uuid, old_flavor, volume_backed)
+336         # The new flavor should show up with resource usage on the target host.
+337         self.assert_hypervisor_usage(target_rp_uuid, new_flavor, volume_backed)
+338 
+339         # While we have a copy of the instance in each cell database make sure
+340         # that quota usage is only reporting 1 (because one is hidden).
+341         self.assert_quota_usage(expected_num_instances=1)
+342 
+343         # For a volume-backed server, at this point there should be two volume
+344         # attachments for the instance: one tracked in the source cell and
+345         # one in the target cell.
+346         if volume_backed:
+347             self.assertEqual(2, self._count_volume_attachments(server['id']),
+348                              self.cinder.volume_to_attachment)
+349 
+350         # Assert the expected power state.
+351         expected_power_state = 4 if stopped else 1
+352         self.assertEqual(
+353             expected_power_state, server['OS-EXT-STS:power_state'],
+354             "Unexpected power state after resize.")
+355 
+356         # For an image-backed server, a snapshot image should have been created
+357         # and then deleted during the resize.
+358         if volume_backed:
+359             self.assertEqual('', server['image'])
+360             self.assertEqual(
+361                 0, len(self.created_images),
+362                 "Unexpected image create during volume-backed resize")
+363         else:
+364             # The original image for the server shown in the API should not
+365             # have changed even if a snapshot was used to create the guest
+366             # on the dest host.
+367             self.assertEqual(image_uuid, server['image']['id'])
+368             self.assertEqual(
+369                 1, len(self.created_images),
+370                 "Unexpected number of images created for image-backed resize")
+371             # Make sure the temporary snapshot image was deleted; we use the
+372             # compute images proxy API here which is deprecated so we force the
+373             # microversion to 2.1.
+374             with utils.temporary_mutation(self.api, microversion='2.1'):
+375                 self.api.api_get('/images/%s' % self.created_images[0],
+376                                  check_response_status=[404])
+377 
+378         return server, source_rp_uuid, target_rp_uuid, old_flavor, new_flavor
+379 
+380     def test_resize_confirm_image_backed(self):
+381         """Creates an image-backed server in one cell and resizes it to the
+382         host in the other cell. The resize is confirmed.
+383         """
+384         self._resize_and_validate()
+385 
+386         # TODO(mriedem): See: https://review.openstack.org/#/c/603930/
+387 
+388     def test_resize_revert_volume_backed(self):
+389         """Tests a volume-backed resize to another cell where the resize
+390         is reverted back to the original source cell.
+391         """
+392         self._resize_and_validate(volume_backed=True)
+393 
+394         # TODO(mriedem): See: https://review.openstack.org/#/c/603930/
+395 
+396     def test_delete_while_in_verify_resize_status(self):
+397         """Tests that when deleting a server in VERIFY_RESIZE status, the
+398         data is cleaned from both the source and target cell.
+399         """
+400         server = self._resize_and_validate()[0]
+401         self.api.delete_server(server['id'])
+402         self._wait_until_deleted(server)
+403         # Now list servers to make sure it doesn't show up from the source cell
+404         servers = self.api.get_servers()
+405         self.assertEqual(0, len(servers), servers)
+406         # FIXME(mriedem): Need to cleanup from source cell in API method
+407         # _confirm_resize_on_deleting(). The above check passes because the
+408         # instance is still hidden in the source cell so the API filters it
+409         # out.
+410         target_host = server['OS-EXT-SRV-ATTR:host']
+411         source_host = 'host1' if target_host == 'host2' else 'host2'
+412         source_cell = self.cell_mappings[
+413             self.host_to_cell_mappings[source_host]]
+414         ctxt = nova_context.get_admin_context()
+415         with nova_context.target_cell(ctxt, source_cell) as cctxt:
+416             # Once the API is fixed this should raise InstanceNotFound.
+417             instance = objects.Instance.get_by_uuid(cctxt, server['id'])
+418             self.assertTrue(instance.hidden)
+419 
+420     def test_cold_migrate_target_host_in_other_cell(self):
+421         """Tests cold migrating to a target host in another cell. This is
+422         mostly just to ensure the API does not restrict the target host to
+423         the source cell when cross-cell resize is allowed by policy.
+424         """
+425         # _resize_and_validate creates the server on host1 which is in cell1.
+426         # To make things interesting, start a third host but in cell1 so we can
+427         # be sure the requested host from cell2 is honored.
+428         self._start_compute(
+429             'host3', cell_name=self.host_to_cell_mappings['host1'])
+430         self._resize_and_validate(target_host='host2')
+431 
+432     # TODO(mriedem): Test cross-cell list where the source cell has two
+433     # hosts so the CrossCellWeigher picks the other host in the source cell
+434     # and we do a traditional resize. Add a variant on this where the flavor
+435     # being resized to is only available, via aggregate, on the host in the
+436     # other cell so the CrossCellWeigher is overruled by the filters.
+437 
+438     # TODO(mriedem): Test a bunch of rollback scenarios.
+439 
+440     # TODO(mriedem): Test cross-cell anti-affinity group assumptions from
+441     # scheduler utils setup_instance_group where it assumes moves are within
+442     # the same cell, so:
+443     # 0. create 2 hosts in cell1 and 1 host in cell2
+444     # 1. create two servers in an anti-affinity group in cell1
+445     # 2. migrate one server to cell2
+446     # 3. migrate the other server to cell2 - this should fail during scheduling
+447     # because there is already a server from the anti-affinity group on the
+448     # host in cell2 but setup_instance_group code may not catch it.
+449 
+450     # TODO(mriedem): Perform a resize with at-capacity computes, meaning that
+451     # when we revert we can only fit the instance with the old flavor back
+452     # onto the source host in the source cell.
+453 
+454     def test_resize_confirm_from_stopped(self):
+455         """Tests resizing and confirming a server that was initially stopped
+456         so it should remain stopped through the resize.
+457         """
+458         self._resize_and_validate(volume_backed=True, stopped=True)
+459         # TODO(mriedem): Confirm the resize and assert the guest remains off
+460 
+461     def test_finish_snapshot_based_resize_at_dest_spawn_fails(self):
+462         """Negative test where the driver spawn fails on the dest host during
+463         finish_snapshot_based_resize_at_dest which triggers a rollback of the
+464         instance data in the target cell. Furthermore, the test will hard
+465         reboot the server in the source cell to recover it from ERROR status.
+466         """
+467         # Create a volume-backed server. This is more interesting for rollback
+468         # testing to make sure the volume attachments in the target cell were
+469         # cleaned up on failure.
+470         flavors = self.api.get_flavors()
+471         server = self._create_server(flavors[0], volume_backed=True)
+472 
+473         # Now mock out the spawn method on the destination host to fail
+474         # during _finish_snapshot_based_resize_at_dest_spawn and then resize
+475         # the server.
+476         error = exception.HypervisorUnavailable(host='host2')
+477         with mock.patch.object(self.computes['host2'].driver, 'spawn',
+478                                side_effect=error):
+479             flavor2 = flavors[1]['id']
+480             body = {'resize': {'flavorRef': flavor2}}
+481             self.api.post_server_action(server['id'], body)
+482             # The server should go to ERROR state with a fault record and
+483             # the API should still be showing the server from the source cell
+484             # because the instance mapping was not updated.
+485             server = self._wait_for_server_parameter(
+486                 self.admin_api, server,
+487                 {'status': 'ERROR', 'OS-EXT-STS:task_state': None})
+488 
+489         # The migration should be in 'error' status.
+490         self._wait_for_migration_status(server, ['error'])
+491         # Assert a fault was recorded.
+492         self.assertIn('fault', server)
+493         self.assertIn('Connection to the hypervisor is broken',
+494                       server['fault']['message'])
+495         # The instance in the target cell DB should have been hard-deleted.
+496         target_cell = self.cell_mappings['cell2']
+497         ctxt = nova_context.get_admin_context(read_deleted='yes')
+498         with nova_context.target_cell(ctxt, target_cell) as cctxt:
+499             self.assertRaises(
+500                 exception.InstanceNotFound,
+501                 objects.Instance.get_by_uuid, cctxt, server['id'])
+502 
+503         # Assert that there is only one volume attachment for the server, i.e.
+504         # the one in the target cell was deleted.
+505         self.assertEqual(1, self._count_volume_attachments(server['id']),
+506                          self.cinder.volume_to_attachment)
+507 
+508         # Assert that migration-based allocations were properly reverted.
+509         mig_uuid = self.get_migration_uuid_for_instance(server['id'])
+510         mig_allocs = self._get_allocations_by_server_uuid(mig_uuid)
+511         self.assertEqual({}, mig_allocs)
+512         source_rp_uuid = self._get_provider_uuid_by_host(
+513             server['OS-EXT-SRV-ATTR:host'])
+514         server_allocs = self._get_allocations_by_server_uuid(server['id'])
+515         self.assertFlavorMatchesAllocation(
+516             flavors[0], server_allocs[source_rp_uuid]['resources'],
+517             volume_backed=True)
+518 
+519         # Now hard reboot the server in the source cell and it should go back
+520         # to ACTIVE.
+521         self.api.post_server_action(server['id'], {'reboot': {'type': 'HARD'}})
+522         self._wait_for_state_change(self.admin_api, server, 'ACTIVE')
+523 
+524         # Now retry the resize without the fault in the target host to make
+525         # sure things are OK (no duplicate entry errors in the target DB).
+526         self.api.post_server_action(server['id'], body)
+527         self._wait_for_state_change(self.admin_api, server, 'VERIFY_RESIZE')

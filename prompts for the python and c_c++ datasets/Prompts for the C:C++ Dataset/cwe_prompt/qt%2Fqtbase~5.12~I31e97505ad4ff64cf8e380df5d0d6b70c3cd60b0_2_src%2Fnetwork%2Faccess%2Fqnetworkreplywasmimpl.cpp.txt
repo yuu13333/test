@@ -1,0 +1,626 @@
+Please review the code below for security defects using the CWE (Common Weakness Enumeration) as a reference standard. If any are found, please describe the security defect in detail and indicate the corresponding line number of code and solution. If none are detected, state: 'No security defects are detected in the code'.
+
+1 /****************************************************************************
+2 **
+3 ** Copyright (C) 2018 The Qt Company Ltd.
+4 ** Contact: https://www.qt.io/licensing/
+5 **
+6 ** This file is part of the QtNetwork module of the Qt Toolkit.
+7 **
+8 ** $QT_BEGIN_LICENSE:LGPL$
+9 ** Commercial License Usage
+10 ** Licensees holding valid commercial Qt licenses may use this file in
+11 ** accordance with the commercial license agreement provided with the
+12 ** Software or, alternatively, in accordance with the terms contained in
+13 ** a written agreement between you and The Qt Company. For licensing terms
+14 ** and conditions see https://www.qt.io/terms-conditions. For further
+15 ** information use the contact form at https://www.qt.io/contact-us.
+16 **
+17 ** GNU Lesser General Public License Usage
+18 ** Alternatively, this file may be used under the terms of the GNU Lesser
+19 ** General Public License version 3 as published by the Free Software
+20 ** Foundation and appearing in the file LICENSE.LGPL3 included in the
+21 ** packaging of this file. Please review the following information to
+22 ** ensure the GNU Lesser General Public License version 3 requirements
+23 ** will be met: https://www.gnu.org/licenses/lgpl-3.0.html.
+24 **
+25 ** GNU General Public License Usage
+26 ** Alternatively, this file may be used under the terms of the GNU
+27 ** General Public License version 2.0 or (at your option) the GNU General
+28 ** Public license version 3 or any later version approved by the KDE Free
+29 ** Qt Foundation. The licenses are as published by the Free Software
+30 ** Foundation and appearing in the file LICENSE.GPL2 and LICENSE.GPL3
+31 ** included in the packaging of this file. Please review the following
+32 ** information to ensure the GNU General Public License requirements will
+33 ** be met: https://www.gnu.org/licenses/gpl-2.0.html and
+34 ** https://www.gnu.org/licenses/gpl-3.0.html.
+35 **
+36 ** $QT_END_LICENSE$
+37 **
+38 ****************************************************************************/
+39 
+40 #include "qnetworkreplywasmimpl_p.h"
+41 #include "qnetworkrequest.h"
+42 
+43 #include <QtCore/qtimer.h>
+44 #include <QtCore/qdatetime.h>
+45 #include <QtCore/qcoreapplication.h>
+46 #include <QtCore/qfileinfo.h>
+47 #include <QtCore/qthread.h>
+48 
+49 #include <private/qnetworkaccessmanager_p.h>
+50 #include <private/qnetworkfile_p.h>
+51 
+52 #include <emscripten.h>
+53 #include <emscripten/bind.h>
+54 #include <emscripten/val.h>
+55 
+56 QT_BEGIN_NAMESPACE
+57 
+58 using namespace emscripten;
+59 
+60 static void q_requestErrorCallback(val event)
+61 {
+62     val xhr = event["target"];
+63 
+64     quintptr func = xhr["data-handler"].as<quintptr>();
+65     QNetworkReplyWasmImplPrivate *reply = reinterpret_cast<QNetworkReplyWasmImplPrivate*>(func);
+66     Q_ASSERT(reply);
+67 
+68     int statusCode = xhr["status"].as<int>();
+69 
+70     QString reasonStr = QString::fromStdString(xhr["statusText"].as<std::string>());
+71 
+72     reply->setReplyAttributes(func, statusCode, reasonStr);
+73 
+74     if (statusCode >= 400) {
+75         if (!reasonStr.isEmpty()) {
+76             reply->emitReplyError(reply->statusCodeFromHttp(statusCode, reply->request.url()), reasonStr);
+77         }
+78     }
+79 }
+80 
+81 static void q_progressCallback(val event)
+82 {
+83     val xhr = event["target"];
+84 
+85     QNetworkReplyWasmImplPrivate *reply =
+86             reinterpret_cast<QNetworkReplyWasmImplPrivate*>(xhr["data-handler"].as<quintptr>());
+87     Q_ASSERT(reply);
+88 
+89     if (xhr["lengthComputable"].as<bool>()) {
+90         if (xhr["status"].as<int>() < 400) {
+91             reply->emitDataReadProgress(xhr["loaded"].as<qint64>(), xhr["total"].as<qint64>());
+92         }
+93     }
+94 }
+95 
+96 static void q_loadCallback(val event)
+97 {
+98     val xhr = event["target"];
+99 
+100     QNetworkReplyWasmImplPrivate *reply =
+101             reinterpret_cast<QNetworkReplyWasmImplPrivate*>(xhr["data-handler"].as<quintptr>());
+102     Q_ASSERT(reply);
+103 
+104     int status = xhr["status"].as<int>();
+105     if (status >= 300) {
+106         q_requestErrorCallback(event);
+107         return;
+108     }
+109     if (status == 200 || status == 203) {
+110         QString responseString;
+111         const std::string responseType = xhr["responseType"].as<std::string>();
+112         if (responseType.length() == 0 || responseType == "document" || responseType == "text") {
+113             responseString = QString::fromStdWString(xhr["responseText"].as<std::wstring>());
+114         } else if (responseType == "json") {
+115             responseString =
+116                     QString::fromStdWString(val::global("JSON").call<std::wstring>("stringify", xhr["response"]));
+117         } else if (responseType == "arraybuffer" || responseType == "blob") {
+118             // handle this data in the FileReader, triggered by the call to readAsArrayBuffer
+119             val reader = val::global("FileReader").new_();
+120             reader.set("onload", val::module_property("q_readBinary"));
+121             reader.set("data-handler", xhr["data-handler"]);
+122             reader.call<void>("readAsArrayBuffer", xhr["response"]);
+123         }
+124 
+125         QString statusText = QString::fromStdString(xhr["statusText"].as<std::string>());
+126         int readyState = xhr["readyState"].as<int>();
+127 
+128         if (readyState == 4) { // done
+129             reply->setReplyAttributes(xhr["data-handler"].as<quintptr>(), status, statusText);
+130             if (status >= 400 && !statusText.isEmpty()) {
+131                 reply->emitReplyError(reply->statusCodeFromHttp(status, reply->request.url()), statusText);
+132             }
+133             if (!responseString.isEmpty())
+134                 reply->dataReceived(responseString.toUtf8(), responseString.size());
+135         }
+136     }
+137 }
+138 
+139 static void q_responseHeadersCallback(val event)
+140 {
+141     val xhr = event["target"];
+142 
+143     if (xhr["readyState"].as<int>() == 2) { // HEADERS_RECEIVED
+144         std::string responseHeaders = xhr.call<std::string>("getAllResponseHeaders");
+145         if (!responseHeaders.empty()) {
+146             QNetworkReplyWasmImplPrivate *reply =
+147                     reinterpret_cast<QNetworkReplyWasmImplPrivate*>(xhr["data-handler"].as<quintptr>());
+148             Q_ASSERT(reply);
+149 
+150             reply->headersReceived(QString::fromStdString(responseHeaders));
+151         }
+152     }
+153 }
+154 
+155 static void q_readBinary(val event)
+156 {
+157     val fileReader = event["target"];
+158 
+159     QNetworkReplyWasmImplPrivate *reply =
+160             reinterpret_cast<QNetworkReplyWasmImplPrivate*>(fileReader["data-handler"].as<quintptr>());
+161     Q_ASSERT(reply);
+162 
+163     // Set up source typed array
+164     val result = fileReader["result"]; // ArrayBuffer
+165     val Uint8Array = val::global("Uint8Array");
+166     val sourceTypedArray = Uint8Array.new_(result);
+167 
+168     // Allocate and set up destination typed array
+169     const quintptr size = result["byteLength"].as<quintptr>();
+170     QByteArray buffer(size, Qt::Uninitialized);
+171 
+172     val destinationTypedArray = Uint8Array.new_(val::module_property("HEAPU8")["buffer"],
+173                                                             reinterpret_cast<quintptr>(buffer.data()), size);
+174     destinationTypedArray.call<void>("set", sourceTypedArray);
+175     reply->dataReceived(buffer, buffer.size());
+176 }
+177 
+178 
+179 EMSCRIPTEN_BINDINGS(network_module) {
+180     function("QNetworkReplyWasmImplPrivate_requestErrorCallback", q_requestErrorCallback);
+181     function("QNetworkReplyWasmImplPrivate_progressCallback", q_progressCallback);
+182     function("QNetworkReplyWasmImplPrivate_loadCallback", q_loadCallback);
+183     function("QNetworkReplyWasmImplPrivate_responseHeadersCallback", q_responseHeadersCallback);
+184     function("QNetworkReplyWasmImplPrivate_readBinary", q_readBinary);
+185 }
+186 
+187 QNetworkReplyWasmImplPrivate::QNetworkReplyWasmImplPrivate()
+188     : QNetworkReplyPrivate()
+189     , managerPrivate(0)
+190     , downloadBufferReadPosition(0)
+191     , downloadBufferCurrentSize(0)
+192     , totalDownloadSize(0)
+193     , percentFinished(0)
+194 {
+195 }
+196 
+197 QNetworkReplyWasmImplPrivate::~QNetworkReplyWasmImplPrivate()
+198 {
+199 }
+200 
+201 QNetworkReplyWasmImpl::~QNetworkReplyWasmImpl()
+202 {
+203 }
+204 
+205 QNetworkReplyWasmImpl::QNetworkReplyWasmImpl(QObject *parent)
+206     : QNetworkReply(*new QNetworkReplyWasmImplPrivate(), parent)
+207 {
+208 }
+209 
+210 QByteArray QNetworkReplyWasmImpl::methodName() const
+211 {
+212     switch (operation()) {
+213     case QNetworkAccessManager::HeadOperation:
+214         return "HEAD";
+215     case QNetworkAccessManager::GetOperation:
+216         return "GET";
+217     case QNetworkAccessManager::PutOperation:
+218         return "PUT";
+219     case QNetworkAccessManager::PostOperation:
+220         return "POST";
+221     case QNetworkAccessManager::DeleteOperation:
+222         return "DELETE";
+223     default:
+224         break;
+225     }
+226     return QByteArray();
+227 }
+228 
+229 void QNetworkReplyWasmImpl::close()
+230 {
+231     QNetworkReply::close();
+232 }
+233 
+234 void QNetworkReplyWasmImpl::abort()
+235 {
+236     close();
+237 }
+238 
+239 qint64 QNetworkReplyWasmImpl::bytesAvailable() const
+240 {
+241     Q_D(const QNetworkReplyWasmImpl);
+242 
+243     if (!d->isFinished)
+244         return QNetworkReply::bytesAvailable();
+245 
+246     return QNetworkReply::bytesAvailable() + d->downloadBufferCurrentSize - d->downloadBufferReadPosition;
+247 }
+248 
+249 bool QNetworkReplyWasmImpl::isSequential() const
+250 {
+251     return true;
+252 }
+253 
+254 qint64 QNetworkReplyWasmImpl::size() const
+255 {
+256     return QNetworkReply::size();
+257 }
+258 
+259 /*!
+260     \internal
+261 */
+262 qint64 QNetworkReplyWasmImpl::readData(char *data, qint64 maxlen)
+263 {
+264     Q_D(QNetworkReplyWasmImpl);
+265 
+266     qint64 howMuch = qMin(maxlen, (d->downloadBuffer.size() - d->downloadBufferReadPosition));
+267     memcpy(data, d->downloadBuffer.constData(), howMuch);
+268     d->downloadBufferReadPosition += howMuch;
+269 
+270     return howMuch;
+271 }
+272 
+273 void QNetworkReplyWasmImplPrivate::setup(QNetworkAccessManager::Operation op, const QNetworkRequest &req, QIODevice *data)
+274 {
+275     Q_Q(QNetworkReplyWasmImpl);
+276 
+277     outgoingData = data;
+278     request = req;
+279     url = request.url();
+280     operation = op;
+281 
+282     q->QIODevice::open(QIODevice::ReadOnly);
+283     if (outgoingData && outgoingData->isSequential()) {
+284         bool bufferingDisallowed =
+285             request.attribute(QNetworkRequest::DoNotBufferUploadDataAttribute, false).toBool();
+286 
+287         if (bufferingDisallowed) {
+288             // if a valid content-length header for the request was supplied, we can disable buffering
+289             // if not, we will buffer anyway
+290             if (!request.header(QNetworkRequest::ContentLengthHeader).isValid()) {
+291                 state = Buffering;
+292                 _q_bufferOutgoingData();
+293                 return;
+294             }
+295         } else {
+296             // doSendRequest will be called when the buffering has finished.
+297             state = Buffering;
+298             _q_bufferOutgoingData();
+299             return;
+300         }
+301     }
+302     // No outgoing data (POST, ..)
+303     doSendRequest();
+304 }
+305 
+306 void QNetworkReplyWasmImplPrivate::setReplyAttributes(quintptr data, int statusCode, const QString &statusReason)
+307 {
+308     QNetworkReplyWasmImplPrivate *handler = reinterpret_cast<QNetworkReplyWasmImplPrivate*>(data);
+309     Q_ASSERT(handler);
+310 
+311     handler->q_func()->setAttribute(QNetworkRequest::HttpStatusCodeAttribute, statusCode);
+312     if (!statusReason.isEmpty())
+313         handler->q_func()->setAttribute(QNetworkRequest::HttpReasonPhraseAttribute, statusReason);
+314 }
+315 
+316 void QNetworkReplyWasmImplPrivate::doSendRequest()
+317 {
+318     Q_Q(QNetworkReplyWasmImpl);
+319     totalDownloadSize = 0;
+320 
+321     val xhr = val::global("XMLHttpRequest").new_();
+322     std::string verb = q->methodName().toStdString();
+323 
+324     QUrl url;
+325     QString extraDataString;
+326 
+327     if (request.url().hasQuery()) { //strip query from url
+328         extraDataString = request.url().query(QUrl::FullyEncoded);
+329         QString urlStr = request.url().toString();
+330         url.setUrl(urlStr.left(urlStr.indexOf("?")));
+331     } else {
+332         url = request.url();
+333     }
+334     xhr.call<void>("open", verb, url.toString().toStdString());
+335 
+336     xhr.set("onerror", val::module_property("QNetworkReplyWasmImplPrivate_requestErrorCallback"));
+337     xhr.set("onload", val::module_property("QNetworkReplyWasmImplPrivate_loadCallback"));
+338     xhr.set("onprogress", val::module_property("QNetworkReplyWasmImplPrivate_progressCallback"));
+339     xhr.set("onreadystatechange", val::module_property("QNetworkReplyWasmImplPrivate_responseHeadersCallback"));
+340 
+341     xhr.set("data-handler", val(quintptr(reinterpret_cast<void *>(this))));
+342 
+343     QByteArray contentType = request.rawHeader("Content-Type");
+344 
+345     // handle extra data
+346     val dataToSend = val::null();
+347     QByteArray extraData;
+348 
+349     if (outgoingData) // data from post request
+350         extraData = outgoingData->readAll();
+351 
+352     if (contentType.contains("text") ||
+353             contentType.contains("json") ||
+354             contentType.contains("form")) {
+355         if (extraData.size() > 0)
+356             extraDataString.fromUtf8(extraData);
+357     }
+358     if (contentType.contains("json")) {
+359         if (!extraDataString.isEmpty()) {
+360             xhr.set("responseType", val("json"));
+361             dataToSend = val(extraDataString.toStdString());
+362         }
+363     }
+364     if (contentType.contains("form")) { //construct form data
+365         if (!extraDataString.isEmpty()) {
+366             val formData = val::global("FormData").new_();
+367             QStringList formList = extraDataString.split('&');
+368 
+369             for (auto formEntry : formList) {
+370                 formData.call<void>("append", formEntry.split('=')[0].toStdString(), formEntry.split('=')[1].toStdString());
+371             }
+372             dataToSend = formData;
+373         }
+374     }
+375     // set request headers
+376     for (auto header : request.rawHeaderList()) {
+377         xhr.call<void>("setRequestHeader", header.toStdString(), request.rawHeader(header).toStdString());
+378     }
+379      xhr.call<void>("send", dataToSend);
+380 }
+381 
+382 void QNetworkReplyWasmImplPrivate::emitReplyError(QNetworkReply::NetworkError errorCode, const QString &errorString)
+383 {
+384     Q_UNUSED(errorCode)
+385     Q_Q(QNetworkReplyWasmImpl);
+386 
+387     q->setError(errorCode, errorString);
+388     emit q->error(errorCode);
+389 
+390     q->setFinished(true);
+391     emit q->finished();
+392 }
+393 
+394 void QNetworkReplyWasmImplPrivate::emitDataReadProgress(qint64 bytesReceived, qint64 bytesTotal)
+395 {
+396     Q_Q(QNetworkReplyWasmImpl);
+397 
+398     totalDownloadSize = bytesTotal;
+399 
+400     percentFinished = (bytesReceived / bytesTotal) * 100;
+401 
+402     emit q->downloadProgress(bytesReceived, bytesTotal);
+403 }
+404 
+405 void QNetworkReplyWasmImplPrivate::dataReceived(const QByteArray &buffer, int bufferSize)
+406 {
+407     Q_Q(QNetworkReplyWasmImpl);
+408 
+409     if (bufferSize > 0)
+410         q->setReadBufferSize(bufferSize);
+411 
+412     bytesDownloaded = bufferSize;
+413 
+414     if (percentFinished != 100)
+415         downloadBufferCurrentSize += bufferSize;
+416     else
+417         downloadBufferCurrentSize = bufferSize;
+418 
+419     totalDownloadSize = downloadBufferCurrentSize;
+420 
+421     downloadBuffer.append(buffer, bufferSize);
+422 
+423     if (downloadBufferCurrentSize == totalDownloadSize) {
+424          q->setFinished(true);
+425          emit q->finished();
+426      }
+427 }
+428 
+429 //taken from qnetworkrequest.cpp
+430 static int parseHeaderName(const QByteArray &headerName)
+431 {
+432     if (headerName.isEmpty())
+433         return -1;
+434 
+435     switch (tolower(headerName.at(0))) {
+436     case 'c':
+437         if (qstricmp(headerName.constData(), "content-type") == 0)
+438             return QNetworkRequest::ContentTypeHeader;
+439         else if (qstricmp(headerName.constData(), "content-length") == 0)
+440             return QNetworkRequest::ContentLengthHeader;
+441         else if (qstricmp(headerName.constData(), "cookie") == 0)
+442             return QNetworkRequest::CookieHeader;
+443         break;
+444 
+445     case 'l':
+446         if (qstricmp(headerName.constData(), "location") == 0)
+447             return QNetworkRequest::LocationHeader;
+448         else if (qstricmp(headerName.constData(), "last-modified") == 0)
+449             return QNetworkRequest::LastModifiedHeader;
+450         break;
+451 
+452     case 's':
+453         if (qstricmp(headerName.constData(), "set-cookie") == 0)
+454             return QNetworkRequest::SetCookieHeader;
+455         else if (qstricmp(headerName.constData(), "server") == 0)
+456             return QNetworkRequest::ServerHeader;
+457         break;
+458 
+459     case 'u':
+460         if (qstricmp(headerName.constData(), "user-agent") == 0)
+461             return QNetworkRequest::UserAgentHeader;
+462         break;
+463     }
+464 
+465     return -1; // nothing found
+466 }
+467 
+468 
+469 void QNetworkReplyWasmImplPrivate::headersReceived(const QString &bufferString)
+470 {
+471     Q_Q(QNetworkReplyWasmImpl);
+472 
+473     if (!bufferString.isEmpty()) {
+474         QStringList headers = bufferString.split(QString::fromUtf8("\r\n"), QString::SkipEmptyParts);
+475 
+476         for (int i = 0; i < headers.size(); i++) {
+477             QString headerName = headers.at(i).split(QString::fromUtf8(": ")).at(0);
+478             QString headersValue = headers.at(i).split(QString::fromUtf8(": ")).at(1);
+479             if (headerName.isEmpty() || headersValue.isEmpty())
+480                 continue;
+481 
+482             int headerIndex = parseHeaderName(headerName.toLocal8Bit());
+483 
+484             if (headerIndex == -1)
+485                 q->setRawHeader(headerName.toLocal8Bit(), headersValue.toLocal8Bit());
+486             else
+487                 q->setHeader(static_cast<QNetworkRequest::KnownHeaders>(headerIndex), (QVariant)headersValue);
+488         }
+489     }
+490     emit q->metaDataChanged();
+491 }
+492 
+493 void QNetworkReplyWasmImplPrivate::_q_bufferOutgoingDataFinished()
+494 {
+495     Q_Q(QNetworkReplyWasmImpl);
+496 
+497     // make sure this is only called once, ever.
+498     //_q_bufferOutgoingData may call it or the readChannelFinished emission
+499     if (state != Buffering)
+500         return;
+501 
+502     // disconnect signals
+503     QObject::disconnect(outgoingData, SIGNAL(readyRead()), q, SLOT(_q_bufferOutgoingData()));
+504     QObject::disconnect(outgoingData, SIGNAL(readChannelFinished()), q, SLOT(_q_bufferOutgoingDataFinished()));
+505 
+506     // finally, start the request
+507     doSendRequest();
+508 }
+509 
+510 void QNetworkReplyWasmImplPrivate::_q_bufferOutgoingData()
+511 {
+512     Q_Q(QNetworkReplyWasmImpl);
+513 
+514     if (!outgoingDataBuffer) {
+515         // first call, create our buffer
+516         outgoingDataBuffer = QSharedPointer<QRingBuffer>::create();
+517 
+518         QObject::connect(outgoingData, SIGNAL(readyRead()), q, SLOT(_q_bufferOutgoingData()));
+519         QObject::connect(outgoingData, SIGNAL(readChannelFinished()), q, SLOT(_q_bufferOutgoingDataFinished()));
+520     }
+521 
+522     qint64 bytesBuffered = 0;
+523     qint64 bytesToBuffer = 0;
+524 
+525     // read data into our buffer
+526     forever {
+527         bytesToBuffer = outgoingData->bytesAvailable();
+528         // unknown? just try 2 kB, this also ensures we always try to read the EOF
+529         if (bytesToBuffer <= 0)
+530             bytesToBuffer = 2*1024;
+531 
+532         char *dst = outgoingDataBuffer->reserve(bytesToBuffer);
+533         bytesBuffered = outgoingData->read(dst, bytesToBuffer);
+534 
+535         if (bytesBuffered == -1) {
+536             // EOF has been reached.
+537             outgoingDataBuffer->chop(bytesToBuffer);
+538 
+539             _q_bufferOutgoingDataFinished();
+540             break;
+541         } else if (bytesBuffered == 0) {
+542             // nothing read right now, just wait until we get called again
+543             outgoingDataBuffer->chop(bytesToBuffer);
+544 
+545             break;
+546         } else {
+547             // don't break, try to read() again
+548             outgoingDataBuffer->chop(bytesToBuffer - bytesBuffered);
+549         }
+550     }
+551 }
+552 
+553 //taken from qhttpthreaddelegate.cpp
+554 QNetworkReply::NetworkError QNetworkReplyWasmImplPrivate::statusCodeFromHttp(int httpStatusCode, const QUrl &url)
+555 {
+556     QNetworkReply::NetworkError code;
+557     // we've got an error
+558     switch (httpStatusCode) {
+559     case 400:               // Bad Request
+560         code = QNetworkReply::ProtocolInvalidOperationError;
+561         break;
+562 
+563     case 401:               // Authorization required
+564         code = QNetworkReply::AuthenticationRequiredError;
+565         break;
+566 
+567     case 403:               // Access denied
+568         code = QNetworkReply::ContentAccessDenied;
+569         break;
+570 
+571     case 404:               // Not Found
+572         code = QNetworkReply::ContentNotFoundError;
+573         break;
+574 
+575     case 405:               // Method Not Allowed
+576         code = QNetworkReply::ContentOperationNotPermittedError;
+577         break;
+578 
+579     case 407:
+580         code = QNetworkReply::ProxyAuthenticationRequiredError;
+581         break;
+582 
+583     case 409:               // Resource Conflict
+584         code = QNetworkReply::ContentConflictError;
+585         break;
+586 
+587     case 410:               // Content no longer available
+588         code = QNetworkReply::ContentGoneError;
+589         break;
+590 
+591     case 418:               // I'm a teapot
+592         code = QNetworkReply::ProtocolInvalidOperationError;
+593         break;
+594 
+595     case 500:               // Internal Server Error
+596         code = QNetworkReply::InternalServerError;
+597         break;
+598 
+599     case 501:               // Server does not support this functionality
+600         code = QNetworkReply::OperationNotImplementedError;
+601         break;
+602 
+603     case 503:               // Service unavailable
+604         code = QNetworkReply::ServiceUnavailableError;
+605         break;
+606 
+607     default:
+608         if (httpStatusCode > 500) {
+609             // some kind of server error
+610             code = QNetworkReply::UnknownServerError;
+611         } else if (httpStatusCode >= 400) {
+612             // content error we did not handle above
+613             code = QNetworkReply::UnknownContentError;
+614         } else {
+615             qWarning("QNetworkAccess: got HTTP status code %d which is not expected from url: \"%s\"",
+616                      httpStatusCode, qPrintable(url.toString()));
+617             code = QNetworkReply::ProtocolFailure;
+618         }
+619     };
+620 
+621     return code;
+622 }
+623 
+624 QT_END_NAMESPACE

@@ -1,0 +1,543 @@
+Please review the code below for security defects using the CWE (Common Weakness Enumeration) as a reference standard. If any are found, please describe the security defect in detail and indicate the corresponding line number of code and solution. If none are detected, state: 'No security defects are detected in the code'.
+
+1 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
+2 #    not use this file except in compliance with the License. You may obtain
+3 #    a copy of the License at
+4 #
+5 #         http://www.apache.org/licenses/LICENSE-2.0
+6 #
+7 #    Unless required by applicable law or agreed to in writing, software
+8 #    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+9 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+10 #    License for the specific language governing permissions and limitations
+11 #    under the License.
+12 """Placement API handlers for setting and deleting allocations."""
+13 
+14 import collections
+15 
+16 from oslo_log import log as logging
+17 from oslo_serialization import jsonutils
+18 from oslo_utils import encodeutils
+19 from oslo_utils import timeutils
+20 import webob
+21 
+22 from nova.api.openstack.placement import errors
+23 from nova.api.openstack.placement import exception
+24 from nova.api.openstack.placement import microversion
+25 from nova.api.openstack.placement.objects import resource_provider as rp_obj
+26 from nova.api.openstack.placement.policies import allocation as policies
+27 from nova.api.openstack.placement.schemas import allocation as schema
+28 from nova.api.openstack.placement import util
+29 from nova.api.openstack.placement import wsgi_wrapper
+30 from nova.i18n import _
+31 
+32 
+33 LOG = logging.getLogger(__name__)
+34 
+35 
+36 def _last_modified_from_allocations(allocations, want_version):
+37     """Given a set of allocation objects, returns the last modified timestamp.
+38     """
+39     # NOTE(cdent): The last_modified for an allocation will always be
+40     # based off the created_at column because allocations are only
+41     # ever inserted, never updated.
+42     last_modified = None
+43     # Only calculate last-modified if we are using a microversion that
+44     # supports it.
+45     get_last_modified = want_version and want_version.matches((1, 15))
+46     for allocation in allocations:
+47         if get_last_modified:
+48             last_modified = util.pick_last_modified(last_modified, allocation)
+49 
+50     last_modified = last_modified or timeutils.utcnow(with_timezone=True)
+51     return last_modified
+52 
+53 
+54 def _serialize_allocations_for_consumer(allocations, want_version):
+55     """Turn a list of allocations into a dict by resource provider uuid.
+56 
+57     {
+58         'allocations': {
+59             RP_UUID_1: {
+60                 'generation': GENERATION,
+61                 'resources': {
+62                     'DISK_GB': 4,
+63                     'VCPU': 2
+64                 }
+65             },
+66             RP_UUID_2: {
+67                 'generation': GENERATION,
+68                 'resources': {
+69                     'DISK_GB': 6,
+70                     'VCPU': 3
+71                 }
+72             }
+73         },
+74         # project_id and user_id are added with microverion 1.12
+75         'project_id': PROJECT_ID,
+76         'user_id': USER_ID,
+77         # Generation for consumer >= 1.28
+78         'consumer_generation': 1
+79     }
+80     """
+81     allocation_data = collections.defaultdict(dict)
+82     for allocation in allocations:
+83         key = allocation.resource_provider.uuid
+84         if 'resources' not in allocation_data[key]:
+85             allocation_data[key]['resources'] = {}
+86 
+87         resource_class = allocation.resource_class
+88         allocation_data[key]['resources'][resource_class] = allocation.used
+89         generation = allocation.resource_provider.generation
+90         allocation_data[key]['generation'] = generation
+91 
+92     result = {'allocations': allocation_data}
+93     if allocations and want_version.matches((1, 12)):
+94         # We're looking at a list of allocations by consumer id so project and
+95         # user are consistent across the list
+96         consumer = allocations[0].consumer
+97         project_id = consumer.project.external_id
+98         user_id = consumer.user.external_id
+99         result['project_id'] = project_id
+100         result['user_id'] = user_id
+101         show_consumer_gen = want_version.matches((1, 28))
+102         if show_consumer_gen:
+103             result['consumer_generation'] = consumer.generation
+104 
+105     return result
+106 
+107 
+108 def _serialize_allocations_for_resource_provider(allocations,
+109                                                  resource_provider,
+110                                                  want_version):
+111     """Turn a list of allocations into a dict by consumer id.
+112 
+113     {'resource_provider_generation': GENERATION,
+114      'allocations':
+115        CONSUMER_ID_1: {
+116            'resources': {
+117               'DISK_GB': 4,
+118               'VCPU': 2
+119            },
+120            # Generation for consumer >= 1.28
+121            'consumer_generation': 0
+122        },
+123        CONSUMER_ID_2: {
+124            'resources': {
+125               'DISK_GB': 6,
+126               'VCPU': 3
+127            },
+128            # Generation for consumer >= 1.28
+129            'consumer_generation': 0
+130        }
+131     }
+132     """
+133     show_consumer_gen = want_version.matches((1, 28))
+134     allocation_data = collections.defaultdict(dict)
+135     for allocation in allocations:
+136         key = allocation.consumer.uuid
+137         if 'resources' not in allocation_data[key]:
+138             allocation_data[key]['resources'] = {}
+139 
+140         resource_class = allocation.resource_class
+141         allocation_data[key]['resources'][resource_class] = allocation.used
+142 
+143         if show_consumer_gen:
+144             consumer_gen = None
+145             if allocation.consumer is not None:
+146                 consumer_gen = allocation.consumer.generation
+147             allocation_data[key]['consumer_generation'] = consumer_gen
+148 
+149     result = {'allocations': allocation_data}
+150     result['resource_provider_generation'] = resource_provider.generation
+151     return result
+152 
+153 
+154 # TODO(cdent): Extracting this is useful, for reuse by reshaper code,
+155 # but having it in this file seems wrong, however, since it uses
+156 # _new_allocations it's being left here for now. We need a place for shared
+157 # handler code, but util.py is already too big and too diverse.
+158 def create_allocation_list(context, data, consumers):
+159     """Create an AllocationList based on provided data.
+160 
+161     :param context: The placement context.
+162     :param data: A dictionary of multiple allocations by consumer uuid.
+163     :param consumers: A dictionary, keyed by consumer UUID, of Consumer objects
+164     :return: An AllocationList.
+165     :raises: `webob.exc.HTTPBadRequest` if a resource provider included in the
+166              allocations does not exist.
+167     """
+168     allocation_objects = []
+169 
+170     for consumer_uuid in data:
+171         allocations = data[consumer_uuid]['allocations']
+172         consumer = consumers[consumer_uuid]
+173         if allocations:
+174             rp_objs = _resource_providers_by_uuid(context, allocations.keys())
+175             for resource_provider_uuid in allocations:
+176                 resource_provider = rp_objs[resource_provider_uuid]
+177                 resources = allocations[resource_provider_uuid]['resources']
+178                 new_allocations = _new_allocations(context,
+179                                                    resource_provider,
+180                                                    consumer,
+181                                                    resources)
+182                 allocation_objects.extend(new_allocations)
+183         else:
+184             # The allocations are empty, which means wipe them out.
+185             # Internal to the allocation object this is signalled by a
+186             # used value of 0.
+187             allocations = rp_obj.AllocationList.get_all_by_consumer_id(
+188                 context, consumer_uuid)
+189             for allocation in allocations:
+190                 allocation.used = 0
+191                 allocation_objects.append(allocation)
+192 
+193     return rp_obj.AllocationList(context, objects=allocation_objects)
+194 
+195 
+196 @wsgi_wrapper.PlacementWsgify
+197 @util.check_accept('application/json')
+198 def list_for_consumer(req):
+199     """List allocations associated with a consumer."""
+200     context = req.environ['placement.context']
+201     context.can(policies.ALLOC_LIST)
+202     consumer_id = util.wsgi_path_item(req.environ, 'consumer_uuid')
+203     want_version = req.environ[microversion.MICROVERSION_ENVIRON]
+204 
+205     # NOTE(cdent): There is no way for a 404 to be returned here,
+206     # only an empty result. We do not have a way to validate a
+207     # consumer id.
+208     allocations = rp_obj.AllocationList.get_all_by_consumer_id(
+209         context, consumer_id)
+210 
+211     output = _serialize_allocations_for_consumer(allocations, want_version)
+212     last_modified = _last_modified_from_allocations(allocations, want_version)
+213     allocations_json = jsonutils.dumps(output)
+214 
+215     response = req.response
+216     response.status = 200
+217     response.body = encodeutils.to_utf8(allocations_json)
+218     response.content_type = 'application/json'
+219     if want_version.matches((1, 15)):
+220         response.last_modified = last_modified
+221         response.cache_control = 'no-cache'
+222     return response
+223 
+224 
+225 @wsgi_wrapper.PlacementWsgify
+226 @util.check_accept('application/json')
+227 def list_for_resource_provider(req):
+228     """List allocations associated with a resource provider."""
+229     # TODO(cdent): On a shared resource provider (for example a
+230     # giant disk farm) this list could get very long. At the moment
+231     # we have no facility for limiting the output. Given that we are
+232     # using a dict of dicts for the output we are potentially limiting
+233     # ourselves in terms of sorting and filtering.
+234     context = req.environ['placement.context']
+235     context.can(policies.RP_ALLOC_LIST)
+236     want_version = req.environ[microversion.MICROVERSION_ENVIRON]
+237     uuid = util.wsgi_path_item(req.environ, 'uuid')
+238 
+239     # confirm existence of resource provider so we get a reasonable
+240     # 404 instead of empty list
+241     try:
+242         rp = rp_obj.ResourceProvider.get_by_uuid(context, uuid)
+243     except exception.NotFound as exc:
+244         raise webob.exc.HTTPNotFound(
+245             _("Resource provider '%(rp_uuid)s' not found: %(error)s") %
+246             {'rp_uuid': uuid, 'error': exc})
+247 
+248     allocs = rp_obj.AllocationList.get_all_by_resource_provider(context, rp)
+249 
+250     output = _serialize_allocations_for_resource_provider(
+251         allocs, rp, want_version)
+252     last_modified = _last_modified_from_allocations(allocs, want_version)
+253     allocations_json = jsonutils.dumps(output)
+254 
+255     response = req.response
+256     response.status = 200
+257     response.body = encodeutils.to_utf8(allocations_json)
+258     response.content_type = 'application/json'
+259     if want_version.matches((1, 15)):
+260         response.last_modified = last_modified
+261         response.cache_control = 'no-cache'
+262     return response
+263 
+264 
+265 def _resource_providers_by_uuid(ctx, rp_uuids):
+266     """Helper method that returns a dict, keyed by resource provider UUID, of
+267     ResourceProvider objects.
+268 
+269     :param ctx: The placement context.
+270     :param rp_uuids: iterable of UUIDs for providers to fetch.
+271     :raises: `webob.exc.HTTPBadRequest` if any of the UUIDs do not refer to
+272              an existing resource provider.
+273     """
+274     res = {}
+275     for rp_uuid in rp_uuids:
+276         # TODO(jaypipes): Clearly, this is not efficient to do one query for
+277         # each resource provider UUID in the allocations instead of doing a
+278         # single query for all the UUIDs. However, since
+279         # ResourceProviderList.get_all_by_filters() is way too complicated for
+280         # this purpose and doesn't raise NotFound anyway, we'll do this.
+281         # Perhaps consider adding a ResourceProviderList.get_all_by_uuids()
+282         # later on?
+283         try:
+284             res[rp_uuid] = rp_obj.ResourceProvider.get_by_uuid(ctx, rp_uuid)
+285         except exception.NotFound:
+286             raise webob.exc.HTTPBadRequest(
+287                 _("Allocation for resource provider '%(rp_uuid)s' "
+288                   "that does not exist.") %
+289                 {'rp_uuid': rp_uuid})
+290     return res
+291 
+292 
+293 def _new_allocations(context, resource_provider, consumer, resources):
+294     """Create new allocation objects for a set of resources
+295 
+296     Returns a list of Allocation objects
+297 
+298     :param context: The placement context.
+299     :param resource_provider: The resource provider that has the resources.
+300     :param consumer: The Consumer object consuming the resources.
+301     :param resources: A dict of resource classes and values.
+302     """
+303     allocations = []
+304     for resource_class in resources:
+305         allocation = rp_obj.Allocation(
+306             resource_provider=resource_provider,
+307             consumer=consumer,
+308             resource_class=resource_class,
+309             used=resources[resource_class])
+310         allocations.append(allocation)
+311     return allocations
+312 
+313 
+314 def _delete_consumers(consumers):
+315     """Helper function that deletes any consumer object supplied to it
+316 
+317     :param consumers: iterable of Consumer objects to delete
+318     """
+319     for consumer in consumers:
+320         try:
+321             consumer.delete()
+322             LOG.debug("Deleted auto-created consumer with consumer UUID "
+323                       "%s after failed allocation", consumer.uuid)
+324         except Exception as err:
+325             LOG.warning("Got an exception when deleting auto-created "
+326                         "consumer with UUID %s: %s", consumer.uuid, err)
+327 
+328 
+329 def _set_allocations_for_consumer(req, schema):
+330     context = req.environ['placement.context']
+331     context.can(policies.ALLOC_UPDATE)
+332     consumer_uuid = util.wsgi_path_item(req.environ, 'consumer_uuid')
+333     data = util.extract_json(req.body, schema)
+334     allocation_data = data['allocations']
+335 
+336     # Normalize allocation data to dict.
+337     want_version = req.environ[microversion.MICROVERSION_ENVIRON]
+338     if not want_version.matches((1, 12)):
+339         allocations_dict = {}
+340         # Allocation are list-ish, transform to dict-ish
+341         for allocation in allocation_data:
+342             resource_provider_uuid = allocation['resource_provider']['uuid']
+343             allocations_dict[resource_provider_uuid] = {
+344                 'resources': allocation['resources']
+345             }
+346         allocation_data = allocations_dict
+347 
+348     allocation_objects = []
+349     # Consumer object saved in case we need to delete the auto-created consumer
+350     # record
+351     consumer = None
+352     # Whether we created a new consumer record
+353     created_new_consumer = False
+354     if not allocation_data:
+355         # The allocations are empty, which means wipe them out. Internal
+356         # to the allocation object this is signalled by a used value of 0.
+357         # We still need to verify the consumer's generation, though, which
+358         # we do in _ensure_consumer()
+359         # NOTE(jaypipes): This will only occur 1.28+. The JSONSchema will
+360         # prevent an empty allocations object from being passed when there is
+361         # no consumer generation, so this is safe to do.
+362         util.ensure_consumer(context, consumer_uuid, data.get('project_id'),
+363              data.get('user_id'), data.get('consumer_generation'),
+364              want_version)
+365         allocations = rp_obj.AllocationList.get_all_by_consumer_id(
+366             context, consumer_uuid)
+367         for allocation in allocations:
+368             allocation.used = 0
+369             allocation_objects.append(allocation)
+370     else:
+371         # If the body includes an allocation for a resource provider
+372         # that does not exist, raise a 400.
+373         rp_objs = _resource_providers_by_uuid(context, allocation_data.keys())
+374         consumer, created_new_consumer = util.ensure_consumer(
+375             context, consumer_uuid, data.get('project_id'),
+376             data.get('user_id'), data.get('consumer_generation'),
+377             want_version)
+378         for resource_provider_uuid, allocation in allocation_data.items():
+379             resource_provider = rp_objs[resource_provider_uuid]
+380             new_allocations = _new_allocations(context,
+381                                                resource_provider,
+382                                                consumer,
+383                                                allocation['resources'])
+384             allocation_objects.extend(new_allocations)
+385 
+386     allocations = rp_obj.AllocationList(
+387         context, objects=allocation_objects)
+388 
+389     def _create_allocations(alloc_list):
+390         try:
+391             alloc_list.create_all()
+392             LOG.debug("Successfully wrote allocations %s", alloc_list)
+393         except Exception:
+394             if created_new_consumer:
+395                 _delete_consumers([consumer])
+396             raise
+397 
+398     try:
+399         _create_allocations(allocations)
+400     # InvalidInventory is a parent for several exceptions that
+401     # indicate either that Inventory is not present, or that
+402     # capacity limits have been exceeded.
+403     except exception.NotFound as exc:
+404         raise webob.exc.HTTPBadRequest(
+405                 _("Unable to allocate inventory for consumer "
+406                   "%(consumer_uuid)s: %(error)s") %
+407             {'consumer_uuid': consumer_uuid, 'error': exc})
+408     except exception.InvalidInventory as exc:
+409         raise webob.exc.HTTPConflict(
+410             _('Unable to allocate inventory: %(error)s') % {'error': exc})
+411     except exception.ConcurrentUpdateDetected as exc:
+412         raise webob.exc.HTTPConflict(
+413             _('Inventory and/or allocations changed while attempting to '
+414               'allocate: %(error)s') % {'error': exc},
+415               comment=errors.CONCURRENT_UPDATE)
+416 
+417     req.response.status = 204
+418     req.response.content_type = None
+419     return req.response
+420 
+421 
+422 @wsgi_wrapper.PlacementWsgify
+423 @microversion.version_handler('1.0', '1.7')
+424 @util.require_content('application/json')
+425 def set_allocations_for_consumer(req):
+426     return _set_allocations_for_consumer(req, schema.ALLOCATION_SCHEMA)
+427 
+428 
+429 @wsgi_wrapper.PlacementWsgify  # noqa
+430 @microversion.version_handler('1.8', '1.11')
+431 @util.require_content('application/json')
+432 def set_allocations_for_consumer(req):
+433     return _set_allocations_for_consumer(req, schema.ALLOCATION_SCHEMA_V1_8)
+434 
+435 
+436 @wsgi_wrapper.PlacementWsgify  # noqa
+437 @microversion.version_handler('1.12', '1.27')
+438 @util.require_content('application/json')
+439 def set_allocations_for_consumer(req):
+440     return _set_allocations_for_consumer(req, schema.ALLOCATION_SCHEMA_V1_12)
+441 
+442 
+443 @wsgi_wrapper.PlacementWsgify  # noqa
+444 @microversion.version_handler('1.28')
+445 @util.require_content('application/json')
+446 def set_allocations_for_consumer(req):
+447     return _set_allocations_for_consumer(req, schema.ALLOCATION_SCHEMA_V1_28)
+448 
+449 
+450 @wsgi_wrapper.PlacementWsgify
+451 @microversion.version_handler('1.13')
+452 @util.require_content('application/json')
+453 def set_allocations(req):
+454     context = req.environ['placement.context']
+455     context.can(policies.ALLOC_MANAGE)
+456     want_version = req.environ[microversion.MICROVERSION_ENVIRON]
+457     want_schema = schema.POST_ALLOCATIONS_V1_13
+458     if want_version.matches((1, 28)):
+459         want_schema = schema.POST_ALLOCATIONS_V1_28
+460     data = util.extract_json(req.body, want_schema)
+461 
+462     # First, ensure that all consumers referenced in the payload actually
+463     # exist. And if not, create them. Keep a record of auto-created consumers
+464     # so we can clean them up if the end allocation create_all() fails.
+465     consumers = {}  # dict of Consumer objects, keyed by consumer UUID
+466     new_consumers_created = []
+467     for consumer_uuid in data:
+468         project_id = data[consumer_uuid]['project_id']
+469         user_id = data[consumer_uuid]['user_id']
+470         consumer_generation = data[consumer_uuid].get('consumer_generation')
+471         consumer, new_consumer_created = util.ensure_consumer(
+472             context, consumer_uuid, project_id, user_id, consumer_generation,
+473             want_version)
+474         if new_consumer_created:
+475             new_consumers_created.append(consumer)
+476         consumers[consumer_uuid] = consumer
+477 
+478     # Create a sequence of allocation objects to be used in one
+479     # AllocationList.create_all() call, which will mean all the changes
+480     # happen within a single transaction and with resource provider
+481     # and consumer generations (if applicable) check all in one go.
+482     allocations = create_allocation_list(context, data, consumers)
+483 
+484     def _create_allocations(alloc_list):
+485         try:
+486             alloc_list.create_all()
+487             LOG.debug("Successfully wrote allocations %s", alloc_list)
+488         except Exception:
+489             _delete_consumers(new_consumers_created)
+490             raise
+491 
+492     try:
+493         _create_allocations(allocations)
+494     except exception.NotFound as exc:
+495         raise webob.exc.HTTPBadRequest(
+496             _("Unable to allocate inventory %(error)s") % {'error': exc})
+497     except exception.InvalidInventory as exc:
+498         # InvalidInventory is a parent for several exceptions that
+499         # indicate either that Inventory is not present, or that
+500         # capacity limits have been exceeded.
+501         raise webob.exc.HTTPConflict(
+502             _('Unable to allocate inventory: %(error)s') % {'error': exc})
+503     except exception.ConcurrentUpdateDetected as exc:
+504         raise webob.exc.HTTPConflict(
+505             _('Inventory and/or allocations changed while attempting to '
+506               'allocate: %(error)s') % {'error': exc},
+507               comment=errors.CONCURRENT_UPDATE)
+508 
+509     req.response.status = 204
+510     req.response.content_type = None
+511     return req.response
+512 
+513 
+514 @wsgi_wrapper.PlacementWsgify
+515 def delete_allocations(req):
+516     context = req.environ['placement.context']
+517     context.can(policies.ALLOC_DELETE)
+518     consumer_uuid = util.wsgi_path_item(req.environ, 'consumer_uuid')
+519 
+520     allocations = rp_obj.AllocationList.get_all_by_consumer_id(
+521         context, consumer_uuid)
+522     if allocations:
+523         try:
+524             allocations.delete_all()
+525         # NOTE(pumaranikar): Following NotFound exception added in the case
+526         # when allocation is deleted from allocations list by some other
+527         # activity. In that case, delete_all() will throw a NotFound exception.
+528         except exception.NotFound as exc:
+529             raise webob.exc.HTTPNotFound(
+530                   _("Allocation for consumer with id %(id)s not found."
+531                     "error: %(error)s") %
+532                   {'id': consumer_uuid, 'error': exc})
+533     else:
+534         raise webob.exc.HTTPNotFound(
+535             _("No allocations for consumer '%(consumer_uuid)s'") %
+536             {'consumer_uuid': consumer_uuid})
+537     LOG.debug("Successfully deleted allocations %s", allocations)
+538 
+539     req.response.status = 204
+540     req.response.content_type = None
+541     return req.response

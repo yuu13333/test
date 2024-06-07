@@ -1,0 +1,496 @@
+Based on the given code from a commit, please generate supplementary code files according to the commit message.
+####commit message
+Delete source allocations in move_allocations if target no longer exists
+
+During a resize, cold or live migration if the server is deleted
+after conductor has swapped the source node allocations to the
+migration record, when reverting the migration-based allocations
+the move_allocations method will re-create and leak the source node
+allocations for the now-deleted server.
+
+Note that move_allocations re-creates the target consumer allocations
+because it's not enforcing the consumer_generation (it's using .get()
+on the target_alloc dict) and POST /allocations will re-create the
+consumer if consumer_generation=None.
+
+This change simply deletes the source consumer allocations (the
+migration-based allocations on the source node when reverting allocations
+during a migration failure) when the target consumer is gone. This is
+effectively what move_allocations was doing with POST /allocations
+anyway by passing allocations={} for the source consumer. As a result,
+if we do call POST /allocations we know the target consumer exists
+and we can enforce that its consumer generation is honored.
+
+To distinguish when the caller expects the target consumer to not yet
+have allocations, like when initiating a migration-based allocation,
+from when the target consumer should exist, like when reverting
+allocations on failure, a new target_is_new kwarg is added to
+move_allocations.
+
+Change-Id: I35c41989b770f799cec1415ee5e2af023656f3a5
+Closes-Bug: #1848343
+
+####code 
+1 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
+2 #    not use this file except in compliance with the License. You may obtain
+3 #    a copy of the License at
+4 #
+5 #         http://www.apache.org/licenses/LICENSE-2.0
+6 #
+7 #    Unless required by applicable law or agreed to in writing, software
+8 #    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+9 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+10 #    License for the specific language governing permissions and limitations
+11 #    under the License.
+12 
+13 from oslo_log import log as logging
+14 from oslo_serialization import jsonutils
+15 
+16 from nova import availability_zones
+17 from nova.compute import utils as compute_utils
+18 from nova.conductor.tasks import base
+19 from nova import exception
+20 from nova.i18n import _
+21 from nova import objects
+22 from nova.scheduler.client import report
+23 from nova.scheduler import utils as scheduler_utils
+24 
+25 LOG = logging.getLogger(__name__)
+26 
+27 
+28 def replace_allocation_with_migration(context, instance, migration):
+29     """Replace instance's allocation with one for a migration.
+30 
+31     :raises: keystoneauth1.exceptions.base.ClientException on failure to
+32              communicate with the placement API
+33     :raises: ConsumerAllocationRetrievalFailed if reading the current
+34              allocation from placement fails
+35     :raises: ComputeHostNotFound if the host of the instance is not found in
+36              the databse
+37     :raises: AllocationMoveFailed if moving the allocation from the
+38              instance.uuid to the migration.uuid fails due to parallel
+39              placement operation on the instance consumer
+40     :raises: NoValidHost if placement rejectes the update for other reasons
+41              (e.g. not enough resources)
+42     :returns: (source_compute_node, migration_allocation)
+43     """
+44     try:
+45         source_cn = objects.ComputeNode.get_by_host_and_nodename(
+46             context, instance.host, instance.node)
+47     except exception.ComputeHostNotFound:
+48         LOG.error('Unable to find record for source '
+49                   'node %(node)s on %(host)s',
+50                   {'host': instance.host, 'node': instance.node},
+51                   instance=instance)
+52         # A generic error like this will just error out the migration
+53         # and do any rollback required
+54         raise
+55 
+56     reportclient = report.SchedulerReportClient()
+57 
+58     orig_alloc = reportclient.get_allocs_for_consumer(
+59         context, instance.uuid)['allocations']
+60     root_alloc = orig_alloc.get(source_cn.uuid, {}).get('resources', {})
+61     if not root_alloc:
+62         LOG.debug('Unable to find existing allocations for instance on '
+63                   'source compute node: %s. This is normal if you are not '
+64                   'using the FilterScheduler.', source_cn.uuid,
+65                   instance=instance)
+66         return None, None
+67 
+68     # FIXME(gibi): This method is flawed in that it does not handle allocations
+69     # against sharing providers in any special way. This leads to duplicate
+70     # allocations against the sharing provider during migration.
+71     success = reportclient.move_allocations(context, instance.uuid,
+72                                             migration.uuid)
+73     if not success:
+74         LOG.error('Unable to replace resource claim on source '
+75                   'host %(host)s node %(node)s for instance',
+76                   {'host': instance.host,
+77                    'node': instance.node},
+78                   instance=instance)
+79         # Mimic the "no space" error that could have come from the
+80         # scheduler. Once we have an atomic replace operation, this
+81         # would be a severe error.
+82         raise exception.NoValidHost(
+83             reason=_('Unable to replace instance claim on source'))
+84     else:
+85         LOG.debug('Created allocations for migration %(mig)s on %(rp)s',
+86                   {'mig': migration.uuid, 'rp': source_cn.uuid})
+87 
+88     return source_cn, orig_alloc
+89 
+90 
+91 def revert_allocation_for_migration(context, source_cn, instance, migration):
+92     """Revert an allocation made for a migration back to the instance."""
+93 
+94     reportclient = report.SchedulerReportClient()
+95 
+96     # FIXME(gibi): This method is flawed in that it does not handle allocations
+97     # against sharing providers in any special way. This leads to duplicate
+98     # allocations against the sharing provider during migration.
+99     success = reportclient.move_allocations(context, migration.uuid,
+100                                             instance.uuid,
+101                                             target_is_new=False)
+102     if not success:
+103         LOG.error('Unable to replace resource claim on source '
+104                   'host %(host)s node %(node)s for instance',
+105                   {'host': instance.host,
+106                    'node': instance.node},
+107                   instance=instance)
+108     else:
+109         LOG.debug('Created allocations for instance %(inst)s on %(rp)s',
+110                   {'inst': instance.uuid, 'rp': source_cn.uuid})
+111 
+112 
+113 class MigrationTask(base.TaskBase):
+114     def __init__(self, context, instance, flavor,
+115                  request_spec, clean_shutdown, compute_rpcapi,
+116                  query_client, report_client, host_list, network_api):
+117         super(MigrationTask, self).__init__(context, instance)
+118         self.clean_shutdown = clean_shutdown
+119         self.request_spec = request_spec
+120         self.flavor = flavor
+121 
+122         self.compute_rpcapi = compute_rpcapi
+123         self.query_client = query_client
+124         self.reportclient = report_client
+125         self.host_list = host_list
+126         self.network_api = network_api
+127 
+128         # Persist things from the happy path so we don't have to look
+129         # them up if we need to roll back
+130         self._migration = None
+131         self._held_allocations = None
+132         self._source_cn = None
+133 
+134     def _preallocate_migration(self):
+135         # If this is a rescheduled migration, don't create a new record.
+136         migration_type = ("resize" if self.instance.flavor.id != self.flavor.id
+137                 else "migration")
+138         filters = {"instance_uuid": self.instance.uuid,
+139                    "migration_type": migration_type,
+140                    "status": "pre-migrating"}
+141         migrations = objects.MigrationList.get_by_filters(self.context,
+142                 filters).objects
+143         if migrations:
+144             migration = migrations[0]
+145         else:
+146             migration = objects.Migration(context=self.context.elevated())
+147             migration.old_instance_type_id = self.instance.flavor.id
+148             migration.new_instance_type_id = self.flavor.id
+149             migration.status = 'pre-migrating'
+150             migration.instance_uuid = self.instance.uuid
+151             migration.source_compute = self.instance.host
+152             migration.source_node = self.instance.node
+153             migration.migration_type = migration_type
+154             migration.create()
+155 
+156         self._migration = migration
+157 
+158         self._source_cn, self._held_allocations = (
+159             replace_allocation_with_migration(self.context,
+160                                               self.instance,
+161                                               self._migration))
+162 
+163         return migration
+164 
+165     def _restrict_request_spec_to_cell(self, legacy_props):
+166         # NOTE(danms): Right now we only support migrate to the same
+167         # cell as the current instance, so request that the scheduler
+168         # limit thusly.
+169         instance_mapping = objects.InstanceMapping.get_by_instance_uuid(
+170             self.context, self.instance.uuid)
+171         LOG.debug('Requesting cell %(cell)s while migrating',
+172                   {'cell': instance_mapping.cell_mapping.identity},
+173                   instance=self.instance)
+174         if ('requested_destination' in self.request_spec and
+175                 self.request_spec.requested_destination):
+176             self.request_spec.requested_destination.cell = (
+177                 instance_mapping.cell_mapping)
+178             # NOTE(takashin): In the case that the target host is specified,
+179             # if the migration is failed, it is not necessary to retry
+180             # the cold migration to the same host. So make sure that
+181             # reschedule will not occur.
+182             if 'host' in self.request_spec.requested_destination:
+183                 legacy_props.pop('retry', None)
+184                 self.request_spec.retry = None
+185         else:
+186             self.request_spec.requested_destination = objects.Destination(
+187                 cell=instance_mapping.cell_mapping)
+188 
+189     def _support_resource_request(self, selection):
+190         """Returns true if the host is new enough to support resource request
+191         during migration and that the RPC API version is not pinned during
+192         rolling upgrade.
+193         """
+194         svc = objects.Service.get_by_host_and_binary(
+195             self.context, selection.service_host, 'nova-compute')
+196         return (svc.version >= 39 and
+197                 self.compute_rpcapi.supports_resize_with_qos_port(
+198                     self.context))
+199 
+200     # TODO(gibi): Remove this compat code when nova doesn't need to support
+201     # Train computes any more.
+202     def _get_host_supporting_request(self, selection_list):
+203         """Return the first compute selection from the selection_list where
+204         the service is new enough to support resource request during migration
+205         and the resources claimed successfully.
+206 
+207         :param selection_list: a list of Selection objects returned by the
+208             scheduler
+209         :return: A two tuple. The first item is a Selection object
+210             representing the host that supports the request. The second item
+211             is a list of Selection objects representing the remaining alternate
+212             hosts.
+213         :raises MaxRetriesExceeded: if none of the hosts in the selection_list
+214             is new enough to support the request or we cannot claim resource
+215             on any of the hosts that are new enough.
+216         """
+217 
+218         if not self.request_spec.requested_resources:
+219             return selection_list[0], selection_list[1:]
+220 
+221         # Scheduler allocated resources on the first host. So check if the
+222         # first host is new enough
+223         if self._support_resource_request(selection_list[0]):
+224             return selection_list[0], selection_list[1:]
+225 
+226         # First host is old, so we need to use an alternate. Therefore we have
+227         # to remove the allocation from the first host.
+228         self.reportclient.delete_allocation_for_instance(
+229             self.context, self.instance.uuid)
+230         LOG.debug(
+231             'Scheduler returned host %(host)s as a possible migration target '
+232             'but that host is not new enough to support the migration with '
+233             'resource request %(request)s or the compute RPC is pinned to '
+234             'less than 5.2. Trying alternate hosts.',
+235             {'host': selection_list[0].service_host,
+236              'request': self.request_spec.requested_resources},
+237             instance=self.instance)
+238 
+239         alternates = selection_list[1:]
+240 
+241         for i, selection in enumerate(alternates):
+242             if self._support_resource_request(selection):
+243                 # this host is new enough so we need to try to claim resources
+244                 # on it
+245                 if selection.allocation_request:
+246                     alloc_req = jsonutils.loads(
+247                         selection.allocation_request)
+248                     resource_claimed = scheduler_utils.claim_resources(
+249                         self.context, self.reportclient, self.request_spec,
+250                         self.instance.uuid, alloc_req,
+251                         selection.allocation_request_version)
+252 
+253                     if not resource_claimed:
+254                         LOG.debug(
+255                             'Scheduler returned alternate host %(host)s as a '
+256                             'possible migration target but resource claim '
+257                             'failed on that host. Trying another alternate.',
+258                             {'host': selection.service_host},
+259                             instance=self.instance)
+260                     else:
+261                         return selection, alternates[i + 1:]
+262 
+263                 else:
+264                     # Some deployments use different schedulers that do not
+265                     # use Placement, so they will not have an
+266                     # allocation_request to claim with. For those cases,
+267                     # there is no concept of claiming, so just assume that
+268                     # the resources are available.
+269                     return selection, alternates[i + 1:]
+270 
+271             else:
+272                 LOG.debug(
+273                     'Scheduler returned alternate host %(host)s as a possible '
+274                     'migration target but that host is not new enough to '
+275                     'support the migration with resource request %(request)s '
+276                     'or the compute RPC is pinned to less than 5.2. '
+277                     'Trying another alternate.',
+278                     {'host': selection.service_host,
+279                      'request': self.request_spec.requested_resources},
+280                     instance=self.instance)
+281 
+282         # if we reach this point then none of the hosts was new enough for the
+283         # request or we failed to claim resources on every alternate
+284         reason = ("Exhausted all hosts available during compute service level "
+285                   "check for instance %(instance_uuid)s." %
+286                   {"instance_uuid": self.instance.uuid})
+287         raise exception.MaxRetriesExceeded(reason=reason)
+288 
+289     def _execute(self):
+290         # NOTE(sbauza): Force_hosts/nodes needs to be reset if we want to make
+291         # sure that the next destination is not forced to be the original host.
+292         # This needs to be done before the populate_retry call otherwise
+293         # retries will be disabled if the server was created with a forced
+294         # host/node.
+295         self.request_spec.reset_forced_destinations()
+296 
+297         # TODO(sbauza): Remove once all the scheduler.utils methods accept a
+298         # RequestSpec object in the signature.
+299         legacy_props = self.request_spec.to_legacy_filter_properties_dict()
+300         scheduler_utils.setup_instance_group(self.context, self.request_spec)
+301         # If a target host is set in a requested destination,
+302         # 'populate_retry' need not be executed.
+303         if not ('requested_destination' in self.request_spec and
+304                     self.request_spec.requested_destination and
+305                         'host' in self.request_spec.requested_destination):
+306             scheduler_utils.populate_retry(legacy_props,
+307                                            self.instance.uuid)
+308 
+309         port_res_req = self.network_api.get_requested_resource_for_instance(
+310             self.context, self.instance.uuid)
+311         # NOTE(gibi): When cyborg or other module wants to handle similar
+312         # non-nova resources then here we have to collect all the external
+313         # resource requests in a single list and add them to the RequestSpec.
+314         self.request_spec.requested_resources = port_res_req
+315 
+316         self._restrict_request_spec_to_cell(legacy_props)
+317 
+318         # Once _preallocate_migration() is done, the source node allocation is
+319         # moved from the instance consumer to the migration record consumer,
+320         # and the instance consumer doesn't have any allocations. If this is
+321         # the first time through here (not a reschedule), select_destinations
+322         # below will allocate resources on the selected destination node for
+323         # the instance consumer. If we're rescheduling, host_list is not None
+324         # and we'll call claim_resources for the instance and the selected
+325         # alternate. If we exhaust our alternates and raise MaxRetriesExceeded,
+326         # the rollback() method should revert the allocation swaparoo and move
+327         # the source node allocation from the migration record back to the
+328         # instance record.
+329         migration = self._preallocate_migration()
+330 
+331         self.request_spec.ensure_project_and_user_id(self.instance)
+332         self.request_spec.ensure_network_metadata(self.instance)
+333         compute_utils.heal_reqspec_is_bfv(
+334             self.context, self.request_spec, self.instance)
+335         # On an initial call to migrate, 'self.host_list' will be None, so we
+336         # have to call the scheduler to get a list of acceptable hosts to
+337         # migrate to. That list will consist of a selected host, along with
+338         # zero or more alternates. On a reschedule, though, the alternates will
+339         # be passed to this object and stored in 'self.host_list', so we can
+340         # pop the first alternate from the list to use for the destination, and
+341         # pass the remaining alternates to the compute.
+342         if self.host_list is None:
+343             selection = self._schedule()
+344 
+345         else:
+346             # This is a reschedule that will use the supplied alternate hosts
+347             # in the host_list as destinations.
+348             selection = self._reschedule()
+349 
+350         scheduler_utils.populate_filter_properties(legacy_props, selection)
+351         # context is not serializable
+352         legacy_props.pop('context', None)
+353 
+354         (host, node) = (selection.service_host, selection.nodename)
+355 
+356         # The availability_zone field was added in v1.1 of the Selection
+357         # object so make sure to handle the case where it is missing.
+358         if 'availability_zone' in selection:
+359             self.instance.availability_zone = selection.availability_zone
+360         else:
+361             self.instance.availability_zone = (
+362                 availability_zones.get_host_availability_zone(
+363                     self.context, host))
+364 
+365         LOG.debug("Calling prep_resize with selected host: %s; "
+366                   "Selected node: %s; Alternates: %s", host, node,
+367                   self.host_list, instance=self.instance)
+368         # RPC cast to the destination host to start the migration process.
+369         self.compute_rpcapi.prep_resize(
+370             # NOTE(mriedem): Using request_spec.image here is potentially
+371             # dangerous if it is not kept up to date (i.e. rebuild/unshelve);
+372             # seems like the sane thing to do would be to pass the current
+373             # instance.image_meta since that is what MoveClaim will use for
+374             # any NUMA topology claims on the destination host...
+375             self.context, self.instance, self.request_spec.image,
+376             self.flavor, host, migration,
+377             request_spec=self.request_spec, filter_properties=legacy_props,
+378             node=node, clean_shutdown=self.clean_shutdown,
+379             host_list=self.host_list)
+380 
+381     def _schedule(self):
+382         selection_lists = self.query_client.select_destinations(
+383             self.context, self.request_spec, [self.instance.uuid],
+384             return_objects=True, return_alternates=True)
+385         # Since there is only ever one instance to migrate per call, we
+386         # just need the first returned element.
+387         selection_list = selection_lists[0]
+388 
+389         selection, self.host_list = self._get_host_supporting_request(
+390             selection_list)
+391 
+392         scheduler_utils.fill_provider_mapping(
+393             self.context, self.reportclient, self.request_spec, selection)
+394         return selection
+395 
+396     def _reschedule(self):
+397         # Since the resources on these alternates may have been consumed and
+398         # might not be able to support the migrated instance, we need to first
+399         # claim the resources to verify the host still has sufficient
+400         # available resources.
+401         elevated = self.context.elevated()
+402         host_available = False
+403         selection = None
+404         while self.host_list and not host_available:
+405             selection = self.host_list.pop(0)
+406             if (self.request_spec.requested_resources and not
+407                     self._support_resource_request(selection)):
+408                 LOG.debug(
+409                     'Scheduler returned alternate host %(host)s as a possible '
+410                     'migration target for re-schedule but that host is not '
+411                     'new enough to support the migration with resource '
+412                     'request %(request)s. Trying another alternate.',
+413                     {'host': selection.service_host,
+414                      'request': self.request_spec.requested_resources},
+415                     instance=self.instance)
+416                 continue
+417             if selection.allocation_request:
+418                 alloc_req = jsonutils.loads(selection.allocation_request)
+419             else:
+420                 alloc_req = None
+421             if alloc_req:
+422                 # If this call succeeds, the resources on the destination
+423                 # host will be claimed by the instance.
+424                 host_available = scheduler_utils.claim_resources(
+425                     elevated, self.reportclient, self.request_spec,
+426                     self.instance.uuid, alloc_req,
+427                     selection.allocation_request_version)
+428                 if host_available:
+429                     scheduler_utils.fill_provider_mapping(
+430                         self.context, self.reportclient, self.request_spec,
+431                         selection)
+432             else:
+433                 # Some deployments use different schedulers that do not
+434                 # use Placement, so they will not have an
+435                 # allocation_request to claim with. For those cases,
+436                 # there is no concept of claiming, so just assume that
+437                 # the host is valid.
+438                 host_available = True
+439         # There are no more available hosts. Raise a MaxRetriesExceeded
+440         # exception in that case.
+441         if not host_available:
+442             reason = ("Exhausted all hosts available for retrying build "
+443                       "failures for instance %(instance_uuid)s." %
+444                       {"instance_uuid": self.instance.uuid})
+445             raise exception.MaxRetriesExceeded(reason=reason)
+446         return selection
+447 
+448     def rollback(self):
+449         if self._migration:
+450             self._migration.status = 'error'
+451             self._migration.save()
+452 
+453         if not self._held_allocations:
+454             return
+455 
+456         # NOTE(danms): We created new-style migration-based
+457         # allocations for the instance, but failed before we kicked
+458         # off the migration in the compute. Normally the latter would
+459         # do that cleanup but we never got that far, so do it here and
+460         # now.
+461 
+462         revert_allocation_for_migration(self.context, self._source_cn,
+463                                         self.instance, self._migration)

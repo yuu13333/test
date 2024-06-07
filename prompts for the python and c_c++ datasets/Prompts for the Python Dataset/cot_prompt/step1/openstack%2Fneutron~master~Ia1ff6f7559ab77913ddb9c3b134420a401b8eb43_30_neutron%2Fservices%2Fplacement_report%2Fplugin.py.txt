@@ -1,0 +1,269 @@
+Based on the given code from a commit, please generate supplementary code files according to the commit message.
+####commit message
+Placement reporting service plugin
+
+This service plugin synchronizes ML2 mechanism driver agents' resource
+information to Placement. To use this service an agent must add
+'resource_provider_bandwidths' to the 'configurations' field of its
+RPC heartbeat. It also may add 'resource_provider_inventory_defaults'
+to fine tune Placement inventory parameters. Again to use this service a
+mechanism driver must implement get_standrd_device_mappings() and allocate
+a UUID as mechanism driver property 'resource_provider_uuid5_namespace'.
+
+The synchronization is triggered by:
+* any new agent object in the DB
+* restart of an agent (via 'start_flag' in the RPC heartbeat)
+* if an agent's 'resources_synced' attribute is not True (None/False)
+
+The latter should autoheal transient errors of the synchronization
+process. That is if a sync attemp fails then we store
+resources_synced=False which triggers a sync retry at each new heartbeat
+message until a sync attempt finally succeeds and we can set
+resources_synced=True.
+
+Since this code functionally depends on ML2 we can also consider making
+it part of ML2, but at the moment it is a service plugin for better
+decoupling. Even if you load the service plugin the logic gracefully
+degrades for heartbeat messages not containing resource provider info.
+
+If needed the sync can be forced in multiple ways. First, if you restart
+an agent then the RPs belonging to that agent will be re-synced. You may
+also delete the agent by 'openstack network agent delete' and let the
+next heartbeat message re-create the agent object. On re-creation the
+RPs belonging to that agent will be re-synced. On the other hand a
+neutron-server restart does not trigger a re-sync in any way. Depending
+on the trade-off between the admin's needs to force re-syncs and the
+performance of (not absolutely necessary) Placement updates re-sync
+conditions may be further fine tuned.
+
+Example config for neutron-server:
+
+neutron.conf:
+[DEFAULT]
+service_plugins = placement
+
+Change-Id: Ia1ff6f7559ab77913ddb9c3b134420a401b8eb43
+Co-Authored-By: Lajos Katona <lajos.katona@ericsson.com>
+Depends-On: https://review.openstack.org/586567
+Partial-Bug: #1578989
+See-Also: https://review.openstack.org/502306 (nova spec)
+See-Also: https://review.openstack.org/508149 (neutron spec)
+
+####code 
+1 # Copyright 2018 Ericsson
+2 #
+3 # Licensed under the Apache License, Version 2.0 (the "License");
+4 # you may not use this file except in compliance with the License.
+5 # You may obtain a copy of the License at
+6 #
+7 #     http://www.apache.org/licenses/LICENSE-2.0
+8 #
+9 # Unless required by applicable law or agreed to in writing, software
+10 # distributed under the License is distributed on an "AS IS" BASIS,
+11 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+12 # See the License for the specific language governing permissions and
+13 # limitations under the License.
+14 
+15 from neutron_lib.agent import constants as agent_const
+16 from neutron_lib.api.definitions import agent_resources_synced
+17 from neutron_lib.callbacks import events
+18 from neutron_lib.callbacks import registry
+19 from neutron_lib.callbacks import resources
+20 from neutron_lib.placement import client as place_client
+21 from neutron_lib.plugins import directory
+22 from neutron_lib.services import base as service_base
+23 from oslo_config import cfg
+24 from oslo_log import log as logging
+25 
+26 from neutron.agent.common import placement_report
+27 from neutron.notifiers import batch_notifier
+28 
+29 LOG = logging.getLogger(__name__)
+30 
+31 PLUGIN_TYPE = "placement_report"
+32 
+33 
+34 @registry.has_registry_receivers
+35 class PlacementReportPlugin(service_base.ServicePluginBase):
+36 
+37     supported_extension_aliases = []
+38 
+39     # A service plugin without claiming support for filter validation would
+40     # disable filter validation for all other plugins, so we report support
+41     # although this plugin doesn't have filters.
+42     __filter_validation_support = True
+43 
+44     @classmethod
+45     def get_plugin_type(cls):
+46         return PLUGIN_TYPE
+47 
+48     def get_plugin_description(self):
+49         return "Sync placement info from agent to server to placement."
+50 
+51     def __init__(self):
+52         self._core_plugin = directory.get_plugin()
+53         # NOTE(bence romsics): The following bug and fix may be relevant here.
+54         # https://bugs.launchpad.net/nova/+bug/1697825
+55         # https://review.openstack.org/493536
+56         self._placement_client = place_client.PlacementAPIClient(cfg.CONF)
+57         self._agents = PlacementReporterAgents(self._core_plugin)
+58         self._batch_notifier = batch_notifier.BatchNotifier(
+59             cfg.CONF.send_events_interval, self._execute_deferred)
+60 
+61     def _execute_deferred(self, deferred_batch):
+62         for deferred in deferred_batch:
+63             deferred()
+64 
+65     def _get_rp_by_name(self, name):
+66         rps = self._placement_client.list_resource_providers(
+67             name=name)['resource_providers']
+68         # RP names are unique, therefore we can get 0 or 1. But not many.
+69         if len(rps) != 1:
+70             # NOTE(bence romsics): While we could raise() here and by detect
+71             # an error a bit earlier, we want the error to surface in the
+72             # sync batch below so it is going to be properly caught and is
+73             # going to influence the agent's resources_synced attribute.
+74             LOG.warning(
+75                 'placement client: no such resource provider: %s', name)
+76             return {'uuid': None}
+77         return rps[0]
+78 
+79     def _sync_placement_state(self, agent, agent_db):
+80         configurations = agent['configurations']
+81         mech_driver = self._agents.mechanism_driver_by_agent_type(
+82             agent['agent_type'])
+83         uuid_ns = mech_driver.resource_provider_uuid5_namespace
+84         supported_vnic_types = mech_driver.supported_vnic_types
+85         device_mappings = mech_driver.get_standard_device_mappings(agent)
+86         agent_host_rp_uuid = self._get_rp_by_name(
+87             name=agent['host'])['uuid']
+88 
+89         state = placement_report.PlacementState(
+90             rp_bandwidths=configurations[
+91                 'resource_provider_bandwidths'],
+92             rp_inventory_defaults=configurations[
+93                 'resource_provider_inventory_defaults'],
+94             driver_uuid_namespace=uuid_ns,
+95             agent_type=agent['agent_type'],
+96             agent_host=agent['host'],
+97             agent_host_rp_uuid=agent_host_rp_uuid,
+98             device_mappings=device_mappings,
+99             supported_vnic_types=supported_vnic_types,
+100             client=self._placement_client)
+101 
+102         deferred_batch = state.deferred_sync()
+103 
+104         # NOTE(bence romsics): Some client calls depend on earlier
+105         # ones, but not all. There are calls in a batch that can succeed
+106         # independently of earlier calls. Therefore even if a call fails
+107         # we have to suppress its failure so the later independent calls
+108         # have a chance to succeed.  If we queue up the deferred client
+109         # calls one by one then we cannot handle errors at the end of
+110         # a batch. So instead we should wrap the deferred client calls
+111         # in a single deferred batch which executes the client calls,
+112         # continuing to the next client call even if there was an error
+113         # but remembering if an error happened. Then at the end of the
+114         # batch (also having access to the agent object) set the agent's
+115         # resources_synced attribute according to the success/failure
+116         # of the batch. Since each client call does monkey patched I/O
+117         # we'll yield to other eventlet threads in each call therefore
+118         # the performance should not be affected by the wrapping.
+119         def batch():
+120             errors = 0
+121 
+122             for deferred in deferred_batch:
+123                 try:
+124                     LOG.debug('placement client: {}'.format(deferred))
+125                     deferred.execute()
+126                 except Exception:
+127                     errors += 1
+128                     LOG.exception(
+129                         'placement client call failed: %s',
+130                         str(deferred))
+131 
+132             resources_synced = not bool(errors)
+133             agent_db.resources_synced = resources_synced
+134             agent_db.update()
+135 
+136             LOG.debug(
+137                 'Synchronization of resources'
+138                 ' of agent type %(type)s'
+139                 ' at host %(host)s'
+140                 ' to placement %(result)s.',
+141                 {'type': agent['agent_type'],
+142                  'host': agent['host'],
+143                  'result': 'succeeded' if resources_synced else 'failed'})
+144 
+145         self._batch_notifier.queue_event(batch)
+146 
+147     @registry.receives(resources.AGENT,
+148                        [events.AFTER_CREATE, events.AFTER_UPDATE])
+149     def handle_placement_config(self, resource, event, trigger, payload):
+150         # NOTE(bence romsics): This method gets called a lot, keep it quick.
+151         agent = payload.desired_state
+152         status = payload.metadata.get('status')
+153         context = payload.context
+154         if agent['agent_type'] not in self._agents.supported_agent_types:
+155             return
+156         if 'resource_provider_bandwidths' not in agent['configurations']:
+157             LOG.warning(
+158                 "The mechanism driver claims agent type supports "
+159                 "placement reports, but the agent does not report "
+160                 "'resoure_provider_bandwidths' in its configurations. "
+161                 "host: %(host)s, type: %(type)s",
+162                 {'host': agent['agent_type'],
+163                  'type': agent['host']})
+164             return
+165 
+166         # We need to get the same agent as in
+167         # neutron.db.agents_db.AgentDbMixin.create_or_update_agent()
+168         agent_db = self._core_plugin._get_agent_by_type_and_host(
+169             context, agent['agent_type'], agent['host'])
+170 
+171         # sync the state known by us to placement
+172         if (
+173                 # agent object in API (re-)created
+174                 status == agent_const.AGENT_NEW or
+175                 # agent (re-)started (even without config change)
+176                 'start_flag' in agent or
+177                 # never tried to sync yet or last sync failed
+178                 not agent_db[agent_resources_synced.RESOURCES_SYNCED]):
+179             LOG.debug('placement: syncing state')
+180             self._sync_placement_state(agent, agent_db)
+181         else:
+182             LOG.debug('placement: nothing to sync')
+183 
+184 
+185 class PlacementReporterAgents(object):
+186 
+187     # Yep, this is meant to depend on ML2.
+188     def __init__(self, ml2_plugin):
+189         self._mechanism_drivers = ml2_plugin.mechanism_manager.\
+190             ordered_mech_drivers
+191         self._supported_agent_types = []
+192         self._agent_type_to_mech_driver = {}
+193 
+194     @property
+195     def supported_agent_types(self):
+196         if not self._supported_agent_types:
+197             # NOTE(bence romsics): We treat the presence of the
+198             # RP uuid namespace a proxy for supporting placement reports from
+199             # the driver's agent type. But we could introduce a property/logic
+200             # explicitly describing the agent types supporting placement
+201             # reports any time if this proved to be insufficient.
+202             self._supported_agent_types = [
+203                 driver.obj.agent_type
+204                 for driver in self._mechanism_drivers
+205                 if driver.obj.resource_provider_uuid5_namespace is not None]
+206             LOG.debug('agent types supporting placement reports: %s',
+207                 ', '.join(self._supported_agent_types))
+208         return self._supported_agent_types
+209 
+210     def mechanism_driver_by_agent_type(self, agent_type):
+211         if agent_type not in self._agent_type_to_mech_driver:
+212             for driver in self._mechanism_drivers:
+213                 if (hasattr(driver.obj, 'agent_type') and
+214                         agent_type == driver.obj.agent_type):
+215                     self._agent_type_to_mech_driver[agent_type] = driver.obj
+216                     break
+217         return self._agent_type_to_mech_driver[agent_type]

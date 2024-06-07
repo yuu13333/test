@@ -1,0 +1,1548 @@
+I want you to act as a code reviewer of Qt Base in Qt. Please review the code below to detect security defects. If any are found, please describe the security defect in detail and indicate the corresponding line number of code and solution. If none are found, please state '''No security defects are detected in the code'''.
+
+1 /****************************************************************************
+2 **
+3 ** Copyright (C) 2016 The Qt Company Ltd.
+4 ** Contact: https://www.qt.io/licensing/
+5 **
+6 ** This file is part of the QtCore module of the Qt Toolkit.
+7 **
+8 ** $QT_BEGIN_LICENSE:LGPL$
+9 ** Commercial License Usage
+10 ** Licensees holding valid commercial Qt licenses may use this file in
+11 ** accordance with the commercial license agreement provided with the
+12 ** Software or, alternatively, in accordance with the terms contained in
+13 ** a written agreement between you and The Qt Company. For licensing terms
+14 ** and conditions see https://www.qt.io/terms-conditions. For further
+15 ** information use the contact form at https://www.qt.io/contact-us.
+16 **
+17 ** GNU Lesser General Public License Usage
+18 ** Alternatively, this file may be used under the terms of the GNU Lesser
+19 ** General Public License version 3 as published by the Free Software
+20 ** Foundation and appearing in the file LICENSE.LGPL3 included in the
+21 ** packaging of this file. Please review the following information to
+22 ** ensure the GNU Lesser General Public License version 3 requirements
+23 ** will be met: https://www.gnu.org/licenses/lgpl-3.0.html.
+24 **
+25 ** GNU General Public License Usage
+26 ** Alternatively, this file may be used under the terms of the GNU
+27 ** General Public License version 2.0 or (at your option) the GNU General
+28 ** Public license version 3 or any later version approved by the KDE Free
+29 ** Qt Foundation. The licenses are as published by the Free Software
+30 ** Foundation and appearing in the file LICENSE.GPL2 and LICENSE.GPL3
+31 ** included in the packaging of this file. Please review the following
+32 ** information to ensure the GNU General Public License requirements will
+33 ** be met: https://www.gnu.org/licenses/gpl-2.0.html and
+34 ** https://www.gnu.org/licenses/gpl-3.0.html.
+35 **
+36 ** $QT_END_LICENSE$
+37 **
+38 ****************************************************************************/
+39 
+40 #include "qresource.h"
+41 #include "qresource_p.h"
+42 #include "qresource_iterator_p.h"
+43 #include "qset.h"
+44 #include "qmutex.h"
+45 #include "qdebug.h"
+46 #include "qlocale.h"
+47 #include "qglobal.h"
+48 #include "qvector.h"
+49 #include "qdatetime.h"
+50 #include "qbytearray.h"
+51 #include "qstringlist.h"
+52 #include <qshareddata.h>
+53 #include <qplatformdefs.h>
+54 #include "private/qabstractfileengine_p.h"
+55 
+56 #ifdef Q_OS_UNIX
+57 # include "private/qcore_unix_p.h"
+58 #endif
+59 
+60 //#define DEBUG_RESOURCE_MATCH
+61 
+62 QT_BEGIN_NAMESPACE
+63 
+64 
+65 class QStringSplitter
+66 {
+67 public:
+68     QStringSplitter(const QString &s)
+69         : m_string(s), m_data(m_string.constData()), m_len(s.length()), m_pos(0)
+70     {
+71         m_splitChar = QLatin1Char('/');
+72     }
+73 
+74     inline bool hasNext() {
+75         while (m_pos < m_len && m_data[m_pos] == m_splitChar)
+76             ++m_pos;
+77         return m_pos < m_len;
+78     }
+79 
+80     inline QStringRef next() {
+81         int start = m_pos;
+82         while (m_pos < m_len && m_data[m_pos] != m_splitChar)
+83             ++m_pos;
+84         return QStringRef(&m_string, start, m_pos - start);
+85     }
+86 
+87     QString m_string;
+88     const QChar *m_data;
+89     QChar m_splitChar;
+90     int m_len;
+91     int m_pos;
+92 };
+93 
+94 
+95 //resource glue
+96 class QResourceRoot
+97 {
+98     enum Flags
+99     {
+100         Compressed = 0x01,
+101         Directory = 0x02
+102     };
+103     const uchar *tree, *names, *payloads;
+104     int version;
+105     inline int findOffset(int node) const { return node * (14 + (version >= 0x02 ? 8 : 0)); } //sizeof each tree element
+106     uint hash(int node) const;
+107     QString name(int node) const;
+108     short flags(int node) const;
+109 public:
+110     mutable QAtomicInt ref;
+111 
+112     inline QResourceRoot(): tree(0), names(0), payloads(0), version(0) {}
+113     inline QResourceRoot(int version, const uchar *t, const uchar *n, const uchar *d) { setSource(version, t, n, d); }
+114     virtual ~QResourceRoot() { }
+115     int findNode(const QString &path, const QLocale &locale=QLocale()) const;
+116     inline bool isContainer(int node) const { return flags(node) & Directory; }
+117     inline bool isCompressed(int node) const { return flags(node) & Compressed; }
+118     const uchar *data(int node, qint64 *size) const;
+119     QDateTime lastModified(int node) const;
+120     QStringList children(int node) const;
+121     virtual QString mappingRoot() const { return QString(); }
+122     bool mappingRootSubdir(const QString &path, QString *match=0) const;
+123     inline bool operator==(const QResourceRoot &other) const
+124     { return tree == other.tree && names == other.names && payloads == other.payloads && version == other.version; }
+125     inline bool operator!=(const QResourceRoot &other) const
+126     { return !operator==(other); }
+127     enum ResourceRootType { Resource_Builtin, Resource_File, Resource_Buffer };
+128     virtual ResourceRootType type() const { return Resource_Builtin; }
+129 
+130 protected:
+131     inline void setSource(int v, const uchar *t, const uchar *n, const uchar *d) {
+132         tree = t;
+133         names = n;
+134         payloads = d;
+135         version = v;
+136     }
+137 };
+138 
+139 static QString cleanPath(const QString &_path)
+140 {
+141     QString path = QDir::cleanPath(_path);
+142     // QDir::cleanPath does not remove two trailing slashes under _Windows_
+143     // due to support for UNC paths. Remove those manually.
+144     if (path.startsWith(QLatin1String("//")))
+145         path.remove(0, 1);
+146     return path;
+147 }
+148 
+149 Q_DECLARE_TYPEINFO(QResourceRoot, Q_MOVABLE_TYPE);
+150 
+151 Q_GLOBAL_STATIC_WITH_ARGS(QMutex, resourceMutex, (QMutex::Recursive))
+152 
+153 typedef QList<QResourceRoot*> ResourceList;
+154 Q_GLOBAL_STATIC(ResourceList, resourceList)
+155 
+156 Q_GLOBAL_STATIC(QStringList, resourceSearchPaths)
+157 
+158 /*!
+159     \class QResource
+160     \inmodule QtCore
+161     \brief The QResource class provides an interface for reading directly from resources.
+162 
+163     \ingroup io
+164 
+165     \reentrant
+166     \since 4.2
+167 
+168     QResource is an object that represents a set of data (and possibly
+169     children) relating to a single resource entity. QResource gives direct
+170     access to the bytes in their raw format. In this way direct access
+171     allows reading data without buffer copying or indirection. Indirection
+172     is often useful when interacting with the resource entity as if it is a
+173     file, this can be achieved with QFile. The data and children behind a
+174     QResource are normally compiled into an application/library, but it is
+175     also possible to load a resource at runtime. When loaded at run time
+176     the resource file will be loaded as one big set of data and then given
+177     out in pieces via references into the resource tree.
+178 
+179     A QResource can either be loaded with an absolute path, either treated
+180     as a file system rooted with a \c{/} character, or in resource notation
+181     rooted with a \c{:} character. A relative resource can also be opened
+182     which will be found in the list of paths returned by QDir::searchPaths().
+183 
+184     A QResource that is representing a file will have data backing it, this
+185     data can possibly be compressed, in which case qUncompress() must be
+186     used to access the real data; this happens implicitly when accessed
+187     through a QFile. A QResource that is representing a directory will have
+188     only children and no data.
+189 
+190     \section1 Dynamic Resource Loading
+191 
+192     A resource can be left out of an application's binary and loaded when
+193     it is needed at run-time by using the registerResource() function. The
+194     resource file passed into registerResource() must be a binary resource
+195     as created by rcc. Further information about binary resources can be
+196     found in \l{The Qt Resource System} documentation.
+197 
+198     This can often be useful when loading a large set of application icons
+199     that may change based on a setting, or that can be edited by a user and
+200     later recreated. The resource is immediately loaded into memory, either
+201     as a result of a single file read operation, or as a memory mapped file.
+202 
+203     This approach can prove to be a significant performance gain as only a
+204     single file will be loaded, and pieces of data will be given out via the
+205     path requested in setFileName().
+206 
+207     The unregisterResource() function removes a reference to a particular
+208     file. If there are QResource objects that currently reference resources related
+209     to the unregistered file, they will continue to be valid but the resource
+210     file itself will be removed from the resource roots, and thus no further
+211     QResource can be created pointing into this resource data. The resource
+212     itself will be unmapped from memory when the last QResource that points
+213     to it is destroyed.
+214 
+215     \sa {The Qt Resource System}, QFile, QDir, QFileInfo
+216 */
+217 
+218 class QResourcePrivate {
+219 public:
+220     inline QResourcePrivate(QResource *_q) : q_ptr(_q) { clear(); }
+221     inline ~QResourcePrivate() { clear(); }
+222 
+223     void ensureInitialized() const;
+224     void ensureChildren() const;
+225 
+226     bool load(const QString &file);
+227     void clear();
+228 
+229     QLocale locale;
+230     QString fileName, absoluteFilePath;
+231     QList<QResourceRoot*> related;
+232     uint container : 1;
+233     mutable uint compressed : 1;
+234     mutable qint64 size;
+235     mutable const uchar *data;
+236     mutable QStringList children;
+237     mutable QDateTime lastModified;
+238 
+239     QResource *q_ptr;
+240     Q_DECLARE_PUBLIC(QResource)
+241 };
+242 
+243 void
+244 QResourcePrivate::clear()
+245 {
+246     absoluteFilePath.clear();
+247     compressed = 0;
+248     data = 0;
+249     size = 0;
+250     children.clear();
+251     lastModified = QDateTime();
+252     container = 0;
+253     for(int i = 0; i < related.size(); ++i) {
+254         QResourceRoot *root = related.at(i);
+255         if(!root->ref.deref())
+256             delete root;
+257     }
+258     related.clear();
+259 }
+260 
+261 bool
+262 QResourcePrivate::load(const QString &file)
+263 {
+264     related.clear();
+265     QMutexLocker lock(resourceMutex());
+266     const ResourceList *list = resourceList();
+267     QString cleaned = cleanPath(file);
+268     for(int i = 0; i < list->size(); ++i) {
+269         QResourceRoot *res = list->at(i);
+270         const int node = res->findNode(cleaned, locale);
+271         if(node != -1) {
+272             if(related.isEmpty()) {
+273                 container = res->isContainer(node);
+274                 if(!container) {
+275                     data = res->data(node, &size);
+276                     compressed = res->isCompressed(node);
+277                 } else {
+278                     data = 0;
+279                     size = 0;
+280                     compressed = 0;
+281                 }
+282                 lastModified = res->lastModified(node);
+283             } else if(res->isContainer(node) != container) {
+284                 qWarning("QResourceInfo: Resource [%s] has both data and children!", file.toLatin1().constData());
+285             }
+286             res->ref.ref();
+287             related.append(res);
+288         } else if(res->mappingRootSubdir(file)) {
+289             container = true;
+290             data = 0;
+291             size = 0;
+292             compressed = 0;
+293             lastModified = QDateTime();
+294             res->ref.ref();
+295             related.append(res);
+296         }
+297     }
+298     return !related.isEmpty();
+299 }
+300 
+301 void
+302 QResourcePrivate::ensureInitialized() const
+303 {
+304     if(!related.isEmpty())
+305         return;
+306     QResourcePrivate *that = const_cast<QResourcePrivate *>(this);
+307     if(fileName == QLatin1String(":"))
+308         that->fileName += QLatin1Char('/');
+309     that->absoluteFilePath = fileName;
+310     if(!that->absoluteFilePath.startsWith(QLatin1Char(':')))
+311         that->absoluteFilePath.prepend(QLatin1Char(':'));
+312 
+313     QStringRef path(&fileName);
+314     if(path.startsWith(QLatin1Char(':')))
+315         path = path.mid(1);
+316 
+317     if(path.startsWith(QLatin1Char('/'))) {
+318         that->load(path.toString());
+319     } else {
+320         QMutexLocker lock(resourceMutex());
+321         QStringList searchPaths = *resourceSearchPaths();
+322         searchPaths << QLatin1String("");
+323         for(int i = 0; i < searchPaths.size(); ++i) {
+324             const QString searchPath(searchPaths.at(i) + QLatin1Char('/') + path);
+325             if(that->load(searchPath)) {
+326                 that->absoluteFilePath = QLatin1Char(':') + searchPath;
+327                 break;
+328             }
+329         }
+330     }
+331 }
+332 
+333 void
+334 QResourcePrivate::ensureChildren() const
+335 {
+336     ensureInitialized();
+337     if(!children.isEmpty() || !container || related.isEmpty())
+338         return;
+339 
+340     QString path = absoluteFilePath, k;
+341     if(path.startsWith(QLatin1Char(':')))
+342         path = path.mid(1);
+343     QSet<QString> kids;
+344     QString cleaned = cleanPath(path);
+345     for(int i = 0; i < related.size(); ++i) {
+346         QResourceRoot *res = related.at(i);
+347         if(res->mappingRootSubdir(path, &k) && !k.isEmpty()) {
+348             if(!kids.contains(k)) {
+349                 children += k;
+350                 kids.insert(k);
+351             }
+352         } else {
+353             const int node = res->findNode(cleaned);
+354             if(node != -1) {
+355                 QStringList related_children = res->children(node);
+356                 for(int kid = 0; kid < related_children.size(); ++kid) {
+357                     k = related_children.at(kid);
+358                     if(!kids.contains(k)) {
+359                         children += k;
+360                         kids.insert(k);
+361                     }
+362                 }
+363             }
+364         }
+365     }
+366 }
+367 
+368 /*!
+369     Constructs a QResource pointing to \a file. \a locale is used to
+370     load a specific localization of a resource data.
+371 
+372     \sa QFileInfo, QDir::searchPaths(), setFileName(), setLocale()
+373 */
+374 
+375 QResource::QResource(const QString &file, const QLocale &locale) : d_ptr(new QResourcePrivate(this))
+376 {
+377     Q_D(QResource);
+378     d->fileName = file;
+379     d->locale = locale;
+380 }
+381 
+382 /*!
+383     Releases the resources of the QResource object.
+384 */
+385 QResource::~QResource()
+386 {
+387 }
+388 
+389 /*!
+390     Sets a QResource to only load the localization of resource to for \a
+391     locale. If a resource for the specific locale is not found then the
+392     C locale is used.
+393 
+394     \sa setFileName()
+395 */
+396 
+397 void QResource::setLocale(const QLocale &locale)
+398 {
+399     Q_D(QResource);
+400     d->clear();
+401     d->locale = locale;
+402 }
+403 
+404 /*!
+405     Returns the locale used to locate the data for the QResource.
+406 */
+407 
+408 QLocale QResource::locale() const
+409 {
+410     Q_D(const QResource);
+411     return d->locale;
+412 }
+413 
+414 /*!
+415     Sets a QResource to point to \a file. \a file can either be absolute,
+416     in which case it is opened directly, if relative then the file will be
+417     tried to be found in QDir::searchPaths().
+418 
+419     \sa absoluteFilePath()
+420 */
+421 
+422 void QResource::setFileName(const QString &file)
+423 {
+424     Q_D(QResource);
+425     d->clear();
+426     d->fileName = file;
+427 }
+428 
+429 /*!
+430     Returns the full path to the file that this QResource represents as it
+431     was passed.
+432 
+433     \sa absoluteFilePath()
+434 */
+435 
+436 QString QResource::fileName() const
+437 {
+438     Q_D(const QResource);
+439     d->ensureInitialized();
+440     return d->fileName;
+441 }
+442 
+443 /*!
+444     Returns the real path that this QResource represents, if the resource
+445     was found via the QDir::searchPaths() it will be indicated in the path.
+446 
+447     \sa fileName()
+448 */
+449 
+450 QString QResource::absoluteFilePath() const
+451 {
+452     Q_D(const QResource);
+453     d->ensureInitialized();
+454     return d->absoluteFilePath;
+455 }
+456 
+457 /*!
+458     Returns \c true if the resource really exists in the resource hierarchy,
+459     false otherwise.
+460 
+461 */
+462 
+463 bool QResource::isValid() const
+464 {
+465     Q_D(const QResource);
+466     d->ensureInitialized();
+467     return !d->related.isEmpty();
+468 }
+469 
+470 /*!
+471     \fn bool QResource::isFile() const
+472 
+473     Returns \c true if the resource represents a file and thus has data
+474     backing it, false if it represents a directory.
+475 
+476     \sa isDir()
+477 */
+478 
+479 
+480 /*!
+481     Returns \c true if the resource represents a file and the data backing it
+482     is in a compressed format, false otherwise.
+483 
+484     \sa data(), isFile()
+485 */
+486 
+487 bool QResource::isCompressed() const
+488 {
+489     Q_D(const QResource);
+490     d->ensureInitialized();
+491     return d->compressed;
+492 }
+493 
+494 /*!
+495     Returns the size of the data backing the resource.
+496 
+497     \sa data(), isFile()
+498 */
+499 
+500 qint64 QResource::size() const
+501 {
+502     Q_D(const QResource);
+503     d->ensureInitialized();
+504     return d->size;
+505 }
+506 
+507 /*!
+508     Returns direct access to a read only segment of data that this resource
+509     represents. If the resource is compressed the data returns is
+510     compressed and qUncompress() must be used to access the data. If the
+511     resource is a directory 0 is returned.
+512 
+513     \sa size(), isCompressed(), isFile()
+514 */
+515 
+516 const uchar *QResource::data() const
+517 {
+518     Q_D(const QResource);
+519     d->ensureInitialized();
+520     return d->data;
+521 }
+522 
+523 /*!
+524     Returns the date and time when the file was last modified before
+525     packaging into a resource.
+526 */
+527 QDateTime QResource::lastModified() const
+528 {
+529     Q_D(const QResource);
+530     d->ensureInitialized();
+531     return d->lastModified;
+532 }
+533 
+534 /*!
+535     Returns \c true if the resource represents a directory and thus may have
+536     children() in it, false if it represents a file.
+537 
+538     \sa isFile()
+539 */
+540 
+541 bool QResource::isDir() const
+542 {
+543     Q_D(const QResource);
+544     d->ensureInitialized();
+545     return d->container;
+546 }
+547 
+548 /*!
+549     Returns a list of all resources in this directory, if the resource
+550     represents a file the list will be empty.
+551 
+552     \sa isDir()
+553 */
+554 
+555 QStringList QResource::children() const
+556 {
+557     Q_D(const QResource);
+558     d->ensureChildren();
+559     return d->children;
+560 }
+561 
+562 /*!
+563   \obsolete
+564 
+565   Use QDir::addSearchPath() with a prefix instead.
+566 
+567   Adds \a path to the search paths searched in to find resources that are
+568   not specified with an absolute path. The \a path must be an absolute
+569   path (start with \c{/}).
+570 
+571   The default search path is to search only in the root (\c{:/}). The last
+572   path added will be consulted first upon next QResource creation.
+573 */
+574 void
+575 QResource::addSearchPath(const QString &path)
+576 {
+577     if (!path.startsWith(QLatin1Char('/'))) {
+578         qWarning("QResource::addResourceSearchPath: Search paths must be absolute (start with /) [%s]",
+579                  path.toLocal8Bit().data());
+580         return;
+581     }
+582     QMutexLocker lock(resourceMutex());
+583     resourceSearchPaths()->prepend(path);
+584 }
+585 
+586 /*!
+587   \obsolete
+588 
+589   Use QDir::searchPaths() instead.
+590 
+591   Returns the current search path list. This list is consulted when
+592   creating a relative resource.
+593 
+594   \sa QDir::addSearchPath(), QDir::setSearchPaths()
+595 */
+596 
+597 QStringList
+598 QResource::searchPaths()
+599 {
+600     QMutexLocker lock(resourceMutex());
+601     return *resourceSearchPaths();
+602 }
+603 
+604 inline uint QResourceRoot::hash(int node) const
+605 {
+606     if(!node) //root
+607         return 0;
+608     const int offset = findOffset(node);
+609     int name_offset = (tree[offset+0] << 24) + (tree[offset+1] << 16) +
+610                       (tree[offset+2] << 8) + (tree[offset+3] << 0);
+611     name_offset += 2; //jump past name length
+612     return (names[name_offset+0] << 24) + (names[name_offset+1] << 16) +
+613            (names[name_offset+2] << 8) + (names[name_offset+3] << 0);
+614 }
+615 inline QString QResourceRoot::name(int node) const
+616 {
+617     if(!node) // root
+618         return QString();
+619     const int offset = findOffset(node);
+620 
+621     QString ret;
+622     int name_offset = (tree[offset+0] << 24) + (tree[offset+1] << 16) +
+623                       (tree[offset+2] << 8) + (tree[offset+3] << 0);
+624     const short name_length = (names[name_offset+0] << 8) +
+625                               (names[name_offset+1] << 0);
+626     name_offset += 2;
+627     name_offset += 4; //jump past hash
+628 
+629     ret.resize(name_length);
+630     QChar *strData = ret.data();
+631     for(int i = 0; i < name_length*2; i+=2) {
+632         QChar c(names[name_offset+i+1], names[name_offset+i]);
+633         *strData = c;
+634         ++strData;
+635     }
+636     return ret;
+637 }
+638 
+639 int QResourceRoot::findNode(const QString &_path, const QLocale &locale) const
+640 {
+641     QString path = _path;
+642     {
+643         QString root = mappingRoot();
+644         if(!root.isEmpty()) {
+645             if(root == path) {
+646                 path = QLatin1Char('/');
+647             } else {
+648                 if(!root.endsWith(QLatin1Char('/')))
+649                     root += QLatin1Char('/');
+650                 if(path.size() >= root.size() && path.startsWith(root))
+651                     path = path.mid(root.length()-1);
+652                 if(path.isEmpty())
+653                     path = QLatin1Char('/');
+654             }
+655         }
+656     }
+657 #ifdef DEBUG_RESOURCE_MATCH
+658     qDebug() << "!!!!" << "START" << path << locale.country() << locale.language();
+659 #endif
+660 
+661     if(path == QLatin1String("/"))
+662         return 0;
+663 
+664     //the root node is always first
+665     int child_count = (tree[6] << 24) + (tree[7] << 16) +
+666                       (tree[8] << 8) + (tree[9] << 0);
+667     int child       = (tree[10] << 24) + (tree[11] << 16) +
+668                       (tree[12] << 8) + (tree[13] << 0);
+669 
+670     //now iterate up the tree
+671     int node = -1;
+672 
+673     QStringSplitter splitter(path);
+674     while (child_count && splitter.hasNext()) {
+675         QStringRef segment = splitter.next();
+676 
+677 #ifdef DEBUG_RESOURCE_MATCH
+678         qDebug() << "  CHILDREN" << segment;
+679         for(int j = 0; j < child_count; ++j) {
+680             qDebug() << "   " << child+j << " :: " << name(child+j);
+681         }
+682 #endif
+683         const uint h = qt_hash(segment);
+684 
+685         //do the binary search for the hash
+686         int l = 0, r = child_count-1;
+687         int sub_node = (l+r+1)/2;
+688         while(r != l) {
+689             const uint sub_node_hash = hash(child+sub_node);
+690             if(h == sub_node_hash)
+691                 break;
+692             else if(h < sub_node_hash)
+693                 r = sub_node - 1;
+694             else
+695                 l = sub_node;
+696             sub_node = (l + r + 1) / 2;
+697         }
+698         sub_node += child;
+699 
+700         //now do the "harder" compares
+701         bool found = false;
+702         if(hash(sub_node) == h) {
+703             while(sub_node > child && hash(sub_node-1) == h) //backup for collisions
+704                 --sub_node;
+705             for(; sub_node < child+child_count && hash(sub_node) == h; ++sub_node) { //here we go...
+706                 if(name(sub_node) == segment) {
+707                     found = true;
+708                     int offset = findOffset(sub_node);
+709 #ifdef DEBUG_RESOURCE_MATCH
+710                     qDebug() << "  TRY" << sub_node << name(sub_node) << offset;
+711 #endif
+712                     offset += 4;  //jump past name
+713 
+714                     const short flags = (tree[offset+0] << 8) +
+715                                         (tree[offset+1] << 0);
+716                     offset += 2;
+717 
+718                     if(!splitter.hasNext()) {
+719                         if(!(flags & Directory)) {
+720                             const short country = (tree[offset+0] << 8) +
+721                                                   (tree[offset+1] << 0);
+722                             offset += 2;
+723 
+724                             const short language = (tree[offset+0] << 8) +
+725                                                    (tree[offset+1] << 0);
+726                             offset += 2;
+727 #ifdef DEBUG_RESOURCE_MATCH
+728                             qDebug() << "    " << "LOCALE" << country << language;
+729 #endif
+730                             if(country == locale.country() && language == locale.language()) {
+731 #ifdef DEBUG_RESOURCE_MATCH
+732                                 qDebug() << "!!!!" << "FINISHED" << __LINE__ << sub_node;
+733 #endif
+734                                 return sub_node;
+735                             } else if((country == QLocale::AnyCountry && language == locale.language()) ||
+736                                       (country == QLocale::AnyCountry && language == QLocale::C && node == -1)) {
+737                                 node = sub_node;
+738                             }
+739                             continue;
+740                         } else {
+741 #ifdef DEBUG_RESOURCE_MATCH
+742                             qDebug() << "!!!!" << "FINISHED" << __LINE__ << sub_node;
+743 #endif
+744 
+745                             return sub_node;
+746                         }
+747                     }
+748 
+749                     if(!(flags & Directory))
+750                         return -1;
+751 
+752                     child_count = (tree[offset+0] << 24) + (tree[offset+1] << 16) +
+753                                   (tree[offset+2] << 8) + (tree[offset+3] << 0);
+754                     offset += 4;
+755                     child = (tree[offset+0] << 24) + (tree[offset+1] << 16) +
+756                             (tree[offset+2] << 8) + (tree[offset+3] << 0);
+757                     break;
+758                 }
+759             }
+760         }
+761         if(!found)
+762             break;
+763     }
+764 #ifdef DEBUG_RESOURCE_MATCH
+765     qDebug() << "!!!!" << "FINISHED" << __LINE__ << node;
+766 #endif
+767     return node;
+768 }
+769 short QResourceRoot::flags(int node) const
+770 {
+771     if(node == -1)
+772         return 0;
+773     const int offset = findOffset(node) + 4; //jump past name
+774     return (tree[offset+0] << 8) + (tree[offset+1] << 0);
+775 }
+776 const uchar *QResourceRoot::data(int node, qint64 *size) const
+777 {
+778     if(node == -1) {
+779         *size = 0;
+780         return 0;
+781     }
+782     int offset = findOffset(node) + 4; //jump past name
+783 
+784     const short flags = (tree[offset+0] << 8) + (tree[offset+1] << 0);
+785     offset += 2;
+786 
+787     offset += 4; //jump past locale
+788 
+789     if(!(flags & Directory)) {
+790         const int data_offset = (tree[offset+0] << 24) + (tree[offset+1] << 16) +
+791                                 (tree[offset+2] << 8) + (tree[offset+3] << 0);
+792         const uint data_length = (payloads[data_offset+0] << 24) + (payloads[data_offset+1] << 16) +
+793                                  (payloads[data_offset+2] << 8) + (payloads[data_offset+3] << 0);
+794         const uchar *ret = payloads+data_offset+4;
+795         *size = data_length;
+796         return ret;
+797     }
+798     *size = 0;
+799     return 0;
+800 }
+801 
+802 QDateTime QResourceRoot::lastModified(int node) const
+803 {
+804     if (node == -1 || version < 0x02)
+805         return QDateTime();
+806 
+807     const int offset = findOffset(node) + 14;
+808 
+809     const quint64 timeStamp = (quint64(tree[offset+0]) << 56) + (quint64(tree[offset+1]) << 48) +
+810                               (quint64(tree[offset+2]) << 40) + (quint64(tree[offset+3]) << 32) +
+811                               (quint64(tree[offset+4]) << 24) + (quint64(tree[offset+5]) << 16) +
+812                               (quint64(tree[offset+6]) << 8) + (quint64(tree[offset+7]));
+813     if (timeStamp == 0)
+814         return QDateTime();
+815 
+816     return QDateTime::fromMSecsSinceEpoch(timeStamp);
+817 }
+818 
+819 QStringList QResourceRoot::children(int node) const
+820 {
+821     if(node == -1)
+822         return QStringList();
+823     int offset = findOffset(node) + 4; //jump past name
+824 
+825     const short flags = (tree[offset+0] << 8) + (tree[offset+1] << 0);
+826     offset += 2;
+827 
+828     QStringList ret;
+829     if(flags & Directory) {
+830         const int child_count = (tree[offset+0] << 24) + (tree[offset+1] << 16) +
+831                                 (tree[offset+2] << 8) + (tree[offset+3] << 0);
+832         offset += 4;
+833         const int child_off = (tree[offset+0] << 24) + (tree[offset+1] << 16) +
+834                               (tree[offset+2] << 8) + (tree[offset+3] << 0);
+835         ret.reserve(child_count);
+836         for(int i = child_off; i < child_off+child_count; ++i)
+837             ret << name(i);
+838     }
+839     return ret;
+840 }
+841 bool QResourceRoot::mappingRootSubdir(const QString &path, QString *match) const
+842 {
+843     const QString root = mappingRoot();
+844     if(!root.isEmpty()) {
+845         const QVector<QStringRef> root_segments = root.splitRef(QLatin1Char('/'), QString::SkipEmptyParts),
+846                                   path_segments = path.splitRef(QLatin1Char('/'), QString::SkipEmptyParts);
+847         if(path_segments.size() <= root_segments.size()) {
+848             int matched = 0;
+849             for(int i = 0; i < path_segments.size(); ++i) {
+850                 if(root_segments[i] != path_segments[i])
+851                     break;
+852                 ++matched;
+853             }
+854             if(matched == path_segments.size()) {
+855                 if(match && root_segments.size() > matched)
+856                     *match = root_segments.at(matched).toString();
+857                 return true;
+858             }
+859         }
+860     }
+861     return false;
+862 }
+863 
+864 Q_CORE_EXPORT bool qRegisterResourceData(int version, const unsigned char *tree,
+865                                          const unsigned char *name, const unsigned char *data)
+866 {
+867     QMutexLocker lock(resourceMutex());
+868     if ((version == 0x01 || version == 0x2) && resourceList()) {
+869         bool found = false;
+870         QResourceRoot res(version, tree, name, data);
+871         for(int i = 0; i < resourceList()->size(); ++i) {
+872             if(*resourceList()->at(i) == res) {
+873                 found = true;
+874                 break;
+875             }
+876         }
+877         if(!found) {
+878             QResourceRoot *root = new QResourceRoot(version, tree, name, data);
+879             root->ref.ref();
+880             resourceList()->append(root);
+881         }
+882         return true;
+883     }
+884     return false;
+885 }
+886 
+887 Q_CORE_EXPORT bool qUnregisterResourceData(int version, const unsigned char *tree,
+888                                            const unsigned char *name, const unsigned char *data)
+889 {
+890     QMutexLocker lock(resourceMutex());
+891     if ((version == 0x01 || version == 0x02) && resourceList()) {
+892         QResourceRoot res(version, tree, name, data);
+893         for(int i = 0; i < resourceList()->size(); ) {
+894             if(*resourceList()->at(i) == res) {
+895                 QResourceRoot *root = resourceList()->takeAt(i);
+896                 if(!root->ref.deref())
+897                     delete root;
+898             } else {
+899                 ++i;
+900             }
+901         }
+902         return true;
+903     }
+904     return false;
+905 }
+906 
+907 //run time resource creation
+908 
+909 class QDynamicBufferResourceRoot: public QResourceRoot
+910 {
+911     QString root;
+912     const uchar *buffer;
+913 
+914 public:
+915     inline QDynamicBufferResourceRoot(const QString &_root) : root(_root), buffer(0) { }
+916     inline ~QDynamicBufferResourceRoot() { }
+917     inline const uchar *mappingBuffer() const { return buffer; }
+918     virtual QString mappingRoot() const Q_DECL_OVERRIDE { return root; }
+919     virtual ResourceRootType type() const Q_DECL_OVERRIDE { return Resource_Buffer; }
+920 
+921     // size == -1 means "unknown"
+922     bool registerSelf(const uchar *b, int size)
+923     {
+924         // 5 int "pointers"
+925         if (size >= 0 && size < 20)
+926             return false;
+927 
+928         //setup the data now
+929         int offset = 0;
+930 
+931         //magic number
+932         if(b[offset+0] != 'q' || b[offset+1] != 'r' ||
+933            b[offset+2] != 'e' || b[offset+3] != 's') {
+934             return false;
+935         }
+936         offset += 4;
+937 
+938         const int version = (b[offset+0] << 24) + (b[offset+1] << 16) +
+939                          (b[offset+2] << 8) + (b[offset+3] << 0);
+940         offset += 4;
+941 
+942         const int tree_offset = (b[offset+0] << 24) + (b[offset+1] << 16) +
+943                                 (b[offset+2] << 8) + (b[offset+3] << 0);
+944         offset += 4;
+945 
+946         const int data_offset = (b[offset+0] << 24) + (b[offset+1] << 16) +
+947                                 (b[offset+2] << 8) + (b[offset+3] << 0);
+948         offset += 4;
+949 
+950         const int name_offset = (b[offset+0] << 24) + (b[offset+1] << 16) +
+951                                 (b[offset+2] << 8) + (b[offset+3] << 0);
+952         offset += 4;
+953 
+954         // Some sanity checking for sizes. This is _not_ a security measure.
+955         if (size >= 0 && (tree_offset >= size || data_offset >= size || name_offset >= size))
+956             return false;
+957 
+958         if (version == 0x01 || version == 0x02) {
+959             buffer = b;
+960             setSource(version, b+tree_offset, b+name_offset, b+data_offset);
+961             return true;
+962         }
+963         return false;
+964     }
+965 };
+966 
+967 #if defined(Q_OS_UNIX) && !defined (Q_OS_NACL) && !defined(Q_OS_INTEGRITY)
+968 #define QT_USE_MMAP
+969 #endif
+970 
+971 // most of the headers below are already included in qplatformdefs.h
+972 // also this lacks Large File support but that's probably irrelevant
+973 #if defined(QT_USE_MMAP)
+974 // for mmap
+975 QT_BEGIN_INCLUDE_NAMESPACE
+976 #include <sys/mman.h>
+977 #include <errno.h>
+978 QT_END_INCLUDE_NAMESPACE
+979 #endif
+980 
+981 
+982 
+983 class QDynamicFileResourceRoot: public QDynamicBufferResourceRoot
+984 {
+985     QString fileName;
+986     // for mmap'ed files, this is what needs to be unmapped.
+987     uchar *unmapPointer;
+988     unsigned int unmapLength;
+989 
+990 public:
+991     inline QDynamicFileResourceRoot(const QString &_root) : QDynamicBufferResourceRoot(_root), unmapPointer(0), unmapLength(0) { }
+992     ~QDynamicFileResourceRoot() {
+993 #if defined(QT_USE_MMAP)
+994         if (unmapPointer) {
+995             munmap((char*)unmapPointer, unmapLength);
+996             unmapPointer = 0;
+997             unmapLength = 0;
+998         } else
+999 #endif
+1000         {
+1001             delete [] mappingBuffer();
+1002         }
+1003     }
+1004     QString mappingFile() const { return fileName; }
+1005     virtual ResourceRootType type() const Q_DECL_OVERRIDE { return Resource_File; }
+1006 
+1007     bool registerSelf(const QString &f) {
+1008         bool fromMM = false;
+1009         uchar *data = 0;
+1010         unsigned int data_len = 0;
+1011 
+1012 #ifdef QT_USE_MMAP
+1013 
+1014 #ifndef MAP_FILE
+1015 #define MAP_FILE 0
+1016 #endif
+1017 #ifndef MAP_FAILED
+1018 #define MAP_FAILED -1
+1019 #endif
+1020 
+1021         int fd = QT_OPEN(QFile::encodeName(f), O_RDONLY,
+1022 #if defined(Q_OS_WIN)
+1023                          _S_IREAD | _S_IWRITE
+1024 #else
+1025                          0666
+1026 #endif
+1027             );
+1028         if (fd >= 0) {
+1029             QT_STATBUF st;
+1030             if (!QT_FSTAT(fd, &st)) {
+1031                 uchar *ptr;
+1032                 ptr = reinterpret_cast<uchar *>(
+1033                     mmap(0, st.st_size,             // any address, whole file
+1034                          PROT_READ,                 // read-only memory
+1035                          MAP_FILE | MAP_PRIVATE,    // swap-backed map from file
+1036                          fd, 0));                   // from offset 0 of fd
+1037                 if (ptr && ptr != reinterpret_cast<uchar *>(MAP_FAILED)) {
+1038                     data = ptr;
+1039                     data_len = st.st_size;
+1040                     fromMM = true;
+1041                 }
+1042             }
+1043             ::close(fd);
+1044         }
+1045 #endif // QT_USE_MMAP
+1046         if(!data) {
+1047             QFile file(f);
+1048             if (!file.exists())
+1049                 return false;
+1050             data_len = file.size();
+1051             data = new uchar[data_len];
+1052 
+1053             bool ok = false;
+1054             if (file.open(QIODevice::ReadOnly))
+1055                 ok = (data_len == (uint)file.read((char*)data, data_len));
+1056             if (!ok) {
+1057                 delete [] data;
+1058                 data = 0;
+1059                 data_len = 0;
+1060                 return false;
+1061             }
+1062             fromMM = false;
+1063         }
+1064         if (data && QDynamicBufferResourceRoot::registerSelf(data, data_len)) {
+1065             if(fromMM) {
+1066                 unmapPointer = data;
+1067                 unmapLength = data_len;
+1068             }
+1069             fileName = f;
+1070             return true;
+1071         }
+1072         return false;
+1073     }
+1074 };
+1075 
+1076 static QString qt_resource_fixResourceRoot(QString r) {
+1077     if(!r.isEmpty()) {
+1078         if(r.startsWith(QLatin1Char(':')))
+1079             r = r.mid(1);
+1080         if(!r.isEmpty())
+1081             r = QDir::cleanPath(r);
+1082     }
+1083     return r;
+1084 }
+1085 
+1086 
+1087 /*!
+1088    \fn bool QResource::registerResource(const QString &rccFileName, const QString &mapRoot)
+1089 
+1090    Registers the resource with the given \a rccFileName at the location in the
+1091    resource tree specified by \a mapRoot, and returns \c true if the file is
+1092    successfully opened; otherwise returns \c false.
+1093 
+1094    \sa unregisterResource()
+1095 */
+1096 
+1097 bool
+1098 QResource::registerResource(const QString &rccFilename, const QString &resourceRoot)
+1099 {
+1100     QString r = qt_resource_fixResourceRoot(resourceRoot);
+1101     if(!r.isEmpty() && r[0] != QLatin1Char('/')) {
+1102         qWarning("QDir::registerResource: Registering a resource [%s] must be rooted in an absolute path (start with /) [%s]",
+1103                  rccFilename.toLocal8Bit().data(), resourceRoot.toLocal8Bit().data());
+1104         return false;
+1105     }
+1106 
+1107     QDynamicFileResourceRoot *root = new QDynamicFileResourceRoot(r);
+1108     if(root->registerSelf(rccFilename)) {
+1109         root->ref.ref();
+1110         QMutexLocker lock(resourceMutex());
+1111         resourceList()->append(root);
+1112         return true;
+1113     }
+1114     delete root;
+1115     return false;
+1116 }
+1117 
+1118 /*!
+1119   \fn bool QResource::unregisterResource(const QString &rccFileName, const QString &mapRoot)
+1120 
+1121   Unregisters the resource with the given \a rccFileName at the location in
+1122   the resource tree specified by \a mapRoot, and returns \c true if the
+1123   resource is successfully unloaded and no references exist for the
+1124   resource; otherwise returns \c false.
+1125 
+1126   \sa registerResource()
+1127 */
+1128 
+1129 bool
+1130 QResource::unregisterResource(const QString &rccFilename, const QString &resourceRoot)
+1131 {
+1132     QString r = qt_resource_fixResourceRoot(resourceRoot);
+1133 
+1134     QMutexLocker lock(resourceMutex());
+1135     ResourceList *list = resourceList();
+1136     for(int i = 0; i < list->size(); ++i) {
+1137         QResourceRoot *res = list->at(i);
+1138         if(res->type() == QResourceRoot::Resource_File) {
+1139             QDynamicFileResourceRoot *root = reinterpret_cast<QDynamicFileResourceRoot*>(res);
+1140             if (root->mappingFile() == rccFilename && root->mappingRoot() == r) {
+1141                 resourceList()->removeAt(i);
+1142                 if(!root->ref.deref()) {
+1143                     delete root;
+1144                     return true;
+1145                 }
+1146                 return false;
+1147             }
+1148         }
+1149     }
+1150     return false;
+1151 }
+1152 
+1153 
+1154 /*!
+1155    \fn bool QResource::registerResource(const uchar *rccData, const QString &mapRoot)
+1156    \since 4.3
+1157 
+1158    Registers the resource with the given \a rccData at the location in the
+1159    resource tree specified by \a mapRoot, and returns \c true if the file is
+1160    successfully opened; otherwise returns \c false.
+1161 
+1162    \warning The data must remain valid throughout the life of any QFile
+1163    that may reference the resource data.
+1164 
+1165    \sa unregisterResource()
+1166 */
+1167 
+1168 bool
+1169 QResource::registerResource(const uchar *rccData, const QString &resourceRoot)
+1170 {
+1171     QString r = qt_resource_fixResourceRoot(resourceRoot);
+1172     if(!r.isEmpty() && r[0] != QLatin1Char('/')) {
+1173         qWarning("QDir::registerResource: Registering a resource [%p] must be rooted in an absolute path (start with /) [%s]",
+1174                  rccData, resourceRoot.toLocal8Bit().data());
+1175         return false;
+1176     }
+1177 
+1178     QDynamicBufferResourceRoot *root = new QDynamicBufferResourceRoot(r);
+1179     if (root->registerSelf(rccData, -1)) {
+1180         root->ref.ref();
+1181         QMutexLocker lock(resourceMutex());
+1182         resourceList()->append(root);
+1183         return true;
+1184     }
+1185     delete root;
+1186     return false;
+1187 }
+1188 
+1189 /*!
+1190   \fn bool QResource::unregisterResource(const uchar *rccData, const QString &mapRoot)
+1191   \since 4.3
+1192 
+1193   Unregisters the resource with the given \a rccData at the location in the
+1194   resource tree specified by \a mapRoot, and returns \c true if the resource is
+1195   successfully unloaded and no references exist into the resource; otherwise returns \c false.
+1196 
+1197   \sa registerResource()
+1198 */
+1199 
+1200 bool
+1201 QResource::unregisterResource(const uchar *rccData, const QString &resourceRoot)
+1202 {
+1203     QString r = qt_resource_fixResourceRoot(resourceRoot);
+1204 
+1205     QMutexLocker lock(resourceMutex());
+1206     ResourceList *list = resourceList();
+1207     for(int i = 0; i < list->size(); ++i) {
+1208         QResourceRoot *res = list->at(i);
+1209         if(res->type() == QResourceRoot::Resource_Buffer) {
+1210             QDynamicBufferResourceRoot *root = reinterpret_cast<QDynamicBufferResourceRoot*>(res);
+1211             if (root->mappingBuffer() == rccData && root->mappingRoot() == r) {
+1212                 resourceList()->removeAt(i);
+1213                 if(!root->ref.deref()) {
+1214                     delete root;
+1215                     return true;
+1216                 }
+1217                 return false;
+1218             }
+1219         }
+1220     }
+1221     return false;
+1222 }
+1223 
+1224 #if !defined(QT_BOOTSTRAPPED)
+1225 //resource engine
+1226 class QResourceFileEnginePrivate : public QAbstractFileEnginePrivate
+1227 {
+1228 protected:
+1229     Q_DECLARE_PUBLIC(QResourceFileEngine)
+1230 private:
+1231     uchar *map(qint64 offset, qint64 size, QFile::MemoryMapFlags flags);
+1232     bool unmap(uchar *ptr);
+1233     void uncompress() const;
+1234     qint64 offset;
+1235     QResource resource;
+1236     mutable QByteArray uncompressed;
+1237 protected:
+1238     QResourceFileEnginePrivate() : offset(0) { }
+1239 };
+1240 
+1241 bool QResourceFileEngine::mkdir(const QString &, bool) const
+1242 {
+1243     return false;
+1244 }
+1245 
+1246 bool QResourceFileEngine::rmdir(const QString &, bool) const
+1247 {
+1248     return false;
+1249 }
+1250 
+1251 bool QResourceFileEngine::setSize(qint64)
+1252 {
+1253     return false;
+1254 }
+1255 
+1256 QStringList QResourceFileEngine::entryList(QDir::Filters filters, const QStringList &filterNames) const
+1257 {
+1258     return QAbstractFileEngine::entryList(filters, filterNames);
+1259 }
+1260 
+1261 bool QResourceFileEngine::caseSensitive() const
+1262 {
+1263     return true;
+1264 }
+1265 
+1266 QResourceFileEngine::QResourceFileEngine(const QString &file) :
+1267     QAbstractFileEngine(*new QResourceFileEnginePrivate)
+1268 {
+1269     Q_D(QResourceFileEngine);
+1270     d->resource.setFileName(file);
+1271 }
+1272 
+1273 QResourceFileEngine::~QResourceFileEngine()
+1274 {
+1275 }
+1276 
+1277 void QResourceFileEngine::setFileName(const QString &file)
+1278 {
+1279     Q_D(QResourceFileEngine);
+1280     d->resource.setFileName(file);
+1281 }
+1282 
+1283 bool QResourceFileEngine::open(QIODevice::OpenMode flags)
+1284 {
+1285     Q_D(QResourceFileEngine);
+1286     if (d->resource.fileName().isEmpty()) {
+1287         qWarning("QResourceFileEngine::open: Missing file name");
+1288         return false;
+1289     }
+1290     if(flags & QIODevice::WriteOnly)
+1291         return false;
+1292     d->uncompress();
+1293     if (!d->resource.isValid()) {
+1294         d->errorString = qt_error_string(ENOENT);
+1295         return false;
+1296     }
+1297     return true;
+1298 }
+1299 
+1300 bool QResourceFileEngine::close()
+1301 {
+1302     Q_D(QResourceFileEngine);
+1303     d->offset = 0;
+1304     d->uncompressed.clear();
+1305     return true;
+1306 }
+1307 
+1308 bool QResourceFileEngine::flush()
+1309 {
+1310     return true;
+1311 }
+1312 
+1313 qint64 QResourceFileEngine::read(char *data, qint64 len)
+1314 {
+1315     Q_D(QResourceFileEngine);
+1316     if(len > size()-d->offset)
+1317         len = size()-d->offset;
+1318     if(len <= 0)
+1319         return 0;
+1320     if(d->resource.isCompressed())
+1321         memcpy(data, d->uncompressed.constData()+d->offset, len);
+1322     else
+1323         memcpy(data, d->resource.data()+d->offset, len);
+1324     d->offset += len;
+1325     return len;
+1326 }
+1327 
+1328 qint64 QResourceFileEngine::write(const char *, qint64)
+1329 {
+1330     return -1;
+1331 }
+1332 
+1333 bool QResourceFileEngine::remove()
+1334 {
+1335     return false;
+1336 }
+1337 
+1338 bool QResourceFileEngine::copy(const QString &)
+1339 {
+1340     return false;
+1341 }
+1342 
+1343 bool QResourceFileEngine::rename(const QString &)
+1344 {
+1345     return false;
+1346 }
+1347 
+1348 bool QResourceFileEngine::link(const QString &)
+1349 {
+1350     return false;
+1351 }
+1352 
+1353 qint64 QResourceFileEngine::size() const
+1354 {
+1355     Q_D(const QResourceFileEngine);
+1356     if(!d->resource.isValid())
+1357         return 0;
+1358     if (d->resource.isCompressed()) {
+1359         d->uncompress();
+1360         return d->uncompressed.size();
+1361     }
+1362     return d->resource.size();
+1363 }
+1364 
+1365 qint64 QResourceFileEngine::pos() const
+1366 {
+1367     Q_D(const QResourceFileEngine);
+1368     return d->offset;
+1369 }
+1370 
+1371 bool QResourceFileEngine::atEnd() const
+1372 {
+1373     Q_D(const QResourceFileEngine);
+1374     if(!d->resource.isValid())
+1375         return true;
+1376     return d->offset == size();
+1377 }
+1378 
+1379 bool QResourceFileEngine::seek(qint64 pos)
+1380 {
+1381     Q_D(QResourceFileEngine);
+1382     if(!d->resource.isValid())
+1383         return false;
+1384 
+1385     if(d->offset > size())
+1386         return false;
+1387     d->offset = pos;
+1388     return true;
+1389 }
+1390 
+1391 bool QResourceFileEngine::isSequential() const
+1392 {
+1393     return false;
+1394 }
+1395 
+1396 QAbstractFileEngine::FileFlags QResourceFileEngine::fileFlags(QAbstractFileEngine::FileFlags type) const
+1397 {
+1398     Q_D(const QResourceFileEngine);
+1399     QAbstractFileEngine::FileFlags ret = 0;
+1400     if(!d->resource.isValid())
+1401         return ret;
+1402 
+1403     if(type & PermsMask)
+1404         ret |= QAbstractFileEngine::FileFlags(ReadOwnerPerm|ReadUserPerm|ReadGroupPerm|ReadOtherPerm);
+1405     if(type & TypesMask) {
+1406         if(d->resource.isDir())
+1407             ret |= DirectoryType;
+1408         else
+1409             ret |= FileType;
+1410     }
+1411     if(type & FlagsMask) {
+1412         ret |= ExistsFlag;
+1413         if(d->resource.absoluteFilePath() == QLatin1String(":/"))
+1414             ret |= RootFlag;
+1415     }
+1416     return ret;
+1417 }
+1418 
+1419 bool QResourceFileEngine::setPermissions(uint)
+1420 {
+1421     return false;
+1422 }
+1423 
+1424 QString QResourceFileEngine::fileName(FileName file) const
+1425 {
+1426     Q_D(const QResourceFileEngine);
+1427     if(file == BaseName) {
+1428         int slash = d->resource.fileName().lastIndexOf(QLatin1Char('/'));
+1429         if (slash == -1)
+1430             return d->resource.fileName();
+1431         return d->resource.fileName().mid(slash + 1);
+1432     } else if(file == PathName || file == AbsolutePathName) {
+1433         const QString path = (file == AbsolutePathName) ? d->resource.absoluteFilePath() : d->resource.fileName();
+1434         const int slash = path.lastIndexOf(QLatin1Char('/'));
+1435         if (slash == -1)
+1436             return QLatin1String(":");
+1437         else if (slash <= 1)
+1438             return QLatin1String(":/");
+1439         return path.left(slash);
+1440 
+1441     } else if(file == CanonicalName || file == CanonicalPathName) {
+1442         const QString absoluteFilePath = d->resource.absoluteFilePath();
+1443         if(file == CanonicalPathName) {
+1444             const int slash = absoluteFilePath.lastIndexOf(QLatin1Char('/'));
+1445             if (slash != -1)
+1446                 return absoluteFilePath.left(slash);
+1447         }
+1448         return absoluteFilePath;
+1449     }
+1450     return d->resource.fileName();
+1451 }
+1452 
+1453 bool QResourceFileEngine::isRelativePath() const
+1454 {
+1455     return false;
+1456 }
+1457 
+1458 uint QResourceFileEngine::ownerId(FileOwner) const
+1459 {
+1460     static const uint nobodyID = (uint) -2;
+1461     return nobodyID;
+1462 }
+1463 
+1464 QString QResourceFileEngine::owner(FileOwner) const
+1465 {
+1466     return QString();
+1467 }
+1468 
+1469 QDateTime QResourceFileEngine::fileTime(FileTime time) const
+1470 {
+1471     Q_D(const QResourceFileEngine);
+1472     if (time == ModificationTime)
+1473         return d->resource.lastModified();
+1474     return QDateTime();
+1475 }
+1476 
+1477 /*!
+1478     \internal
+1479 */
+1480 QAbstractFileEngine::Iterator *QResourceFileEngine::beginEntryList(QDir::Filters filters,
+1481                                                                    const QStringList &filterNames)
+1482 {
+1483     return new QResourceFileEngineIterator(filters, filterNames);
+1484 }
+1485 
+1486 /*!
+1487     \internal
+1488 */
+1489 QAbstractFileEngine::Iterator *QResourceFileEngine::endEntryList()
+1490 {
+1491     return 0;
+1492 }
+1493 
+1494 bool QResourceFileEngine::extension(Extension extension, const ExtensionOption *option, ExtensionReturn *output)
+1495 {
+1496     Q_D(QResourceFileEngine);
+1497     if (extension == MapExtension) {
+1498         const MapExtensionOption *options = (const MapExtensionOption*)(option);
+1499         MapExtensionReturn *returnValue = static_cast<MapExtensionReturn*>(output);
+1500         returnValue->address = d->map(options->offset, options->size, options->flags);
+1501         return (returnValue->address != 0);
+1502     }
+1503     if (extension == UnMapExtension) {
+1504         const UnMapExtensionOption *options = (const UnMapExtensionOption*)option;
+1505         return d->unmap(options->address);
+1506     }
+1507     return false;
+1508 }
+1509 
+1510 bool QResourceFileEngine::supportsExtension(Extension extension) const
+1511 {
+1512     return (extension == UnMapExtension || extension == MapExtension);
+1513 }
+1514 
+1515 uchar *QResourceFileEnginePrivate::map(qint64 offset, qint64 size, QFile::MemoryMapFlags flags)
+1516 {
+1517     Q_Q(QResourceFileEngine);
+1518     Q_UNUSED(flags);
+1519     if (offset < 0 || size <= 0 || !resource.isValid() || offset + size > resource.size()) {
+1520         q->setError(QFile::UnspecifiedError, QString());
+1521         return 0;
+1522     }
+1523     uchar *address = const_cast<uchar *>(resource.data());
+1524     return (address + offset);
+1525 }
+1526 
+1527 bool QResourceFileEnginePrivate::unmap(uchar *ptr)
+1528 {
+1529     Q_UNUSED(ptr);
+1530     return true;
+1531 }
+1532 
+1533 void QResourceFileEnginePrivate::uncompress() const
+1534 {
+1535     if (resource.isCompressed() && uncompressed.isEmpty() && resource.size()) {
+1536 #ifndef QT_NO_COMPRESS
+1537         uncompressed = qUncompress(resource.data(), resource.size());
+1538 #else
+1539         Q_ASSERT(!"QResourceFileEngine::open: Qt built without support for compression");
+1540 #endif
+1541     }
+1542 }
+1543 
+1544 #endif // !defined(QT_BOOTSTRAPPED)
+1545 
+1546 QT_END_NAMESPACE

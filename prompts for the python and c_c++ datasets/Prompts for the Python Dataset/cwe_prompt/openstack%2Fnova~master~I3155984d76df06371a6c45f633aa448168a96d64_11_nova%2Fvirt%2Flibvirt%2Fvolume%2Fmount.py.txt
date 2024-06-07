@@ -1,0 +1,158 @@
+Please review the code below for security defects using the CWE (Common Weakness Enumeration) as a reference standard. If any are found, please describe the security defect in detail and indicate the corresponding line number of code and solution. If none are detected, state: 'No security defects are detected in the code'.
+
+1 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
+2 #    not use this file except in compliance with the License. You may obtain
+3 #    a copy of the License at
+4 #
+5 #         http://www.apache.org/licenses/LICENSE-2.0
+6 #
+7 #    Unless required by applicable law or agreed to in writing, software
+8 #    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+9 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+10 #    License for the specific language governing permissions and limitations
+11 #    under the License.
+12 
+13 import collections
+14 import contextlib
+15 import logging
+16 import os.path
+17 import six
+18 import threading
+19 
+20 from oslo_concurrency import processutils
+21 
+22 import nova.conf
+23 from nova import exception
+24 from nova.i18n import _LE
+25 from nova import utils
+26 
+27 CONF = nova.conf.CONF
+28 LOG = logging.getLogger(__name__)
+29 
+30 
+31 class MountManager(object):
+32     __instance__ = None
+33     __instance_lock__ = threading.Lock()
+34 
+35     class _ManagedMount(object):
+36         def __init__(self):
+37             self.lock = threading.Lock()
+38             self.volumes = []
+39             self.mounted = False
+40 
+41     def __init__(self, host):
+42         self.mountpoints = collections.defaultdict(self._ManagedMount)
+43 
+44         for guest in host.list_guests(only_running=False):
+45             for disk in guest.get_all_disks():
+46 
+47                 # All remote filesystem volumes are files
+48                 if disk.type != 'file':
+49                     continue
+50 
+51                 # NOTE(mdbooth): We're assuming that the mountpoint is our
+52                 # immediate parent, which is currently true for all
+53                 # volume drivers. We deliberately don't do anything clever
+54                 # here, because we don't want to, e.g.:
+55                 # * Add mountpoints for non-volume disks
+56                 # * Get it wrong when a non-running domain references a
+57                 #   volume which isn't mounted because the host just rebooted.
+58                 # and this is good enough. We could probably do better here
+59                 # with more thought.
+60 
+61                 mountpoint = os.path.dirname(disk.source_path)
+62                 if not os.path.ismount(mountpoint):
+63                     continue
+64                 name = os.path.relpath(disk.source_path, mountpoint)
+65 
+66                 # No locking required here because this is running before
+67                 # we start servicing user requests
+68                 mount = self.mountpoints[mountpoint]
+69                 mount.volumes.append(name)
+70                 mount.mounted = True
+71 
+72     @classmethod
+73     def get(cls):
+74         # We hold the instance lock here so that if the MountManager is
+75         # currently initialising we'll wait for it to complete rather than
+76         # fail.
+77         with cls.__instance_lock__:
+78             mount_manager = cls.__instance__
+79             if mount_manager is None:
+80                 raise exception.HypervisorUnavailable(host=CONF.host)
+81             return mount_manager
+82 
+83     @classmethod
+84     def host_up(cls, host):
+85         with cls.__instance_lock__:
+86             cls.__instance__ = MountManager(host)
+87 
+88     @classmethod
+89     def host_down(cls):
+90         with cls.__instance_lock__:
+91             cls.__instance__ = None
+92 
+93     @contextlib.contextmanager
+94     def _get_locked(self, mountpoint):
+95         # This dance is because we delete locks. We need to be sure that the
+96         # lock we hold does not belong to an object which has been deleted.
+97         # We do this by checking that mountpoint still refers to this object
+98         # when we hold the lock. This is safe because:
+99         # * we only delete an object from mountpounts whilst holding its lock
+100         # * mountpoints is a defaultdict which will atomically create a new
+101         #   object on access
+102         while True:
+103             mount = self.mountpoints[mountpoint]
+104             with mount.lock:
+105                 if self.mountpoints[mountpoint] is mount:
+106                     yield mount
+107                     break
+108 
+109     def mount(self, fstype, export, vol_name, mountpoint, options=None):
+110         with self._get_locked(mountpoint) as mount:
+111             if not mount.mounted:
+112                 utils.execute('mkdir', '-p', mountpoint)
+113 
+114                 mount_cmd = ['mount', '-t', fstype]
+115                 if options is not None:
+116                     mount_cmd.extend(options)
+117                 mount_cmd.extend([export, mountpoint])
+118 
+119                 # We're not expecting to be mounted already, so we let errors
+120                 # propagate
+121                 try:
+122                     utils.execute(*mount_cmd, run_as_root=True)
+123                 except Exception:
+124                     # If the mount failed there's no reason for us to keep a
+125                     # record of it. It will be created again if the caller
+126                     # retries.
+127 
+128                     # Delete while holding lock
+129                     del self.mountpoints[mountpoint]
+130 
+131                     raise
+132 
+133                 mount.mounted = True
+134 
+135             mount.volumes.append(vol_name)
+136 
+137     def umount(self, vol_name, mountpoint):
+138         with self._get_locked(mountpoint) as mount:
+139             # This will raise ValueError if share isn't in volumes, which is
+140             # as good an error as any.
+141             mount.volumes.remove(vol_name)
+142 
+143             if len(mount.volumes) == 0:
+144                 try:
+145                     utils.execute('umount', mountpoint, run_as_root=True,
+146                                   attempts=3, delay_on_retry=True)
+147 
+148                     # Delete while holding lock
+149                     del self.mountpoints[mountpoint]
+150                     self.mounted = False
+151 
+152                     utils.execute('rmdir', mountpoint)
+153                 except processutils.ProcessExecutionError as ex:
+154                     LOG.error(_LE("Couldn't unmount %(mountpoint)s: %(msg)s"),
+155                               {'mountpoint': mountpoint,
+156                                'msg': six.text_type(ex)})

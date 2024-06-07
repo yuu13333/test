@@ -1,0 +1,541 @@
+Please review the code below for security defects. You can consider defect types in terms of:
+1.CWE-284 (Improper Access Control)
+2.CWE-435 (Improper Interaction Between Multiple Entities)
+3.CWE-664 (Improper Control of a Resource Through its Lifetime)
+4.CWE-682 (Incorrect Calculation)
+5.CWE-691 (Insufficient Control Flow Management)
+6.CWE-693 (Protection Mechanism Failure)
+7.CWE-697 (Incorrect Comparison)
+8.CWE-703 (Improper Check or Handling of Exceptional Conditions)
+9.CWE-707 (Improper Neutralization)
+10.CWE-710 (Improper Adherence to Coding Standards)
+If any are found, please describe the security defect in detail and indicate the corresponding line number of code and solution. If none are detected, states: 'No security defects are detected in the code'.
+
+1 # Copyright (C) 2014 eNovance SAS <licensing@enovance.com>
+2 #
+3 # Licensed under the Apache License, Version 2.0 (the "License"); you may
+4 # not use this file except in compliance with the License. You may obtain
+5 # a copy of the License at
+6 #
+7 #      http://www.apache.org/licenses/LICENSE-2.0
+8 #
+9 # Unless required by applicable law or agreed to in writing, software
+10 # distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+11 # WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+12 # License for the specific language governing permissions and limitations
+13 # under the License.
+14 
+15 import errno
+16 import itertools
+17 import os
+18 
+19 import netaddr
+20 from oslo_config import cfg
+21 from oslo_log import log as logging
+22 
+23 from neutron._i18n import _
+24 from neutron.agent.linux import external_process
+25 from neutron.common import exceptions
+26 from neutron.common import utils as common_utils
+27 
+28 VALID_STATES = ['MASTER', 'BACKUP']
+29 VALID_AUTH_TYPES = ['AH', 'PASS']
+30 HA_DEFAULT_PRIORITY = 50
+31 PRIMARY_VIP_RANGE_SIZE = 24
+32 # TODO(amuller): Use L3 agent constant when new constants module is introduced.
+33 FIP_LL_SUBNET = '169.254.30.0/23'
+34 KEEPALIVED_SERVICE_NAME = 'keepalived'
+35 GARP_MASTER_DELAY = 60
+36 HEALTH_CHECK_NAME = 'ha_health_check'
+37 
+38 LOG = logging.getLogger(__name__)
+39 
+40 
+41 def get_free_range(parent_range, excluded_ranges, size=PRIMARY_VIP_RANGE_SIZE):
+42     """Get a free IP range, from parent_range, of the specified size.
+43 
+44     :param parent_range: String representing an IP range. E.g: '169.254.0.0/16'
+45     :param excluded_ranges: A list of strings to be excluded from parent_range
+46     :param size: What should be the size of the range returned?
+47     :return: A string representing an IP range
+48     """
+49     free_cidrs = netaddr.IPSet([parent_range]) - netaddr.IPSet(excluded_ranges)
+50     for cidr in free_cidrs.iter_cidrs():
+51         if cidr.prefixlen <= size:
+52             return '%s/%s' % (cidr.network, size)
+53 
+54     raise ValueError(_('Network of size %(size)s, from IP range '
+55                        '%(parent_range)s excluding IP ranges '
+56                        '%(excluded_ranges)s was not found.') %
+57                      {'size': size,
+58                       'parent_range': parent_range,
+59                       'excluded_ranges': excluded_ranges})
+60 
+61 
+62 class InvalidInstanceStateException(exceptions.NeutronException):
+63     message = _('Invalid instance state: %(state)s, valid states are: '
+64                 '%(valid_states)s')
+65 
+66     def __init__(self, **kwargs):
+67         if 'valid_states' not in kwargs:
+68             kwargs['valid_states'] = ', '.join(VALID_STATES)
+69         super(InvalidInstanceStateException, self).__init__(**kwargs)
+70 
+71 
+72 class InvalidAuthenticationTypeException(exceptions.NeutronException):
+73     message = _('Invalid authentication type: %(auth_type)s, '
+74                 'valid types are: %(valid_auth_types)s')
+75 
+76     def __init__(self, **kwargs):
+77         if 'valid_auth_types' not in kwargs:
+78             kwargs['valid_auth_types'] = ', '.join(VALID_AUTH_TYPES)
+79         super(InvalidAuthenticationTypeException, self).__init__(**kwargs)
+80 
+81 
+82 class KeepalivedVipAddress(object):
+83     """A virtual address entry of a keepalived configuration."""
+84 
+85     def __init__(self, ip_address, interface_name, scope=None):
+86         self.ip_address = ip_address
+87         self.interface_name = interface_name
+88         self.scope = scope
+89 
+90     def __eq__(self, other):
+91         return (isinstance(other, KeepalivedVipAddress) and
+92                 self.ip_address == other.ip_address)
+93 
+94     def __str__(self):
+95         return '[%s, %s, %s]' % (self.ip_address,
+96                                  self.interface_name,
+97                                  self.scope)
+98 
+99     def build_config(self):
+100         result = '%s dev %s' % (self.ip_address, self.interface_name)
+101         if self.scope:
+102             result += ' scope %s' % self.scope
+103         return result
+104 
+105 
+106 class KeepalivedVirtualRoute(object):
+107     """A virtual route entry of a keepalived configuration."""
+108 
+109     def __init__(self, destination, nexthop, interface_name=None,
+110                  scope=None):
+111         self.destination = destination
+112         self.nexthop = nexthop
+113         self.interface_name = interface_name
+114         self.scope = scope
+115 
+116     def build_config(self):
+117         output = self.destination
+118         if self.nexthop:
+119             output += ' via %s' % self.nexthop
+120         if self.interface_name:
+121             output += ' dev %s' % self.interface_name
+122         if self.scope:
+123             output += ' scope %s' % self.scope
+124         return output
+125 
+126 
+127 class KeepalivedInstanceRoutes(object):
+128     def __init__(self):
+129         self.gateway_routes = []
+130         self.extra_routes = []
+131         self.extra_subnets = []
+132 
+133     def remove_routes_on_interface(self, interface_name):
+134         self.gateway_routes = [gw_rt for gw_rt in self.gateway_routes
+135                                if gw_rt.interface_name != interface_name]
+136         # NOTE(amuller): extra_routes are initialized from the router's
+137         # 'routes' attribute. These routes do not have an interface
+138         # parameter and so cannot be removed via an interface_name lookup.
+139         self.extra_subnets = [route for route in self.extra_subnets if
+140                               route.interface_name != interface_name]
+141 
+142     @property
+143     def routes(self):
+144         return self.gateway_routes + self.extra_routes + self.extra_subnets
+145 
+146     def __len__(self):
+147         return len(self.routes)
+148 
+149     def build_config(self):
+150         return itertools.chain(['    virtual_routes {'],
+151                                ('        %s' % route.build_config()
+152                                 for route in self.routes),
+153                                ['    }'])
+154 
+155 
+156 class KeepalivedInstance(object):
+157     """Instance section of a keepalived configuration."""
+158 
+159     def __init__(self, state, interface, vrouter_id, ha_cidrs,
+160                  priority=HA_DEFAULT_PRIORITY, advert_int=None,
+161                  mcast_src_ip=None, nopreempt=False,
+162                  garp_master_delay=GARP_MASTER_DELAY):
+163         self.name = 'VR_%s' % vrouter_id
+164 
+165         if state not in VALID_STATES:
+166             raise InvalidInstanceStateException(state=state)
+167 
+168         self.state = state
+169         self.interface = interface
+170         self.vrouter_id = vrouter_id
+171         self.priority = priority
+172         self.nopreempt = nopreempt
+173         self.advert_int = advert_int
+174         self.mcast_src_ip = mcast_src_ip
+175         self.garp_master_delay = garp_master_delay
+176         self.track_interfaces = []
+177         self.vips = []
+178         self.virtual_routes = KeepalivedInstanceRoutes()
+179         self.authentication = None
+180         self.track_script = None
+181         metadata_cidr = '169.254.169.254/32'
+182         self.primary_vip_range = get_free_range(
+183             parent_range='169.254.0.0/16',
+184             excluded_ranges=[metadata_cidr, FIP_LL_SUBNET] + ha_cidrs,
+185             size=PRIMARY_VIP_RANGE_SIZE)
+186 
+187     def set_authentication(self, auth_type, password):
+188         if auth_type not in VALID_AUTH_TYPES:
+189             raise InvalidAuthenticationTypeException(auth_type=auth_type)
+190 
+191         self.authentication = (auth_type, password)
+192 
+193     def add_vip(self, ip_cidr, interface_name, scope):
+194         vip = KeepalivedVipAddress(ip_cidr, interface_name, scope)
+195         if vip not in self.vips:
+196             self.vips.append(vip)
+197         else:
+198             LOG.debug('VIP %s already present in %s', vip, self.vips)
+199 
+200     def remove_vips_vroutes_by_interface(self, interface_name):
+201         self.vips = [vip for vip in self.vips
+202                      if vip.interface_name != interface_name]
+203 
+204         self.virtual_routes.remove_routes_on_interface(interface_name)
+205 
+206     def remove_vip_by_ip_address(self, ip_address):
+207         self.vips = [vip for vip in self.vips
+208                      if vip.ip_address != ip_address]
+209 
+210     def get_existing_vip_ip_addresses(self, interface_name):
+211         return [vip.ip_address for vip in self.vips
+212                 if vip.interface_name == interface_name]
+213 
+214     def _build_track_interface_config(self):
+215         return itertools.chain(
+216             ['    track_interface {'],
+217             ('        %s' % i for i in self.track_interfaces),
+218             ['    }'])
+219 
+220     def get_primary_vip(self):
+221         """Return an address in the primary_vip_range CIDR, with the router's
+222         VRID in the host section.
+223 
+224         For example, if primary_vip_range is 169.254.0.0/24, and this router's
+225         VRID is 5, the result is 169.254.0.5. Using the VRID assures that
+226         the primary VIP is consistent amongst HA router instances on different
+227         nodes.
+228         """
+229 
+230         ip = (netaddr.IPNetwork(self.primary_vip_range).network +
+231               self.vrouter_id)
+232         return str(netaddr.IPNetwork('%s/%s' % (ip, PRIMARY_VIP_RANGE_SIZE)))
+233 
+234     def _build_vips_config(self):
+235         # NOTE(amuller): The primary VIP must be consistent in order to avoid
+236         # keepalived bugs. Changing the VIP in the 'virtual_ipaddress' and
+237         # SIGHUP'ing keepalived can remove virtual routers, including the
+238         # router's default gateway.
+239         # We solve this by never changing the VIP in the virtual_ipaddress
+240         # section, herein known as the primary VIP.
+241         # The only interface known to exist for HA routers is the HA interface
+242         # (self.interface). We generate an IP on that device and use it as the
+243         # primary VIP. The other VIPs (Internal interfaces IPs, the external
+244         # interface IP and floating IPs) are placed in the
+245         # virtual_ipaddress_excluded section.
+246 
+247         primary = KeepalivedVipAddress(self.get_primary_vip(), self.interface)
+248         vips_result = ['    virtual_ipaddress {',
+249                        '        %s' % primary.build_config(),
+250                        '    }']
+251 
+252         if self.vips:
+253             vips_result.extend(
+254                 itertools.chain(['    virtual_ipaddress_excluded {'],
+255                                 ('        %s' % vip.build_config()
+256                                  for vip in
+257                                  sorted(self.vips,
+258                                         key=lambda vip: vip.ip_address)),
+259                                 ['    }']))
+260 
+261         return vips_result
+262 
+263     def _build_virtual_routes_config(self):
+264         return itertools.chain(['    virtual_routes {'],
+265                                ('        %s' % route.build_config()
+266                                 for route in self.virtual_routes),
+267                                ['    }'])
+268 
+269     def build_config(self):
+270         if self.track_script:
+271             config = self.track_script.build_config_preamble()
+272         else:
+273             config = []
+274 
+275         config.extend(['vrrp_instance %s {' % self.name,
+276                        '    state %s' % self.state,
+277                        '    interface %s' % self.interface,
+278                        '    virtual_router_id %s' % self.vrouter_id,
+279                        '    priority %s' % self.priority,
+280                        '    garp_master_delay %s' % self.garp_master_delay])
+281 
+282         if self.track_script:
+283             self.track_script.routes = self.virtual_routes.gateway_routes
+284             self.track_script.vips = self.vips
+285 
+286         if self.nopreempt:
+287             config.append('    nopreempt')
+288 
+289         if self.advert_int:
+290             config.append('    advert_int %s' % self.advert_int)
+291 
+292         if self.authentication:
+293             auth_type, password = self.authentication
+294             authentication = ['    authentication {',
+295                               '        auth_type %s' % auth_type,
+296                               '        auth_pass %s' % password,
+297                               '    }']
+298             config.extend(authentication)
+299 
+300         if self.mcast_src_ip:
+301             config.append('    mcast_src_ip %s' % self.mcast_src_ip)
+302 
+303         if self.track_interfaces:
+304             config.extend(self._build_track_interface_config())
+305 
+306         config.extend(self._build_vips_config())
+307 
+308         if len(self.virtual_routes):
+309             config.extend(self.virtual_routes.build_config())
+310 
+311         if self.track_script:
+312             config.extend(self.track_script.build_config())
+313 
+314         config.append('}')
+315 
+316         return config
+317 
+318 
+319 class KeepalivedConf(object):
+320     """A keepalived configuration."""
+321 
+322     def __init__(self):
+323         self.reset()
+324 
+325     def reset(self):
+326         self.instances = {}
+327 
+328     def add_instance(self, instance):
+329         self.instances[instance.vrouter_id] = instance
+330 
+331     def get_instance(self, vrouter_id):
+332         return self.instances.get(vrouter_id)
+333 
+334     def build_config(self):
+335         config = []
+336 
+337         for instance in self.instances.values():
+338             config.extend(instance.build_config())
+339 
+340         return config
+341 
+342     def get_config_str(self):
+343         """Generates and returns the keepalived configuration.
+344 
+345         :return: Keepalived configuration string.
+346         """
+347         return '\n'.join(self.build_config())
+348 
+349 
+350 class KeepalivedManager(object):
+351     """Wrapper for keepalived.
+352 
+353     This wrapper permits to write keepalived config files, to start/restart
+354     keepalived process.
+355 
+356     """
+357 
+358     def __init__(self, resource_id, config, process_monitor, conf_path='/tmp',
+359                  namespace=None):
+360         self.resource_id = resource_id
+361         self.config = config
+362         self.namespace = namespace
+363         self.process_monitor = process_monitor
+364         self.conf_path = conf_path
+365 
+366     def get_conf_dir(self):
+367         confs_dir = os.path.abspath(os.path.normpath(self.conf_path))
+368         conf_dir = os.path.join(confs_dir, self.resource_id)
+369         return conf_dir
+370 
+371     def get_full_config_file_path(self, filename, ensure_conf_dir=True):
+372         conf_dir = self.get_conf_dir()
+373         if ensure_conf_dir:
+374             common_utils.ensure_dir(conf_dir)
+375         return os.path.join(conf_dir, filename)
+376 
+377     def _output_config_file(self):
+378         config_str = self.config.get_config_str()
+379         config_path = self.get_full_config_file_path('keepalived.conf')
+380         common_utils.replace_file(config_path, config_str)
+381 
+382         return config_path
+383 
+384     def get_conf_on_disk(self):
+385         config_path = self.get_full_config_file_path('keepalived.conf')
+386         try:
+387             with open(config_path) as conf:
+388                 return conf.read()
+389         except (OSError, IOError) as e:
+390             if e.errno != errno.ENOENT:
+391                 raise
+392 
+393     def spawn(self):
+394         config_path = self._output_config_file()
+395 
+396         keepalived_pm = self.get_process()
+397         vrrp_pm = self._get_vrrp_process(
+398             '%s-vrrp' % keepalived_pm.get_pid_file_name())
+399 
+400         keepalived_pm.default_cmd_callback = (
+401             self._get_keepalived_process_callback(vrrp_pm, config_path))
+402 
+403         keepalived_pm.enable(reload_cfg=True)
+404 
+405         self.process_monitor.register(uuid=self.resource_id,
+406                                       service_name=KEEPALIVED_SERVICE_NAME,
+407                                       monitored_process=keepalived_pm)
+408 
+409         if self.config.instances.get(1).track_script:
+410             self.config.instances.get(1).track_script.write_check_script()
+411 
+412         LOG.debug('Keepalived spawned with config %s', config_path)
+413 
+414     def disable(self):
+415         self.process_monitor.unregister(uuid=self.resource_id,
+416                                         service_name=KEEPALIVED_SERVICE_NAME)
+417 
+418         pm = self.get_process()
+419         pm.disable(sig='15')
+420 
+421     def get_process(self):
+422         return external_process.ProcessManager(
+423             cfg.CONF,
+424             self.resource_id,
+425             self.namespace,
+426             pids_path=self.conf_path)
+427 
+428     def _get_vrrp_process(self, pid_file):
+429         return external_process.ProcessManager(
+430             cfg.CONF,
+431             self.resource_id,
+432             self.namespace,
+433             pid_file=pid_file)
+434 
+435     def _get_keepalived_process_callback(self, vrrp_pm, config_path):
+436 
+437         def callback(pid_file):
+438             # If keepalived process crashed unexpectedly, the vrrp process
+439             # will be orphan and prevent keepalived process to be spawned.
+440             # A check here will let the l3-agent to kill the orphan process
+441             # and spawn keepalived successfully.
+442             if vrrp_pm.active:
+443                 vrrp_pm.disable()
+444             cmd = ['keepalived', '-P',
+445                    '-f', config_path,
+446                    '-p', pid_file,
+447                    '-r', '%s-vrrp' % pid_file]
+448             return cmd
+449 
+450         return callback
+451 
+452 
+453 class KeepalivedTrackScript(object):
+454     """Track script generator for Keepalived"""
+455 
+456     def __init__(self, interval, conf_dir, vr_id):
+457         self.interval = interval
+458         self.conf_dir = conf_dir
+459         self.vr_id = vr_id
+460         self.routes = []
+461         self.vips = []
+462 
+463     def build_config_preamble(self):
+464         config = ["""
+465 vrrp_script %(health_check_name)s_%(vr_id)s {
+466     script "%(script_location)s"
+467     interval %(interval)s
+468     fall 2
+469     rise 2
+470 }
+471 """ % {
+472             'vr_id': self.vr_id,
+473             'health_check_name': HEALTH_CHECK_NAME,
+474             'script_location': self._get_script_location(),
+475             'interval': self.interval,
+476         }]
+477 
+478         return config
+479 
+480     def build_config(self):
+481         config = ['    track_script {',
+482                   '        %s_%s' % (HEALTH_CHECK_NAME, self.vr_id),
+483                   '    }']
+484 
+485         return config
+486 
+487     def build_script(self):
+488         return itertools.chain(['#!/bin/bash -eu'],
+489                                ['%s' % self._check_ip_assigned()],
+490                                ('%s' % self._add_ip_addr(route.nexthop)
+491                                 for route in self.routes if route.nexthop),
+492                                )
+493 
+494     def _add_ip_addr(self, ip_addr):
+495         cmd = {
+496             4: 'ping',
+497             6: 'ping6',
+498         }.get(netaddr.IPAddress(ip_addr).version)
+499 
+500         return '%s -c 1 -w 1 -n %s 1>/dev/null || exit 1' % (cmd, ip_addr)
+501 
+502     def _check_ip_assigned(self):
+503         cmd = 'ip a | grep %s || exit 0'
+504         return cmd % netaddr.IPNetwork(self.vips[0].ip_address).ip if len(
+505             self.vips) else ''
+506 
+507     def get_config_str(self):
+508         """Generates and returns track_script section of Keepalived
+509         configuration.
+510 
+511         :return: Keepalived track_script section.
+512         """
+513         return '\n'.join(self.build_config())
+514 
+515     def get_script_str(self):
+516         """Generates and returns bash script to veryfy connectivity.
+517 
+518         :return: Bash script code
+519         """
+520         return '\n'.join(self.build_script())
+521 
+522     def _get_script_location(self):
+523         return os.path.join(self.conf_dir,
+524                             'ha_check_script_%s.sh' % self.vr_id)
+525 
+526     def write_check_script(self):
+527         common_utils.replace_file(
+528             self._get_script_location(), self.get_script_str(), 520)

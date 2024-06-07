@@ -1,0 +1,424 @@
+Based on the given code from a commit, please generate supplementary code files according to the commit message.
+####commit message
+DVR: Add static routes to FIP namespace
+
+The static routes are currently only added to the router
+namespace and snat namespace, but not added to the fip
+namespace.
+
+This patch adds the static routes configured for the router
+to the FIP namespace, to its own table. So this will allow
+the FIP namespace to be configured with different nexthop
+routes for different routers.
+
+Change-Id: Ida165d1ecf5c07af31dac11d9daed33ccaaf5605
+Closes-Bug: #1571676
+
+####code 
+1 # Copyright (c) 2015 OpenStack Foundation
+2 #
+3 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
+4 #    not use this file except in compliance with the License. You may obtain
+5 #    a copy of the License at
+6 #
+7 #         http://www.apache.org/licenses/LICENSE-2.0
+8 #
+9 #    Unless required by applicable law or agreed to in writing, software
+10 #    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+11 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+12 #    License for the specific language governing permissions and limitations
+13 #    under the License.
+14 
+15 import contextlib
+16 import os
+17 
+18 from oslo_concurrency import lockutils
+19 from oslo_log import log as logging
+20 from oslo_utils import excutils
+21 
+22 from neutron._i18n import _, _LE, _LW
+23 from neutron.agent.l3 import fip_rule_priority_allocator as frpa
+24 from neutron.agent.l3 import link_local_allocator as lla
+25 from neutron.agent.l3 import namespaces
+26 from neutron.agent.linux import ip_lib
+27 from neutron.agent.linux import iptables_manager
+28 from neutron.common import constants
+29 from neutron.common import exceptions as n_exc
+30 from neutron.common import utils as common_utils
+31 from neutron.ipam import utils as ipam_utils
+32 
+33 LOG = logging.getLogger(__name__)
+34 
+35 FIP_NS_PREFIX = 'fip-'
+36 FIP_EXT_DEV_PREFIX = 'fg-'
+37 FIP_2_ROUTER_DEV_PREFIX = 'fpr-'
+38 ROUTER_2_FIP_DEV_PREFIX = namespaces.ROUTER_2_FIP_DEV_PREFIX
+39 # Route Table index for FIPs
+40 FIP_RT_TBL = 16
+41 # Rule priority range for FIPs
+42 FIP_PR_START = 32768
+43 FIP_PR_END = FIP_PR_START + 40000
+44 
+45 
+46 class FipNamespace(namespaces.Namespace):
+47 
+48     def __init__(self, ext_net_id, agent_conf, driver, use_ipv6):
+49         name = self._get_ns_name(ext_net_id)
+50         super(FipNamespace, self).__init__(
+51             name, agent_conf, driver, use_ipv6)
+52 
+53         self._ext_net_id = ext_net_id
+54         self.agent_conf = agent_conf
+55         self.driver = driver
+56         self.use_ipv6 = use_ipv6
+57         self.agent_gateway_port = None
+58         self._subscribers = set()
+59         path = os.path.join(agent_conf.state_path, 'fip-priorities')
+60         self._rule_priorities = frpa.FipRulePriorityAllocator(path,
+61                                                               FIP_PR_START,
+62                                                               FIP_PR_END)
+63         self._iptables_manager = iptables_manager.IptablesManager(
+64             namespace=self.get_name(),
+65             use_ipv6=self.use_ipv6)
+66         path = os.path.join(agent_conf.state_path, 'fip-linklocal-networks')
+67         self.local_subnets = lla.LinkLocalAllocator(
+68             path, constants.DVR_FIP_LL_CIDR)
+69         self.destroyed = False
+70 
+71     @classmethod
+72     def _get_ns_name(cls, ext_net_id):
+73         return namespaces.build_ns_name(FIP_NS_PREFIX, ext_net_id)
+74 
+75     def get_name(self):
+76         return self._get_ns_name(self._ext_net_id)
+77 
+78     def get_ext_device_name(self, port_id):
+79         return (FIP_EXT_DEV_PREFIX + port_id)[:self.driver.DEV_NAME_LEN]
+80 
+81     def get_int_device_name(self, router_id):
+82         return (FIP_2_ROUTER_DEV_PREFIX + router_id)[:self.driver.DEV_NAME_LEN]
+83 
+84     def get_rtr_ext_device_name(self, router_id):
+85         return (ROUTER_2_FIP_DEV_PREFIX + router_id)[:self.driver.DEV_NAME_LEN]
+86 
+87     def has_subscribers(self):
+88         return len(self._subscribers) != 0
+89 
+90     def subscribe(self, external_net_id):
+91         is_first = not self.has_subscribers()
+92         self._subscribers.add(external_net_id)
+93         return is_first
+94 
+95     def unsubscribe(self, external_net_id):
+96         self._subscribers.discard(external_net_id)
+97         return not self.has_subscribers()
+98 
+99     def allocate_rule_priority(self, floating_ip):
+100         return self._rule_priorities.allocate(floating_ip)
+101 
+102     def deallocate_rule_priority(self, floating_ip):
+103         self._rule_priorities.release(floating_ip)
+104 
+105     @contextlib.contextmanager
+106     def _fip_port_lock(self, interface_name):
+107         # Use a namespace and port-specific lock semaphore to allow for
+108         # concurrency
+109         lock_name = 'port-lock-' + self.name + '-' + interface_name
+110         with lockutils.lock(lock_name, common_utils.SYNCHRONIZED_PREFIX):
+111             try:
+112                 yield
+113             except Exception:
+114                 with excutils.save_and_reraise_exception():
+115                     LOG.error(_LE('DVR: FIP namespace config failure '
+116                                   'for interface %s'), interface_name)
+117 
+118     def create_or_update_gateway_port(self, agent_gateway_port):
+119         interface_name = self.get_ext_device_name(agent_gateway_port['id'])
+120 
+121         is_first = self.subscribe(agent_gateway_port['network_id'])
+122         if is_first:
+123             self._create_gateway_port_and_ns(agent_gateway_port,
+124                                              interface_name)
+125         else:
+126             try:
+127                 self._update_gateway_port(agent_gateway_port, interface_name)
+128             except Exception:
+129                 # If an exception occurs at this point, then it is
+130                 # good to clean up the namespace that has been created
+131                 # and reraise the exception in order to resync the router
+132                 with excutils.save_and_reraise_exception():
+133                     self.unsubscribe(agent_gateway_port['network_id'])
+134                     self.delete()
+135                     LOG.exception(_LE('DVR: Gateway setup in FIP namespace '
+136                                       'failed'))
+137 
+138     def _create_gateway_port_and_ns(self, agent_gateway_port, interface_name):
+139         """Create namespace and Floating IP gateway port."""
+140         self.create()
+141         self._create_gateway_port(agent_gateway_port, interface_name)
+142 
+143     def _create_gateway_port(self, ex_gw_port, interface_name):
+144         """Request port creation from Plugin then configure gateway port."""
+145         LOG.debug("DVR: adding gateway interface: %s", interface_name)
+146         ns_name = self.get_name()
+147         self.driver.plug(ex_gw_port['network_id'],
+148                          ex_gw_port['id'],
+149                          interface_name,
+150                          ex_gw_port['mac_address'],
+151                          bridge=self.agent_conf.external_network_bridge,
+152                          namespace=ns_name,
+153                          prefix=FIP_EXT_DEV_PREFIX,
+154                          mtu=ex_gw_port.get('mtu'))
+155 
+156         # Remove stale fg devices
+157         ip_wrapper = ip_lib.IPWrapper(namespace=ns_name)
+158         devices = ip_wrapper.get_devices()
+159         for device in devices:
+160             name = device.name
+161             if name.startswith(FIP_EXT_DEV_PREFIX) and name != interface_name:
+162                 LOG.debug('DVR: unplug: %s', name)
+163                 ext_net_bridge = self.agent_conf.external_network_bridge
+164                 self.driver.unplug(name,
+165                                    bridge=ext_net_bridge,
+166                                    namespace=ns_name,
+167                                    prefix=FIP_EXT_DEV_PREFIX)
+168 
+169         ip_cidrs = common_utils.fixed_ip_cidrs(ex_gw_port['fixed_ips'])
+170         self.driver.init_l3(interface_name, ip_cidrs, namespace=ns_name,
+171                             clean_connections=True)
+172 
+173         self.agent_gateway_port = ex_gw_port
+174 
+175         cmd = ['sysctl', '-w', 'net.ipv4.conf.%s.proxy_arp=1' % interface_name]
+176         ip_wrapper.netns.execute(cmd, check_exit_code=False)
+177 
+178     def create(self):
+179         LOG.debug("DVR: add fip namespace: %s", self.name)
+180         # parent class will ensure the namespace exists and turn-on forwarding
+181         super(FipNamespace, self).create()
+182         # Somewhere in the 3.19 kernel timeframe ip_nonlocal_bind was
+183         # changed to be a per-namespace attribute.  To be backwards
+184         # compatible we need to try both if at first we fail.
+185         ip_wrapper = ip_lib.IPWrapper(namespace=self.name)
+186         try:
+187             ip_wrapper.netns.execute(['sysctl',
+188                                       '-w',
+189                                       'net.ipv4.ip_nonlocal_bind=1'],
+190                                      log_fail_as_error=False,
+191                                      run_as_root=True)
+192         except RuntimeError:
+193             LOG.debug('DVR: fip namespace (%s) does not support setting '
+194                       'net.ipv4.ip_nonlocal_bind, trying in root namespace',
+195                       self.name)
+196             self.ip_wrapper_root.netns.execute(['sysctl',
+197                                                 '-w',
+198                                                 'net.ipv4.ip_nonlocal_bind=1'],
+199                                                run_as_root=True)
+200 
+201         # no connection tracking needed in fip namespace
+202         self._iptables_manager.ipv4['raw'].add_rule('PREROUTING',
+203                                                     '-j CT --notrack')
+204         self._iptables_manager.apply()
+205 
+206     def delete(self):
+207         self.destroyed = True
+208         self._delete()
+209         self.agent_gateway_port = None
+210 
+211     @namespaces.check_ns_existence
+212     def _delete(self):
+213         ip_wrapper = ip_lib.IPWrapper(namespace=self.name)
+214         for d in ip_wrapper.get_devices(exclude_loopback=True):
+215             if d.name.startswith(FIP_2_ROUTER_DEV_PREFIX):
+216                 # internal link between IRs and FIP NS
+217                 ip_wrapper.del_veth(d.name)
+218             elif d.name.startswith(FIP_EXT_DEV_PREFIX):
+219                 # single port from FIP NS to br-ext
+220                 # TODO(carl) Where does the port get deleted?
+221                 LOG.debug('DVR: unplug: %s', d.name)
+222                 ext_net_bridge = self.agent_conf.external_network_bridge
+223                 self.driver.unplug(d.name,
+224                                    bridge=ext_net_bridge,
+225                                    namespace=self.name,
+226                                    prefix=FIP_EXT_DEV_PREFIX)
+227 
+228         # TODO(mrsmith): add LOG warn if fip count != 0
+229         LOG.debug('DVR: destroy fip namespace: %s', self.name)
+230         super(FipNamespace, self).delete()
+231 
+232     def _check_for_gateway_ip_change(self, new_agent_gateway_port):
+233 
+234         def get_gateway_ips(gateway_port):
+235             gw_ips = {}
+236             if gateway_port:
+237                 for subnet in gateway_port.get('subnets', []):
+238                     gateway_ip = subnet.get('gateway_ip', None)
+239                     if gateway_ip:
+240                         ip_version = ip_lib.get_ip_version(gateway_ip)
+241                         gw_ips[ip_version] = gateway_ip
+242             return gw_ips
+243 
+244         new_gw_ips = get_gateway_ips(new_agent_gateway_port)
+245         old_gw_ips = get_gateway_ips(self.agent_gateway_port)
+246 
+247         return new_gw_ips != old_gw_ips
+248 
+249     def get_fip_table_indexes(self, ip_version):
+250         ns_ipr = ip_lib.IPRule(namespace=self.get_name())
+251         ip_rules_list = ns_ipr.rule.list_rules(ip_version)
+252         tbl_index_list = []
+253         for ip_rule in ip_rules_list:
+254             tbl_index = ip_rule['table']
+255             if tbl_index in ['local', 'default', 'main']:
+256                 continue
+257             tbl_index_list.append(tbl_index)
+258         return tbl_index_list
+259 
+260     def _add_default_gateway_for_fip(self, gw_ip, ip_device, tbl_index):
+261         """Adds default gateway for fip based on the tbl_index passed."""
+262         if tbl_index is None:
+263             ip_version = ip_lib.get_ip_version(gw_ip)
+264             tbl_index_list = self.get_fip_table_indexes(
+265                 ip_version)
+266             for tbl_index in tbl_index_list:
+267                 ip_device.route.add_gateway(gw_ip, table=tbl_index)
+268         else:
+269             ip_device.route.add_gateway(gw_ip, table=tbl_index)
+270 
+271     def _add_rtr_ext_route_rule_to_route_table(self, ri, fip_2_rtr,
+272                                                fip_2_rtr_name):
+273         """Creates external route table and adds routing rules."""
+274         # TODO(Swami): Rename the _get_snat_idx function to some
+275         # generic name that can be used for SNAT and FIP
+276         rt_tbl_index = ri._get_snat_idx(fip_2_rtr)
+277         interface_name = self.get_ext_device_name(
+278             self.agent_gateway_port['id'])
+279         try:
+280             self._update_gateway_route_with_lock(
+281                 self.agent_gateway_port,
+282                 interface_name, tbl_index=rt_tbl_index)
+283         except Exception:
+284             # If an exception occurs at this point, then it is
+285             # good to clean up the namespace that has been created
+286             # and reraise the exception in order to resync the router
+287             with excutils.save_and_reraise_exception():
+288                 self.unsubscribe(self.agent_gateway_port['network_id'])
+289                 # It is also better to reset the fip count so that
+290                 # the create_rtr_2_fip_link is called again in this
+291                 # context
+292                 ri.dist_fip_count = 0
+293                 LOG.exception(_LE('DVR: Gateway setup in FIP namespace '
+294                                   'failed'))
+295 
+296         # Now add the filter match rule for the table.
+297         ip_rule = ip_lib.IPRule(namespace=self.get_name())
+298         ip_rule.rule.add(ip=str(fip_2_rtr.ip),
+299                          iif=fip_2_rtr_name,
+300                          table=rt_tbl_index,
+301                          priority=rt_tbl_index)
+302 
+303     def _update_gateway_port(
+304         self, agent_gateway_port, interface_name):
+305         if (self.agent_gateway_port and
+306                 not self._check_for_gateway_ip_change(agent_gateway_port)):
+307             return
+308         self._update_gateway_route_with_lock(
+309             agent_gateway_port, interface_name)
+310 
+311     def _update_gateway_route_with_lock(self, agent_gateway_port,
+312                                         interface_name, tbl_index=None):
+313         with self._fip_port_lock(interface_name):
+314             self._update_gateway_route(agent_gateway_port,
+315                                        interface_name,
+316                                        tbl_index)
+317 
+318     def _update_gateway_route(self, agent_gateway_port,
+319                              interface_name, tbl_index):
+320         ns_name = self.get_name()
+321         ipd = ip_lib.IPDevice(interface_name, namespace=ns_name)
+322         # If the 'fg-' device doesn't exist in the namespace then trying
+323         # to send advertisements or configure the default route will just
+324         # throw exceptions.  Unsubscribe this external network so that
+325         # the next call will trigger the interface to be plugged.
+326         if not ipd.exists():
+327             LOG.warning(_LW('DVR: FIP gateway port with interface '
+328                             'name: %(device)s does not exist in the given '
+329                             'namespace: %(ns)s'), {'device': interface_name,
+330                                                    'ns': ns_name})
+331             msg = _('DVR: Gateway setup in FIP namespace failed, retry '
+332                     'should be attempted on next call')
+333             raise n_exc.FloatingIpSetupException(msg)
+334 
+335         for fixed_ip in agent_gateway_port['fixed_ips']:
+336             ip_lib.send_ip_addr_adv_notif(ns_name,
+337                                           interface_name,
+338                                           fixed_ip['ip_address'],
+339                                           self.agent_conf.send_arp_for_ha)
+340 
+341         for subnet in agent_gateway_port['subnets']:
+342             gw_ip = subnet.get('gateway_ip')
+343             if gw_ip:
+344                 is_gateway_not_in_subnet = not ipam_utils.check_subnet_ip(
+345                                                 subnet.get('cidr'), gw_ip)
+346                 if is_gateway_not_in_subnet:
+347                     ipd.route.add_route(gw_ip, scope='link')
+348                 self._add_default_gateway_for_fip(
+349                     gw_ip, ipd, tbl_index)
+350             else:
+351                 current_gateway = ipd.route.get_gateway()
+352                 if current_gateway and current_gateway.get('gateway'):
+353                     ipd.route.delete_gateway(current_gateway.get('gateway'))
+354         # Cache the agent gateway port after successfully configuring
+355         # the gateway, so that checking on self.agent_gateway_port
+356         # will be a valid check
+357         self.agent_gateway_port = agent_gateway_port
+358 
+359     def _add_cidr_to_device(self, device, ip_cidr):
+360         if not device.addr.list(to=ip_cidr):
+361             device.addr.add(ip_cidr, add_broadcast=False)
+362 
+363     def create_rtr_2_fip_link(self, ri):
+364         """Create interface between router and Floating IP namespace."""
+365         LOG.debug("Create FIP link interfaces for router %s", ri.router_id)
+366         rtr_2_fip_name = self.get_rtr_ext_device_name(ri.router_id)
+367         fip_2_rtr_name = self.get_int_device_name(ri.router_id)
+368         fip_ns_name = self.get_name()
+369 
+370         # add link local IP to interface
+371         if ri.rtr_fip_subnet is None:
+372             ri.rtr_fip_subnet = self.local_subnets.allocate(ri.router_id)
+373         rtr_2_fip, fip_2_rtr = ri.rtr_fip_subnet.get_pair()
+374         rtr_2_fip_dev = ip_lib.IPDevice(rtr_2_fip_name, namespace=ri.ns_name)
+375         fip_2_rtr_dev = ip_lib.IPDevice(fip_2_rtr_name, namespace=fip_ns_name)
+376 
+377         if not rtr_2_fip_dev.exists():
+378             ip_wrapper = ip_lib.IPWrapper(namespace=ri.ns_name)
+379             rtr_2_fip_dev, fip_2_rtr_dev = ip_wrapper.add_veth(rtr_2_fip_name,
+380                                                                fip_2_rtr_name,
+381                                                                fip_ns_name)
+382             mtu = ri.get_ex_gw_port().get('mtu')
+383             if mtu:
+384                 rtr_2_fip_dev.link.set_mtu(mtu)
+385                 fip_2_rtr_dev.link.set_mtu(mtu)
+386             rtr_2_fip_dev.link.set_up()
+387             fip_2_rtr_dev.link.set_up()
+388 
+389         self._add_cidr_to_device(rtr_2_fip_dev, str(rtr_2_fip))
+390         self._add_cidr_to_device(fip_2_rtr_dev, str(fip_2_rtr))
+391         self._add_rtr_ext_route_rule_to_route_table(ri, fip_2_rtr,
+392                                                     fip_2_rtr_name)
+393 
+394         # add default route for the link local interface
+395         rtr_2_fip_dev.route.add_gateway(str(fip_2_rtr.ip), table=FIP_RT_TBL)
+396 
+397     def scan_fip_ports(self, ri):
+398         # don't scan if not dvr or count is not None
+399         if ri.dist_fip_count is not None:
+400             return
+401 
+402         # scan system for any existing fip ports
+403         ri.dist_fip_count = 0
+404         rtr_2_fip_interface = self.get_rtr_ext_device_name(ri.router_id)
+405         device = ip_lib.IPDevice(rtr_2_fip_interface, namespace=ri.ns_name)
+406         if device.exists():
+407             ri.dist_fip_count = len(ri.get_router_cidrs(device))

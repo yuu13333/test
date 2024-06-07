@@ -1,0 +1,282 @@
+I want you to act as a code reviewer of Neutron in OpenStack. Please review the code below to detect security defects. If any are found, please describe the security defect in detail and indicate the corresponding line number of code and solution. If none are found, please state '''No security defects are detected in the code'''.
+
+1 # Copyright (c) 2015 Mirantis, Inc.
+2 # All Rights Reserved.
+3 #
+4 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
+5 #    not use this file except in compliance with the License. You may obtain
+6 #    a copy of the License at
+7 #
+8 #         http://www.apache.org/licenses/LICENSE-2.0
+9 #
+10 #    Unless required by applicable law or agreed to in writing, software
+11 #    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+12 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+13 #    License for the specific language governing permissions and limitations
+14 #    under the License.
+15 
+16 import copy
+17 
+18 from neutron_lib import constants as const
+19 from oslo_log import log as logging
+20 from oslo_policy import policy as oslo_policy
+21 from oslo_utils import excutils
+22 from pecan import hooks
+23 import webob
+24 
+25 from neutron._i18n import _
+26 from neutron.extensions import quotasv2
+27 from neutron import manager
+28 from neutron.pecan_wsgi import constants as pecan_constants
+29 from neutron.pecan_wsgi.controllers import quota
+30 from neutron.pecan_wsgi.hooks import utils
+31 from neutron import policy
+32 
+33 LOG = logging.getLogger(__name__)
+34 
+35 
+36 def _custom_getter(resource, resource_id):
+37     """Helper function to retrieve resources not served by any plugin."""
+38     if resource == quotasv2.RESOURCE_NAME:
+39         return quota.get_tenant_quotas(resource_id)[quotasv2.RESOURCE_NAME]
+40 
+41 
+42 def _project_have_access_to_item(context, action, item, collection):
+43     try:
+44         return not policy.check(
+45             context, action, item, pluralized=collection)
+46     except oslo_policy.InvalidScope:
+47         LOG.debug("Invalid scope for action: %s, item: %s", action, item)
+48         return False
+49 
+50 
+51 def fetch_resource(method, neutron_context, controller,
+52                    collection, resource, resource_id,
+53                    parent_id=None):
+54     field_list = []
+55     if method == 'PUT':
+56         attrs = controller.resource_info
+57         if not attrs:
+58             # this isn't a request for a normal resource. it could be
+59             # an action like removing a network from a dhcp agent.
+60             # return None and assume the custom controller for this will
+61             # handle the necessary logic.
+62             return
+63         field_list = [name for (name, value) in attrs.items()
+64                       if (value.get('required_by_policy') or
+65                           value.get('primary_key') or 'default' not in value)]
+66     plugin = manager.NeutronManager.get_plugin_for_resource(collection)
+67     if plugin:
+68         if utils.is_member_action(controller):
+69             getter = controller.parent_controller.plugin_shower
+70         else:
+71             getter = controller.plugin_shower
+72         getter_args = [neutron_context, resource_id]
+73         if parent_id:
+74             getter_args.append(parent_id)
+75         return getter(*getter_args, fields=field_list)
+76     else:
+77         # Some legit resources, like quota, do not have a plugin yet.
+78         # Retrieving the original object is nevertheless important
+79         # for policy checks.
+80         return _custom_getter(resource, resource_id)
+81 
+82 
+83 class PolicyHook(hooks.PecanHook):
+84     priority = 140
+85 
+86     def before(self, state):
+87         # This hook should be run only for PUT,POST and DELETE methods and for
+88         # requests targeting a neutron resource
+89         resources = state.request.context.get('resources', [])
+90         if state.request.method not in ('POST', 'PUT', 'DELETE'):
+91             return
+92         # As this routine will likely alter the resources, do a shallow copy
+93         resources_copy = resources[:]
+94         neutron_context = state.request.context.get('neutron_context')
+95         resource = state.request.context.get('resource')
+96         # If there is no resource for this request, don't bother running authZ
+97         # policies
+98         if not resource:
+99             return
+100         controller = utils.get_controller(state)
+101         if not controller or utils.is_member_action(controller):
+102             return
+103         collection = state.request.context.get('collection')
+104         needs_prefetch = (state.request.method == 'PUT' or
+105                           state.request.method == 'DELETE')
+106         policy.init()
+107 
+108         action = controller.plugin_handlers[
+109             pecan_constants.ACTION_MAP[state.request.method]]
+110 
+111         # NOTE(salv-orlando): As bulk updates are not supported, in case of PUT
+112         # requests there will be only a single item to process, and its
+113         # identifier would have been already retrieved by the lookup process;
+114         # in the case of DELETE requests there won't be any item to process in
+115         # the request body
+116         original_resources = []
+117         if needs_prefetch:
+118             try:
+119                 item = resources_copy.pop()
+120             except IndexError:
+121                 # Ops... this was a delete after all!
+122                 item = {}
+123             resource_id = state.request.context.get('resource_id')
+124             parent_id = state.request.context.get('parent_id')
+125             method = state.request.method
+126             resource_obj = fetch_resource(method, neutron_context, controller,
+127                                           collection, resource, resource_id,
+128                                           parent_id=parent_id)
+129             if resource_obj:
+130                 original_resources.append(resource_obj)
+131                 obj = copy.copy(resource_obj)
+132                 obj.update(item)
+133                 obj[const.ATTRIBUTES_TO_UPDATE] = list(item)
+134                 # Put back the item in the list so that policies could be
+135                 # enforced
+136                 resources_copy.append(obj)
+137         # TODO(salv-orlando): as other hooks might need to prefetch resources,
+138         # store them in the request context. However, this should be done in a
+139         # separate hook which is conveniently called before all other hooks
+140         state.request.context['original_resources'] = original_resources
+141         for item in resources_copy:
+142             try:
+143                 policy.enforce(
+144                     neutron_context, action, item,
+145                     pluralized=collection)
+146             except oslo_policy.PolicyNotAuthorized:
+147                 with excutils.save_and_reraise_exception() as ctxt:
+148                     # If a tenant is modifying it's own object, it's safe to
+149                     # return a 403. Otherwise, pretend that it doesn't exist
+150                     # to avoid giving away information.
+151                     controller = utils.get_controller(state)
+152                     s_action = controller.plugin_handlers[controller.SHOW]
+153                     if _project_have_access_to_item(
+154                             neutron_context, s_action, item, collection):
+155                         ctxt.reraise = False
+156                 msg = _('The resource could not be found.')
+157                 raise webob.exc.HTTPNotFound(msg)
+158 
+159     def after(self, state):
+160         neutron_context = state.request.context.get('neutron_context')
+161         resource = state.request.context.get('resource')
+162         collection = state.request.context.get('collection')
+163         controller = utils.get_controller(state)
+164         if not resource:
+165             # can't filter a resource we don't recognize
+166             return
+167         # NOTE(kevinbenton): extension listing isn't controlled by policy
+168         if resource == 'extension':
+169             return
+170         try:
+171             data = state.response.json
+172         except ValueError:
+173             return
+174         if state.request.method not in pecan_constants.ACTION_MAP:
+175             return
+176         if not data or (resource not in data and collection not in data):
+177             return
+178         policy.init()
+179         is_single = resource in data
+180         action_type = pecan_constants.ACTION_MAP[state.request.method]
+181         if action_type == 'get':
+182             action = controller.plugin_handlers[controller.SHOW]
+183         else:
+184             action = controller.plugin_handlers[action_type]
+185         key = resource if is_single else collection
+186         to_process = [data[resource]] if is_single else data[collection]
+187         # in the single case, we enforce which raises on violation
+188         # in the plural case, we just check so violating items are hidden
+189         policy_method = policy.enforce if is_single else policy.check
+190         plugin = manager.NeutronManager.get_plugin_for_resource(collection)
+191         try:
+192             resp = [self._get_filtered_item(state.request, controller,
+193                                             resource, collection, item)
+194                     for item in to_process
+195                     if (state.request.method != 'GET' or
+196                         policy_method(neutron_context, action, item,
+197                                       plugin=plugin,
+198                                       pluralized=collection))]
+199         except oslo_policy.PolicyNotAuthorized:
+200             # This exception must be explicitly caught as the exception
+201             # translation hook won't be called if an error occurs in the
+202             # 'after' handler.  Instead of raising an HTTPNotFound exception,
+203             # we have to set the status_code here to prevent the catch_errors
+204             # middleware from turning this into a 500.
+205             state.response.status_code = 404
+206             return
+207         except oslo_policy.InvalidScope:
+208             # This exception must be explicitly caught as the exception
+209             # translation hook won't be called if an error occurs in the
+210             # 'after' handler.
+211             # If this is "list" request, lets return strictly message that it
+212             # is forbidden in that scope, otherwise lets do it like for
+213             # PolicyNotAuthorized exception so, instead of raising an
+214             # HTTPNotFound exception, we have to set the status_code here to
+215             # prevent the catch_errors middleware from turning this into a 500.
+216             if is_single:
+217                 state.response.status_code = 404
+218             else:
+219                 state.response.status_code = 403
+220             return
+221 
+222         if is_single:
+223             resp = resp[0]
+224         state.response.json = {key: resp}
+225 
+226     def _get_filtered_item(self, request, controller, resource, collection,
+227                            data):
+228         neutron_context = request.context.get('neutron_context')
+229         to_exclude = self._exclude_attributes_by_policy(
+230             neutron_context, controller, resource, collection, data)
+231         return self._filter_attributes(request, data, to_exclude)
+232 
+233     def _filter_attributes(self, request, data, fields_to_strip):
+234         # This routine will remove the fields that were requested to the
+235         # plugin for policy evaluation but were not specified in the
+236         # API request
+237         return dict(item for item in data.items()
+238                     if item[0] not in fields_to_strip)
+239 
+240     def _exclude_attributes_by_policy(self, context, controller, resource,
+241                                       collection, data):
+242         """Identifies attributes to exclude according to authZ policies.
+243 
+244         Return a list of attribute names which should be stripped from the
+245         response returned to the user because the user is not authorized
+246         to see them.
+247         """
+248         attributes_to_exclude = []
+249         for attr_name in list(data):
+250             # TODO(amotoki): All attribute maps have tenant_id and
+251             # it determines excluded attributes based on tenant_id.
+252             # We need to migrate tenant_id to project_id later
+253             # as attr_info is referred to in various places and we need
+254             # to check all logs carefully.
+255             if attr_name == 'project_id':
+256                 continue
+257             attr_data = controller.resource_info.get(attr_name)
+258             if attr_data and attr_data['is_visible']:
+259                 if policy.check(
+260                         context,
+261                         # NOTE(kevinbenton): this used to reference a
+262                         # _plugin_handlers dict, why?
+263                         'get_%s:%s' % (resource, attr_name),
+264                         data,
+265                         might_not_exist=True,
+266                         pluralized=collection):
+267                     # this attribute is visible, check next one
+268                     continue
+269             # if the code reaches this point then either the policy check
+270             # failed or the attribute was not visible in the first place
+271             attributes_to_exclude.append(attr_name)
+272             # TODO(amotoki): As mentioned in the above TODO,
+273             # we treat project_id and tenant_id equivalently.
+274             # This should be migrated to project_id later.
+275             if attr_name == 'tenant_id':
+276                 attributes_to_exclude.append('project_id')
+277         if attributes_to_exclude:
+278             LOG.debug("Attributes excluded by policy engine: %s",
+279                       attributes_to_exclude)
+280         return attributes_to_exclude

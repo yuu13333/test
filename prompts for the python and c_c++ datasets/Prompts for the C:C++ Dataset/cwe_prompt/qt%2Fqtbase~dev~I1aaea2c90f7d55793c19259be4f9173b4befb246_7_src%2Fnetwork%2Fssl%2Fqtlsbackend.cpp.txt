@@ -1,0 +1,2378 @@
+Please review the code below for security defects using the CWE (Common Weakness Enumeration) as a reference standard. If any are found, please describe the security defect in detail and indicate the corresponding line number of code and solution. If none are detected, state: 'No security defects are detected in the code'.
+
+1 /****************************************************************************
+2 **
+3 ** Copyright (C) 2021 The Qt Company Ltd.
+4 ** Contact: https://www.qt.io/licensing/
+5 **
+6 ** This file is part of the QtNetwork module of the Qt Toolkit.
+7 **
+8 ** $QT_BEGIN_LICENSE:LGPL$
+9 ** Commercial License Usage
+10 ** Licensees holding valid commercial Qt licenses may use this file in
+11 ** accordance with the commercial license agreement provided with the
+12 ** Software or, alternatively, in accordance with the terms contained in
+13 ** a written agreement between you and The Qt Company. For licensing terms
+14 ** and conditions see https://www.qt.io/terms-conditions. For further
+15 ** information use the contact form at https://www.qt.io/contact-us.
+16 **
+17 ** GNU Lesser General Public License Usage
+18 ** Alternatively, this file may be used under the terms of the GNU Lesser
+19 ** General Public License version 3 as published by the Free Software
+20 ** Foundation and appearing in the file LICENSE.LGPL3 included in the
+21 ** packaging of this file. Please review the following information to
+22 ** ensure the GNU Lesser General Public License version 3 requirements
+23 ** will be met: https://www.gnu.org/licenses/lgpl-3.0.html.
+24 **
+25 ** GNU General Public License Usage
+26 ** Alternatively, this file may be used under the terms of the GNU
+27 ** General Public License version 2.0 or (at your option) the GNU General
+28 ** Public license version 3 or any later version approved by the KDE Free
+29 ** Qt Foundation. The licenses are as published by the Free Software
+30 ** Foundation and appearing in the file LICENSE.GPL2 and LICENSE.GPL3
+31 ** included in the packaging of this file. Please review the following
+32 ** information to ensure the GNU General Public License requirements will
+33 ** be met: https://www.gnu.org/licenses/gpl-2.0.html and
+34 ** https://www.gnu.org/licenses/gpl-3.0.html.
+35 **
+36 ** $QT_END_LICENSE$
+37 **
+38 ****************************************************************************/
+39 
+40 #include "qtlsbackend_p.h"
+41 
+42 #if QT_CONFIG(ssl)
+43 #include "qsslpresharedkeyauthenticator_p.h"
+44 #include "qsslpresharedkeyauthenticator.h"
+45 #include "qsslsocket_p.h"
+46 #include "qsslcipher_p.h"
+47 #include "qsslkey_p.h"
+48 #include "qsslkey.h"
+49 #endif
+50 
+51 #include "qssl_p.h"
+52 
+53 #include <QtCore/private/qfactoryloader_p.h>
+54 
+55 #include "QtCore/qapplicationstatic.h"
+56 #include <QtCore/qbytearray.h>
+57 #include <QtCore/qmutex.h>
+58 
+59 #include <algorithm>
+60 #include <vector>
+61 
+62 QT_BEGIN_NAMESPACE
+63 
+64 Q_APPLICATION_STATIC_WITH_ARGS(QFactoryLoader, loader,
+65                           (QTlsBackend_iid, QStringLiteral("/tls")))
+66 
+67 namespace {
+68 
+69 class BackendCollection
+70 {
+71 public:
+72     void addBackend(QTlsBackend *backend)
+73     {
+74         Q_ASSERT(backend);
+75         Q_ASSERT(std::find(backends.begin(), backends.end(), backend) == backends.end());
+76         const QMutexLocker locker(&collectionMutex);
+77         backends.push_back(backend);
+78     }
+79 
+80     void removeBackend(QTlsBackend *backend)
+81     {
+82         Q_ASSERT(backend);
+83         const QMutexLocker locker(&collectionMutex);
+84         const auto it = std::find(backends.begin(), backends.end(), backend);
+85         Q_ASSERT(it != backends.end());
+86         backends.erase(it);
+87     }
+88 
+89     bool tryPopulateCollection()
+90     {
+91         if (!loader())
+92             return false;
+93 
+94         static QBasicMutex mutex;
+95         const QMutexLocker locker(&mutex);
+96         if (loaded)
+97             return true;
+98 
+99 #if QT_CONFIG(library)
+100         loader->update();
+101 #endif
+102         int index = 0;
+103         while (loader->instance(index))
+104             ++index;
+105 
+106         return loaded = true;
+107     }
+108 
+109     QList<QString> backendNames()
+110     {
+111         QList<QString> names;
+112         if (!tryPopulateCollection())
+113             return names;
+114 
+115         const QMutexLocker locker(&collectionMutex);
+116         if (!backends.size())
+117             return names;
+118 
+119         names.reserve(backends.size());
+120         for (const auto *backend : backends) {
+121             if (backend->isValid())
+122                 names.append(backend->backendName());
+123         }
+124 
+125         return names;
+126     }
+127 
+128     QTlsBackend *backend(const QString &name)
+129     {
+130         if (!tryPopulateCollection())
+131             return nullptr;
+132 
+133         const QMutexLocker locker(&collectionMutex);
+134         const auto it = std::find_if(backends.begin(), backends.end(),
+135                                      [&name](const auto *fct) {return fct->backendName() == name;});
+136 
+137         return it == backends.end()  ? nullptr : *it;
+138     }
+139 
+140     void cleanup()
+141     {
+142         const QMutexLocker locker(&collectionMutex);
+143         qDeleteAll(backends.begin(), backends.end());
+144         backends.clear();
+145         loaded = false;
+146     }
+147 
+148     ~BackendCollection() {
+149         cleanup();
+150     };
+151 
+152 private:
+153     std::vector<QTlsBackend *> backends;
+154     QMutex collectionMutex;
+155     bool loaded = false;
+156 };
+157 
+158 } // Unnamed namespace
+159 
+160 Q_APPLICATION_STATIC(BackendCollection, backends);
+161 
+162 /*!
+163     \class QTlsBackend
+164     \internal (Network-private)
+165     \brief QTlsBackend is a factory class, providing implementations
+166     for the QSsl classes.
+167 
+168     The purpose of QTlsBackend is to enable and simplify the addition
+169     of new TLS backends to be used by QSslSocket and related classes.
+170     Starting from Qt 6.1, these backends have plugin-based design (and
+171     thus can co-exist simultaneously, unlike pre 6.1 times), although
+172     any given run of a program can only use one of them.
+173 
+174     Inheriting from QTlsBackend and creating an object of such
+175     a class adds a new backend into the list of available TLS backends.
+176 
+177     A new backend must provide a list of classes, features and protocols
+178     it supports, and override the corresponding virtual functions that
+179     create backend-specific implementations for these QSsl-classes.
+180 
+181     The base abstract class - QTlsBackend - provides, where possible,
+182     default implementations of its virtual member functions. These
+183     default implementations can be overridden by a derived backend
+184     class, if needed.
+185 
+186     QTlsBackend also provides some auxiliary functions that a derived
+187     backend class can use to interact with the internals of network-private classes.
+188 
+189     \sa QSslSocket::availableBackends(), supportedFeatures(), supportedProtocols(), implementedClasses()
+190 */
+191 
+192 /*!
+193     \fn QString QTlsBackend::backendName() const
+194     \internal
+195     Returns the name of this backend. The name will be reported by QSslSocket::availableBackends().
+196     Example of backend names: "openssl", "schannel", "securetransport".
+197 
+198     \sa QSslSocket::availableBackends(), isValid()
+199 */
+200 
+201 const QString QTlsBackend::builtinBackendNames[] = {
+202     QStringLiteral("schannel"),
+203     QStringLiteral("securetransport"),
+204     QStringLiteral("openssl"),
+205     QStringLiteral("cert-only")
+206 };
+207 
+208 /*!
+209     \internal
+210     The default constructor, adds a new backend to the list of available backends.
+211 
+212     \sa ~QTlsBackend(), availableBackendNames(), QSslSocket::availableBackends()
+213 */
+214 QTlsBackend::QTlsBackend()
+215 {
+216     if (backends())
+217         backends->addBackend(this);
+218 }
+219 
+220 QTlsBackend::~QTlsBackend() = default;
+221 
+222 /*!
+223     \internal
+224     Returns \c true if this backend was initialised successfully. The default implementation
+225     always returns \c true.
+226 
+227     \note This function must be overridden if a particular backend has a non-trivial initialization
+228     that can fail. If reimplemented, returning \c false will exclude this backend from the list of
+229     backends, reported as available by QSslSocket.
+230 
+231     \sa QSslSocket::availableBackends()
+232 */
+233 
+234 bool QTlsBackend::isValid() const
+235 {
+236     return true;
+237 }
+238 
+239 /*!
+240     \internal
+241     Returns an implementations-specific integer value, representing the TLS library's
+242     version, that is currently used by this backend (i.e. runtime library version).
+243     The default implementation returns 0.
+244 
+245     \sa tlsLibraryBuildVersionNumber()
+246 */
+247 long QTlsBackend::tlsLibraryVersionNumber() const
+248 {
+249     return 0;
+250 }
+251 
+252 /*!
+253     \internal
+254     Returns an implementation-specific string, representing the TLS library's version,
+255     that is currently used by this backend (i.e. runtime library version). The default
+256     implementation returns an empty string.
+257 
+258     \sa tlsLibraryBuildVersionString()
+259 */
+260 
+261 QString QTlsBackend::tlsLibraryVersionString() const
+262 {
+263     return {};
+264 }
+265 
+266 /*!
+267     \internal
+268     Returns an implementation-specific integer value, representing the TLS library's
+269     version that this backend was built against (i.e. compile-time library version).
+270     The default implementation returns 0.
+271 
+272     \sa tlsLibraryVersionNumber()
+273 */
+274 
+275 long QTlsBackend::tlsLibraryBuildVersionNumber() const
+276 {
+277     return 0;
+278 }
+279 
+280 /*!
+281     \internal
+282     Returns an implementation-specific string, representing the TLS library's version
+283     that this backend was built against (i.e. compile-time version). The default
+284     implementation returns an empty string.
+285 
+286     \sa tlsLibraryVersionString()
+287 */
+288 QString QTlsBackend::tlsLibraryBuildVersionString() const
+289 {
+290     return {};
+291 }
+292 
+293 /*!
+294     \internal
+295     QSslSocket and related classes call this function to ensure that backend's internal
+296     resources - e.g. CA certificates, or ciphersuites - were properly initialized.
+297 */
+298 void QTlsBackend::ensureInitialized() const
+299 {
+300 }
+301 
+302 #define REPORT_MISSING_SUPPORT(message) \
+303     qCWarning(lcSsl) << "The backend" << backendName() << message
+304 
+305 /*!
+306     \internal
+307     If QSsl::ImplementedClass::Key is present in this backend's implementedClasses(),
+308     the backend must reimplement this method to return a dynamically-allocated instance
+309     of an implementation-specific type, inheriting from the class QTlsPrivate::TlsKey.
+310     The default implementation of this function returns \nullptr.
+311 
+312     \sa QSslKey, implementedClasses(), QTlsPrivate::TlsKey
+313 */
+314 QTlsPrivate::TlsKey *QTlsBackend::createKey() const
+315 {
+316     REPORT_MISSING_SUPPORT("does not support QSslKey");
+317     return nullptr;
+318 }
+319 
+320 /*!
+321     \internal
+322     If QSsl::ImplementedClass::Certificate is present in this backend's implementedClasses(),
+323     the backend must reimplement this method to return a dynamically-allocated instance of an
+324     implementation-specific type, inheriting from the class QTlsPrivate::X509Certificate.
+325     The default implementation of this function returns \nullptr.
+326 
+327     \sa QSslCertificate, QTlsPrivate::X509Certificate, implementedClasses()
+328 */
+329 QTlsPrivate::X509Certificate *QTlsBackend::createCertificate() const
+330 {
+331     REPORT_MISSING_SUPPORT("does not support QSslCertificate");
+332     return nullptr;
+333 }
+334 
+335 /*!
+336     \internal
+337     This function returns a list of system CA certificates - e.g. certificates, loaded
+338     from a system store, if available. This function allows implementation of the class
+339     QSslConfiguration. The default implementation of this function returns an empty list.
+340 
+341     \sa QSslCertificate, QSslConfiguration
+342 */
+343 QList<QSslCertificate> QTlsBackend::systemCaCertificates() const
+344 {
+345     REPORT_MISSING_SUPPORT("does not provide system CA certificates");
+346     return {};
+347 }
+348 
+349 /*!
+350     \internal
+351     If QSsl::ImplementedClass::Socket is present in this backend's implementedClasses(),
+352     the backend must reimplement this method to return a dynamically-allocated instance of an
+353     implementation-specific type, inheriting from the class QTlsPrivate::TlsCryptograph.
+354     The default implementation of this function returns \nullptr.
+355 
+356     \sa QSslSocket, QTlsPrivate::TlsCryptograph, implementedClasses()
+357 */
+358 QTlsPrivate::TlsCryptograph *QTlsBackend::createTlsCryptograph() const
+359 {
+360     REPORT_MISSING_SUPPORT("does not support QSslSocket");
+361     return nullptr;
+362 }
+363 
+364 /*!
+365     \internal
+366     If QSsl::ImplementedClass::Dtls is present in this backend's implementedClasses(),
+367     the backend must reimplement this method to return a dynamically-allocated instance of an
+368     implementation-specific type, inheriting from the class QTlsPrivate::DtlsCryptograph.
+369     The default implementation of this function returns \nullptr.
+370 
+371     \sa QDtls, QTlsPrivate::DtlsCryptograph, implementedClasses()
+372 */
+373 QTlsPrivate::DtlsCryptograph *QTlsBackend::createDtlsCryptograph(QDtls *qObject, int mode) const
+374 {
+375     Q_UNUSED(qObject);
+376     Q_UNUSED(mode);
+377     REPORT_MISSING_SUPPORT("does not support QDtls");
+378     return nullptr;
+379 }
+380 
+381 /*!
+382     \internal
+383     If QSsl::ImplementedClass::DtlsCookie is present in this backend's implementedClasses(),
+384     the backend must reimplement this method to return a dynamically-allocated instance of an
+385     implementation-specific type, inheriting from the class QTlsPrivate::DtlsCookieVerifier. The
+386     default implementation returns \nullptr.
+387 
+388     \sa QDtlsClientVerifier, QTlsPrivate::DtlsCookieVerifier, implementedClasses()
+389 */
+390 QTlsPrivate::DtlsCookieVerifier *QTlsBackend::createDtlsCookieVerifier() const
+391 {
+392     REPORT_MISSING_SUPPORT("does not support DTLS cookies");
+393     return nullptr;
+394 }
+395 
+396 /*!
+397     \internal
+398     If QSsl::SupportedFeature::CertificateVerification is present in this backend's
+399     supportedFeatures(), the backend must reimplement this method to return a pointer
+400     to a function, that checks a certificate (or a chain of certificates) against available
+401     CA certificates. The default implementation returns \nullptr.
+402 
+403     \sa supportedFeatures(), QSslCertificate
+404 */
+405 
+406 QTlsPrivate::X509ChainVerifyPtr QTlsBackend::X509Verifier() const
+407 {
+408     REPORT_MISSING_SUPPORT("does not support (manual) certificate verification");
+409     return nullptr;
+410 }
+411 
+412 /*!
+413     \internal
+414     Returns a pointer to function, that reads certificates in PEM format. The
+415     default implementation returns \nullptr.
+416 
+417     \sa QSslCertificate
+418 */
+419 QTlsPrivate::X509PemReaderPtr QTlsBackend::X509PemReader() const
+420 {
+421     REPORT_MISSING_SUPPORT("cannot read PEM format");
+422     return nullptr;
+423 }
+424 
+425 /*!
+426     \internal
+427     Returns a pointer to function, that can read certificates in DER format.
+428     The default implementation returns \nullptr.
+429 
+430     \sa QSslCertificate
+431 */
+432 QTlsPrivate::X509DerReaderPtr QTlsBackend::X509DerReader() const
+433 {
+434     REPORT_MISSING_SUPPORT("cannot read DER format");
+435     return nullptr;
+436 }
+437 
+438 /*!
+439     \internal
+440     Returns a pointer to function, that can read certificates in PKCS 12 format.
+441     The default implementation returns \nullptr.
+442 
+443     \sa QSslCertificate
+444 */
+445 QTlsPrivate::X509Pkcs12ReaderPtr QTlsBackend::X509Pkcs12Reader() const
+446 {
+447     REPORT_MISSING_SUPPORT("cannot read PKCS12 format");
+448     return nullptr;
+449 }
+450 
+451 /*!
+452     \internal
+453     If QSsl::ImplementedClass::EllipticCurve is present in this backend's implementedClasses(),
+454     and the backend provides information about supported curves, it must reimplement this
+455     method to return a list of unique identifiers of the supported elliptic curves. The default
+456     implementation returns an empty list.
+457 
+458     \note The meaning of a curve identifier is implementation-specific.
+459 
+460     \sa implemenedClasses(), QSslEllipticCurve
+461 */
+462 QList<int> QTlsBackend::ellipticCurvesIds() const
+463 {
+464     REPORT_MISSING_SUPPORT("does not support QSslEllipticCurve");
+465     return {};
+466 }
+467 
+468 /*!
+469     \internal
+470     If this backend provides information about available elliptic curves, this
+471     function should return a unique integer identifier for a curve named \a name,
+472     which is a conventional short name for the curve. The default implementation
+473     returns 0.
+474 
+475     \note The meaning of a curve identifier is implementation-specific.
+476 
+477     \sa QSslEllipticCurve::shortName()
+478 */
+479 int QTlsBackend::curveIdFromShortName(const QString &name) const
+480 {
+481     Q_UNUSED(name);
+482     REPORT_MISSING_SUPPORT("does not support QSslEllipticCurve");
+483     return 0;
+484 }
+485 
+486 /*!
+487     \internal
+488     If this backend provides information about available elliptic curves, this
+489     function should return a unique integer identifier for a curve named \a name,
+490     which is a conventional long name for the curve. The default implementation
+491     returns 0.
+492 
+493     \note The meaning of a curve identifier is implementation-specific.
+494 
+495     \sa QSslElliptiCurve::longName()
+496 */
+497 int QTlsBackend::curveIdFromLongName(const QString &name) const
+498 {
+499     Q_UNUSED(name);
+500     REPORT_MISSING_SUPPORT("does not support QSslEllipticCurve");
+501     return 0;
+502 }
+503 
+504 /*!
+505     \internal
+506     If this backend provides information about available elliptic curves,
+507     this function should return a conventional short name for a curve identified
+508     by \a cid. The default implementation returns an empty string.
+509 
+510     \note The meaning of a curve identifier is implementation-specific.
+511 
+512     \sa ellipticCurvesIds(), QSslEllipticCurve::shortName()
+513 */
+514 QString QTlsBackend::shortNameForId(int cid) const
+515 {
+516     Q_UNUSED(cid);
+517     REPORT_MISSING_SUPPORT("does not support QSslEllipticCurve");
+518     return {};
+519 }
+520 
+521 /*!
+522     \internal
+523     If this backend provides information about available elliptic curves,
+524     this function should return a conventional long name for a curve identified
+525     by \a cid. The default implementation returns an empty string.
+526 
+527     \note The meaning of a curve identifier is implementation-specific.
+528 
+529     \sa ellipticCurvesIds(), QSslEllipticCurve::shortName()
+530 */
+531 QString QTlsBackend::longNameForId(int cid) const
+532 {
+533     Q_UNUSED(cid);
+534     REPORT_MISSING_SUPPORT("does not support QSslEllipticCurve");
+535     return {};
+536 }
+537 
+538 /*!
+539     \internal
+540     Returns true if the elliptic curve identified by \a cid is one of the named
+541     curves, that can be used in the key exchange when using an elliptic curve
+542     cipher with TLS; false otherwise. The default implementation returns false.
+543 
+544     \note The meaning of curve identifier is implementation-specific.
+545 */
+546 bool QTlsBackend::isTlsNamedCurve(int cid) const
+547 {
+548     Q_UNUSED(cid);
+549     REPORT_MISSING_SUPPORT("does not support QSslEllipticCurve");
+550     return false;
+551 }
+552 
+553 /*!
+554     \internal
+555     If this backend supports the class QSslDiffieHellmanParameters, this function is
+556     needed for construction of a QSslDiffieHellmanParameters from DER encoded data.
+557     This function is expected to return a value that matches an enumerator in
+558     QSslDiffieHellmanParameters::Error enumeration. The default implementation of this
+559     function returns 0 (equals to QSslDiffieHellmanParameters::NoError).
+560 
+561     \sa QSslDiffieHellmanParameters, implementedClasses()
+562 */
+563 int QTlsBackend::dhParametersFromDer(const QByteArray &derData, QByteArray *data) const
+564 {
+565     Q_UNUSED(derData);
+566     Q_UNUSED(data);
+567     REPORT_MISSING_SUPPORT("does not support QSslDiffieHellmanParameters in DER format");
+568     return {};
+569 }
+570 
+571 /*!
+572     \internal
+573     If this backend supports the class QSslDiffieHellmanParameters, this function is
+574     is needed for construction of a QSslDiffieHellmanParameters from PEM encoded data.
+575     This function is expected to return a value that matches an enumerator in
+576     QSslDiffieHellmanParameters::Error enumeration. The default implementation of this
+577     function returns 0 (equals to QSslDiffieHellmanParameters::NoError).
+578 
+579     \sa QSslDiffieHellmanParameters, implementedClasses()
+580 */
+581 int QTlsBackend::dhParametersFromPem(const QByteArray &pemData, QByteArray *data) const
+582 {
+583     Q_UNUSED(pemData);
+584     Q_UNUSED(data);
+585     REPORT_MISSING_SUPPORT("does not support QSslDiffieHellmanParameters in PEM format");
+586     return {};
+587 }
+588 
+589 /*!
+590     \internal
+591     Returns a list of names of available backends.
+592 
+593     \note This list contains only properly initialized backends.
+594 
+595     \sa QTlsBackend(), isValid()
+596 */
+597 QList<QString> QTlsBackend::availableBackendNames()
+598 {
+599     if (!backends())
+600         return {};
+601 
+602     return backends->backendNames();
+603 }
+604 
+605 /*!
+606     \internal
+607     Returns the name of the backend that QSslSocket() would use by default. If no
+608     backend was found, the function returns an empty string.
+609 */
+610 QString QTlsBackend::defaultBackendName()
+611 {
+612     // We prefer OpenSSL as default:
+613     const auto names = availableBackendNames();
+614     auto name = builtinBackendNames[nameIndexOpenSSL];
+615     if (names.contains(name))
+616         return name;
+617     name = builtinBackendNames[nameIndexSchannel];
+618     if (names.contains(name))
+619         return name;
+620     name = builtinBackendNames[nameIndexSecureTransport];
+621     if (names.contains(name))
+622         return name;
+623 
+624     const auto pos = std::find_if(names.begin(), names.end(), [](const auto &name) {
+625         return name != builtinBackendNames[nameIndexCertOnly];
+626     });
+627 
+628     if (pos != names.end())
+629         return *pos;
+630 
+631     if (names.size())
+632         return names[0];
+633 
+634     return {};
+635 }
+636 
+637 /*!
+638     \internal
+639     Returns a backend named \a backendName, if it exists.
+640     Otherwise, it returns \nullptr.
+641 
+642     \sa backendName(), QSslSocket::availableBackends()
+643 */
+644 QTlsBackend *QTlsBackend::findBackend(const QString &backendName)
+645 {
+646     if (!backends())
+647         return {};
+648 
+649     if (auto *fct = backends->backend(backendName))
+650         return fct;
+651 
+652     qCWarning(lcSsl) << "Cannot create unknown backend named" << backendName;
+653     return nullptr;
+654 }
+655 
+656 /*!
+657     \internal
+658     Returns the backend that QSslSocket is using. If Qt was built without TLS support,
+659     this function returns a minimal backend that only supports QSslCertificate.
+660 
+661     \sa defaultBackend()
+662 */
+663 QTlsBackend *QTlsBackend::activeOrAnyBackend()
+664 {
+665 #if QT_CONFIG(ssl)
+666     return QSslSocketPrivate::tlsBackendInUse();
+667 #else
+668     return findBackend(defaultBackendName());
+669 #endif // QT_CONFIG(ssl)
+670 }
+671 
+672 /*!
+673     \internal
+674     Returns a list of TLS and DTLS protocol versions, that a backend named
+675     \a backendName supports.
+676 
+677     \note This list is supposed to also include range-based versions, which
+678     allows negotiation of protocols during the handshake, so that these versions
+679     can be used when configuring QSslSocket (e.g. QSsl::TlsV1_2OrLater).
+680 
+681     \sa QSsl::SslProtocol
+682 */
+683 QList<QSsl::SslProtocol> QTlsBackend::supportedProtocols(const QString &backendName)
+684 {
+685     if (!backends())
+686         return {};
+687 
+688     if (const auto *fct = backends->backend(backendName))
+689         return fct->supportedProtocols();
+690 
+691     return {};
+692 }
+693 
+694 /*!
+695     \internal
+696     Returns a list of features that a backend named \a backendName supports. E.g.
+697     a backend may support PSK (pre-shared keys, defined as QSsl::SupportedFeature::Psk)
+698     or ALPN (application layer protocol negotiation, identified by
+699     QSsl::SupportedFeature::ClientSideAlpn or QSsl::SupportedFeature::ServerSideAlpn).
+700 
+701     \sa QSsl::SupportedFeature
+702 */
+703 QList<QSsl::SupportedFeature> QTlsBackend::supportedFeatures(const QString &backendName)
+704 {
+705     if (!backends())
+706         return {};
+707 
+708     if (const auto *fct = backends->backend(backendName))
+709         return fct->supportedFeatures();
+710 
+711     return {};
+712 }
+713 
+714 /*!
+715     \internal
+716     Returns a list of classes that a backend named \a backendName supports. E.g. a backend
+717     may implement QSslSocket (QSsl::ImplementedClass::Socket), and QDtls
+718     (QSsl::ImplementedClass::Dtls).
+719 
+720     \sa QSsl::ImplementedClass
+721 */
+722 QList<QSsl::ImplementedClass> QTlsBackend::implementedClasses(const QString &backendName)
+723 {
+724     if (!backends())
+725         return {};
+726 
+727     if (const auto *fct = backends->backend(backendName))
+728         return fct->implementedClasses();
+729 
+730     return {};
+731 }
+732 
+733 /*!
+734     \internal
+735     Auxiliary function. Initializes \a key to use \a keyBackend.
+736 */
+737 void QTlsBackend::resetBackend(QSslKey &key, QTlsPrivate::TlsKey *keyBackend)
+738 {
+739 #if QT_CONFIG(ssl)
+740     key.d->backend.reset(keyBackend);
+741 #else
+742     Q_UNUSED(key);
+743     Q_UNUSED(keyBackend);
+744 #endif // QT_CONFIG(ssl)
+745 }
+746 
+747 /*!
+748     \internal
+749     Auxiliary function. Initializes client-side \a auth using the \a hint, \a hintLength,
+750     \a maxIdentityLength and \a maxPskLen.
+751 */
+752 void QTlsBackend::setupClientPskAuth(QSslPreSharedKeyAuthenticator *auth, const char *hint,
+753                                      int hintLength, unsigned maxIdentityLen, unsigned maxPskLen)
+754 {
+755     Q_ASSERT(auth);
+756 #if QT_CONFIG(ssl)
+757     if (hint)
+758         auth->d->identityHint = QByteArray::fromRawData(hint, hintLength); // it's NUL terminated, but do not include the NUL
+759 
+760     auth->d->maximumIdentityLength = int(maxIdentityLen) - 1; // needs to be NUL terminated
+761     auth->d->maximumPreSharedKeyLength = int(maxPskLen);
+762 #else
+763     Q_UNUSED(auth);
+764     Q_UNUSED(hint);
+765     Q_UNUSED(hintLength);
+766     Q_UNUSED(maxIdentityLen);
+767     Q_UNUSED(maxPskLen);
+768 #endif
+769 }
+770 
+771 /*!
+772     \internal
+773     Auxiliary function. Initializes server-side \a auth using the \a identity, \a identityHint and
+774     \a maxPskLen.
+775 */
+776 void QTlsBackend::setupServerPskAuth(QSslPreSharedKeyAuthenticator *auth, const char *identity,
+777                                      const QByteArray &identityHint, unsigned int maxPskLen)
+778 {
+779 #if QT_CONFIG(ssl)
+780     Q_ASSERT(auth);
+781     auth->d->identityHint = identityHint;
+782     auth->d->identity = identity;
+783     auth->d->maximumIdentityLength = 0; // user cannot set an identity
+784     auth->d->maximumPreSharedKeyLength = int(maxPskLen);
+785 #else
+786     Q_UNUSED(auth);
+787     Q_UNUSED(identity);
+788     Q_UNUSED(identityHint);
+789     Q_UNUSED(maxPskLen);
+790 #endif
+791 }
+792 
+793 #if QT_CONFIG(ssl)
+794 /*!
+795     \internal
+796     Auxiliary function. Creates a new QSslCipher from \a descriptionOneLine, \a bits
+797     and \a supportedBits. \a descriptionOneLine consists of several fields, separated by
+798     whitespace. These include: cipher name, protocol version, key exchange method,
+799     authentication method, encryption method, message digest (Mac). Example:
+800     "ECDHE-RSA-AES256-GCM-SHA256 TLSv1.2 Kx=ECDH Au=RSA Enc=AESGCM(256) Mac=AEAD"
+801 */
+802 QSslCipher QTlsBackend::createCiphersuite(const QString &descriptionOneLine, int bits, int supportedBits)
+803 {
+804     QSslCipher ciph;
+805 
+806     const auto descriptionList = QStringView{descriptionOneLine}.split(QLatin1Char(' '), Qt::SkipEmptyParts);
+807     if (descriptionList.size() > 5) {
+808         ciph.d->isNull = false;
+809         ciph.d->name = descriptionList.at(0).toString();
+810 
+811         QStringView protoString = descriptionList.at(1);
+812         ciph.d->protocolString = protoString.toString();
+813         ciph.d->protocol = QSsl::UnknownProtocol;
+814 QT_WARNING_PUSH
+815 QT_WARNING_DISABLE_DEPRECATED
+816         if (protoString.startsWith(u"TLSv1")) {
+817             QStringView tail = protoString.sliced(5);
+818             if (tail.startsWith(u'.')) {
+819                 tail = tail.sliced(1);
+820                 if (tail == u"3")
+821                     ciph.d->protocol = QSsl::TlsV1_3;
+822                 else if (tail == u"2")
+823                     ciph.d->protocol = QSsl::TlsV1_2;
+824                 else if (tail == u"1")
+825                     ciph.d->protocol = QSsl::TlsV1_1;
+826             } else if (tail.isEmpty()) {
+827                 ciph.d->protocol = QSsl::TlsV1_0;
+828             }
+829         }
+830 QT_WARNING_POP
+831 
+832         if (descriptionList.at(2).startsWith(QLatin1String("Kx=")))
+833             ciph.d->keyExchangeMethod = descriptionList.at(2).mid(3).toString();
+834         if (descriptionList.at(3).startsWith(QLatin1String("Au=")))
+835             ciph.d->authenticationMethod = descriptionList.at(3).mid(3).toString();
+836         if (descriptionList.at(4).startsWith(QLatin1String("Enc=")))
+837             ciph.d->encryptionMethod = descriptionList.at(4).mid(4).toString();
+838         ciph.d->exportable = (descriptionList.size() > 6 && descriptionList.at(6) == QLatin1String("export"));
+839 
+840         ciph.d->bits = bits;
+841         ciph.d->supportedBits = supportedBits;
+842     }
+843 
+844     return ciph;
+845 }
+846 
+847 /*!
+848     \internal
+849     Auxiliary function. Creates a new QSslCipher from \a suiteName, \a protocol version and
+850     \a protocolString. For example:
+851     \code
+852     createCiphersuite(QLatin1String("ECDHE-RSA-AES256-GCM-SHA256"), QSsl::TlsV1_2, QLatin1String("TLSv1.2"));
+853     \endcode
+854 */
+855 QSslCipher QTlsBackend::createCiphersuite(const QString &suiteName, QSsl::SslProtocol protocol,
+856                                           const QString &protocolString)
+857 {
+858     QSslCipher ciph;
+859 
+860     if (!suiteName.size())
+861         return ciph;
+862 
+863     ciph.d->isNull = false;
+864     ciph.d->name = suiteName;
+865     ciph.d->protocol = protocol;
+866     ciph.d->protocolString = protocolString;
+867 
+868     const auto bits = QStringView{ciph.d->name}.split(QLatin1Char('-'));
+869     if (bits.size() >= 2) {
+870         if (bits.size() == 2 || bits.size() == 3)
+871             ciph.d->keyExchangeMethod = QLatin1String("RSA");
+872         else if (bits.front() == QLatin1String("DH") || bits.front() == QLatin1String("DHE"))
+873             ciph.d->keyExchangeMethod = QLatin1String("DH");
+874         else if (bits.front() == QLatin1String("ECDH") || bits.front() == QLatin1String("ECDHE"))
+875             ciph.d->keyExchangeMethod = QLatin1String("ECDH");
+876         else
+877             qCWarning(lcSsl) << "Unknown Kx" << ciph.d->name;
+878 
+879         if (bits.size() == 2 || bits.size() == 3)
+880             ciph.d->authenticationMethod = QLatin1String("RSA");
+881         else if (ciph.d->name.contains(QLatin1String("-ECDSA-")))
+882             ciph.d->authenticationMethod = QLatin1String("ECDSA");
+883         else if (ciph.d->name.contains(QLatin1String("-RSA-")))
+884             ciph.d->authenticationMethod = QLatin1String("RSA");
+885         else
+886             qCWarning(lcSsl) << "Unknown Au" << ciph.d->name;
+887 
+888         if (ciph.d->name.contains(QLatin1String("RC4-"))) {
+889             ciph.d->encryptionMethod = QLatin1String("RC4(128)");
+890             ciph.d->bits = 128;
+891             ciph.d->supportedBits = 128;
+892         } else if (ciph.d->name.contains(QLatin1String("DES-CBC3-"))) {
+893             ciph.d->encryptionMethod = QLatin1String("3DES(168)");
+894             ciph.d->bits = 168;
+895             ciph.d->supportedBits = 168;
+896         } else if (ciph.d->name.contains(QLatin1String("AES128-"))) {
+897             ciph.d->encryptionMethod = QLatin1String("AES(128)");
+898             ciph.d->bits = 128;
+899             ciph.d->supportedBits = 128;
+900         } else if (ciph.d->name.contains(QLatin1String("AES256-GCM"))) {
+901             ciph.d->encryptionMethod = QLatin1String("AESGCM(256)");
+902             ciph.d->bits = 256;
+903             ciph.d->supportedBits = 256;
+904         } else if (ciph.d->name.contains(QLatin1String("AES256-"))) {
+905             ciph.d->encryptionMethod = QLatin1String("AES(256)");
+906             ciph.d->bits = 256;
+907             ciph.d->supportedBits = 256;
+908         } else if (ciph.d->name.contains(QLatin1String("NULL-"))) {
+909             ciph.d->encryptionMethod = QLatin1String("NULL");
+910         } else {
+911             qCWarning(lcSsl) << "Unknown Enc" << ciph.d->name;
+912         }
+913     }
+914     return ciph;
+915 }
+916 
+917 /*!
+918     \internal
+919     Auxiliary function. Creates a new QSslCipher from \a name (which is an implementation-specific
+920     string), \a protocol and \a protocolString, e.g.:
+921     \code
+922     createCipher(QStringLiteral("schannel"), QSsl::TlsV1_2, QLatin1String("TLSv1.2"));
+923     \endcode
+924 */
+925 QSslCipher QTlsBackend::createCipher(const QString &name, QSsl::SslProtocol protocol,
+926                                      const QString &protocolString)
+927 {
+928     // Note the name 'createCipher' (not 'ciphersuite'): we don't provide
+929     // information about Kx, Au, bits/supported etc.
+930     QSslCipher cipher;
+931     cipher.d->isNull = false;
+932     cipher.d->name = name;
+933     cipher.d->protocol = protocol;
+934     cipher.d->protocolString = protocolString;
+935     return cipher;
+936 }
+937 
+938 /*!
+939     \internal
+940     Returns an implementation-specific list of ciphersuites that can be used by QSslSocket.
+941 
+942     \sa QSslConfiguration::defaultCiphers()
+943 */
+944 QList<QSslCipher> QTlsBackend::defaultCiphers()
+945 {
+946     return QSslSocketPrivate::defaultCiphers();
+947 }
+948 
+949 /*!
+950     \internal
+951     Returns an implementation-specific list of ciphersuites that can be used by QDtls.
+952 */
+953 QList<QSslCipher> QTlsBackend::defaultDtlsCiphers()
+954 {
+955     return QSslSocketPrivate::defaultDtlsCiphers();
+956 }
+957 
+958 /*!
+959     \internal
+960     Sets \a ciphers as defaults ciphers that QSslSocket can use.
+961 
+962     \sa defaultCiphers()
+963 */
+964 void QTlsBackend::setDefaultCiphers(const QList<QSslCipher> &ciphers)
+965 {
+966     QSslSocketPrivate::setDefaultCiphers(ciphers);
+967 }
+968 
+969 /*!
+970     \internal
+971     Sets \a ciphers as defaults ciphers that QDtls can use.
+972 
+973     \sa defaultDtlsCiphers()
+974 */
+975 void QTlsBackend::setDefaultDtlsCiphers(const QList<QSslCipher> &ciphers)
+976 {
+977     QSslSocketPrivate::setDefaultDtlsCiphers(ciphers);
+978 }
+979 
+980 /*!
+981     \internal
+982     Sets \a ciphers as a list of supported ciphers.
+983 
+984     \sa QSslConfiguration::supportedCiphers()
+985 */
+986 void QTlsBackend::setDefaultSupportedCiphers(const QList<QSslCipher> &ciphers)
+987 {
+988     QSslSocketPrivate::setDefaultSupportedCiphers(ciphers);
+989 }
+990 
+991 /*!
+992     \internal
+993     Sets the list of QSslEllipticCurve objects, that QSslConfiguration::supportedEllipticCurves()
+994     returns, to ones that are supported by this backend.
+995 */
+996 void QTlsBackend::resetDefaultEllipticCurves()
+997 {
+998     QSslSocketPrivate::resetDefaultEllipticCurves();
+999 }
+1000 
+1001 /*!
+1002     Sets \a certs as a list of certificates, that QSslConfiguration::caCertificates()
+1003     reports.
+1004 
+1005     \sa QSslConfiguration::defaultConfiguration(), QSslConfiguration::caCertificates()
+1006 */
+1007 void QTlsBackend::setDefaultCaCertificates(const QList<QSslCertificate> &certs)
+1008 {
+1009     QSslSocketPrivate::setDefaultCaCertificates(certs);
+1010 }
+1011 
+1012 /*!
+1013     \internal
+1014     Returns true if \a configuration allows loading root certificates on demand.
+1015 */
+1016 bool QTlsBackend::rootLoadingOnDemandAllowed(const QSslConfiguration &configuration)
+1017 {
+1018     return configuration.d->allowRootCertOnDemandLoading;
+1019 }
+1020 
+1021 /*!
+1022     \internal
+1023     Stores \a peerCert in the \a configuration.
+1024 */
+1025 void QTlsBackend::storePeerCertificate(QSslConfiguration &configuration,
+1026                                        const QSslCertificate &peerCert)
+1027 {
+1028     configuration.d->peerCertificate = peerCert;
+1029 }
+1030 
+1031 /*!
+1032     \internal
+1033     Stores \a peerChain in the \a configuration.
+1034 */
+1035 void QTlsBackend::storePeerCertificateChain(QSslConfiguration &configuration,
+1036                                             const QList<QSslCertificate> &peerChain)
+1037 {
+1038     configuration.d->peerCertificateChain = peerChain;
+1039 }
+1040 
+1041 /*!
+1042     \internal
+1043     Clears the peer certificate chain in \a configuration.
+1044 */
+1045 void QTlsBackend::clearPeerCertificates(QSslConfiguration &configuration)
+1046 {
+1047     configuration.d->peerCertificate.clear();
+1048     configuration.d->peerCertificateChain.clear();
+1049 }
+1050 
+1051 /*!
+1052     \internal
+1053     Clears the peer certificate chain in \a d.
+1054 */
+1055 void QTlsBackend::clearPeerCertificates(QSslSocketPrivate *d)
+1056 {
+1057     Q_ASSERT(d);
+1058     d->configuration.peerCertificate.clear();
+1059     d->configuration.peerCertificateChain.clear();
+1060 }
+1061 
+1062 /*!
+1063     \internal
+1064     Updates the configuration in \a d with \a shared value.
+1065 */
+1066 void QTlsBackend::setPeerSessionShared(QSslSocketPrivate *d, bool shared)
+1067 {
+1068     Q_ASSERT(d);
+1069     d->configuration.peerSessionShared = shared;
+1070 }
+1071 
+1072 /*!
+1073     \internal
+1074     Sets TLS session in \a d to \a asn1.
+1075 */
+1076 void QTlsBackend::setSessionAsn1(QSslSocketPrivate *d, const QByteArray &asn1)
+1077 {
+1078     Q_ASSERT(d);
+1079     d->configuration.sslSession = asn1;
+1080 }
+1081 
+1082 /*!
+1083     \internal
+1084     Sets TLS session lifetime hint in \a d to \a hint.
+1085 */
+1086 void QTlsBackend::setSessionLifetimeHint(QSslSocketPrivate *d, int hint)
+1087 {
+1088     Q_ASSERT(d);
+1089     d->configuration.sslSessionTicketLifeTimeHint = hint;
+1090 }
+1091 
+1092 /*!
+1093     \internal
+1094     Sets application layer protocol negotiation status in \a d to \a st.
+1095 */
+1096 void QTlsBackend::setAlpnStatus(QSslSocketPrivate *d, AlpnNegotiationStatus st)
+1097 {
+1098     Q_ASSERT(d);
+1099     d->configuration.nextProtocolNegotiationStatus = st;
+1100 }
+1101 
+1102 /*!
+1103     \internal
+1104     Sets \a protocol in \a d as a negotiated application layer protocol.
+1105 */
+1106 void QTlsBackend::setNegotiatedProtocol(QSslSocketPrivate *d, const QByteArray &protocol)
+1107 {
+1108     Q_ASSERT(d);
+1109     d->configuration.nextNegotiatedProtocol = protocol;
+1110 }
+1111 
+1112 /*!
+1113     \internal
+1114     Stores \a peerCert in the TLS configuration of \a d.
+1115 */
+1116 void QTlsBackend::storePeerCertificate(QSslSocketPrivate *d, const QSslCertificate &peerCert)
+1117 {
+1118     Q_ASSERT(d);
+1119     d->configuration.peerCertificate = peerCert;
+1120 }
+1121 
+1122 /*!
+1123     \internal
+1124 
+1125     Stores \a peerChain in the TLS configuration of \a d.
+1126 
+1127     \note This is a helper function that TlsCryptograph and DtlsCryptograph
+1128     call during a handshake.
+1129 */
+1130 void QTlsBackend::storePeerCertificateChain(QSslSocketPrivate *d,
+1131                                             const QList<QSslCertificate> &peerChain)
+1132 {
+1133     Q_ASSERT(d);
+1134     d->configuration.peerCertificateChain = peerChain;
+1135 }
+1136 
+1137 /*!
+1138     \internal
+1139 
+1140     Adds \a rootCert to the list of trusted root certificates in \a d.
+1141 
+1142     \note In Qt 6.1 it's only used on Windows, during so called 'CA fetch'.
+1143 */
+1144 void QTlsBackend::addTustedRoot(QSslSocketPrivate *d, const QSslCertificate &rootCert)
+1145 {
+1146     Q_ASSERT(d);
+1147     if (!d->configuration.caCertificates.contains(rootCert))
+1148         d->configuration.caCertificates += rootCert;
+1149 }
+1150 
+1151 /*!
+1152     \internal
+1153 
+1154     Saves ephemeral \a key in \a d.
+1155 
+1156     \sa QSslConfiguration::ephemeralKey()
+1157 */
+1158 void QTlsBackend::setEphemeralKey(QSslSocketPrivate *d, const QSslKey &key)
+1159 {
+1160     Q_ASSERT(d);
+1161     d->configuration.ephemeralServerKey = key;
+1162 }
+1163 
+1164 /*!
+1165     \internal
+1166 
+1167     Implementation-specific. Sets the security level suitable for Qt's
+1168     auto-tests.
+1169 */
+1170 void QTlsBackend::forceAutotestSecurityLevel()
+1171 {
+1172 }
+1173 
+1174 #endif // QT_CONFIG(ssl)
+1175 
+1176 namespace QTlsPrivate {
+1177 
+1178 /*!
+1179     \internal (Network-private)
+1180     \namespace QTlsPrivate
+1181     \brief Namespace containing onternal types that TLS backends implement.
+1182 
+1183     This namespace is private to Qt and the backends that implement its TLS support.
+1184 */
+1185 
+1186 /*!
+1187     \class TlsKey
+1188     \internal (Network-private)
+1189     \brief TlsKey is an abstract class, that allows a TLS plugin to provide
+1190     an underlying implementation for the class QSslKey.
+1191 
+1192     Most functions in the class TlsKey are pure virtual and thus have to be
+1193     reimplemented by a TLS backend that supports QSslKey. In many cases an
+1194     empty implementation as an overrider is sufficient, albeit with some
+1195     of QSslKey's functionality missing.
+1196 
+1197     \sa QTlsBackend::createKey(), QTlsBackend::implementedClasses(), QSslKey
+1198 */
+1199 
+1200 /*!
+1201     \fn void TlsKey::decodeDer(KeyType type, KeyAlgorithm algorithm, const QByteArray &der, const QByteArray &passPhrase, bool deepClear)
+1202     \internal
+1203 
+1204     If a support of public and private keys in DER format is required, this function
+1205     must be overridden and should initialize this key using the \a type, \a algorithm, \a der
+1206     and \a passPhrase. If this key was initialized previously, \a deepClear
+1207     has an implementation-specific meaning (e.g., if an implementation is using
+1208     reference-counting and can share internally some data structures, a value \c true may
+1209     trigger decrementing a reference counter on some implementation-specific object).
+1210 
+1211     \note An empty overrider is sufficient, but then reading keys in QSsl::Der format
+1212     will not be supported.
+1213 
+1214     \sa isNull(), QSsl::KeyType, QSsl::EncodingFormat, QSsl::KeyAlgorithm
+1215 */
+1216 
+1217 /*!
+1218     \fn void TlsKey::decodePem(KeyType type, KeyAlgorithm algorithm, const QByteArray &pem, const QByteArray &passPhrase, bool deepClear)
+1219     \internal
+1220 
+1221     If a support of public and private keys in PEM format is required, this function must
+1222     be overridden and should initialize this key using the \a type, \a algorithm, \a pem and
+1223     \a passPhrase. If this key was initialized previously, \a deepClear has an
+1224     implementation-specific meaning (e.g., in an implementation using reference-counting,
+1225     a value \c true may trigger decrementing a reference counter on some implementation-specific
+1226     object).
+1227 
+1228     \note An empty overrider is sufficient, but then reading keys in QSsl::Pem format
+1229     will not be supported.
+1230 
+1231     \sa isNull(), QSsl::KeyType, QSsl::EncodingFormat, QSsl::KeyAlgorithm
+1232 */
+1233 
+1234 /*!
+1235     \fn QByteArray TlsKey::toPem(const QByteArray &passPhrase) const
+1236     \internal
+1237 
+1238     This function must be overridden, if converting a key to PEM format, potentially with
+1239     encryption, is needed (e.g. to save a QSslKey into a file). If this key is
+1240     private and \a passPhrase is not empty, the key's data is expected to be encrypted using
+1241     some conventional encryption algorithm (e.g. DES or AES - the one that different tools
+1242     or even the class QSslKey can understand later).
+1243 
+1244     \note If this particular functionality is not needed, an overrider returning an
+1245     empty QByteArray is sufficient.
+1246 
+1247     \sa QSslKey::toPem()
+1248 */
+1249 
+1250 /*!
+1251     \fn QByteArray TlsKey::derFromPem(const QByteArray &pem, QMap<QByteArray, QByteArray> *headers) const
+1252     \internal
+1253 
+1254     Converts \a pem to DER format, using this key's type and algorithm. The parameter \a headers
+1255     must be a valid, non-null pointer. When parsing \a pem, the headers found there will be saved
+1256     into \a headers.
+1257 
+1258     \note An overrider returning an empty QByteArray is sufficient, if QSslKey::toDer() is not
+1259     needed.
+1260 
+1261     \note This function is very implementation-specific. A backend, that already has this key's
+1262     non-empty DER data, may simply return this data.
+1263 
+1264     \sa QSslKey::toDer()
+1265 */
+1266 
+1267 /*!
+1268     \fn QByteArray TlsKey::pemFromDer(const QByteArray &der, const QMap<QByteArray, QByteArray> &headers) const
+1269     \internal
+1270 
+1271     If overridden, this function is expected to convert \a der, using \a headers, to PEM format.
+1272 
+1273     \note This function is very implementation-specific. As of now (Qt 6.1), it is only required by
+1274     Qt's own non-OpenSSL backends, that internally use DER and implement QSslKey::toPem()
+1275     via pemFromDer().
+1276 */
+1277 
+1278 /*!
+1279     \fn void TlsKey::fromHandle(Qt::HANDLE handle, KeyType type)
+1280     \internal
+1281 
+1282     Initializes this key using the \a handle and \a type, taking the ownership
+1283     of the \a handle.
+1284 
+1285     \note The meaning of the \a handle is implementation-specific.
+1286 
+1287     \note If a TLS backend does not support such keys, it must provide an
+1288     empty implementation.
+1289 
+1290     \sa handle(), QSslKey::QSslKey(), QSslKet::handle()
+1291 */
+1292 
+1293 /*!
+1294     \fn TlsKey::handle() const
+1295     \internal
+1296 
+1297     If a TLS backend supports opaque keys, returns a native handle that
+1298     this key was initialized with.
+1299 
+1300     \sa fromHandle(), QSslKey::handle()
+1301 */
+1302 
+1303 /*!
+1304     \fn bool TlsKey::isNull() const
+1305     \internal
+1306 
+1307     Returns \c true if this is a null key, \c false otherwise.
+1308 
+1309     \note A null key corresponds to the default-constructed
+1310     QSslKey or the one, that was cleared via QSslKey::clear().
+1311 
+1312     \sa QSslKey::isNull()
+1313 */
+1314 
+1315 /*!
+1316     \fn QSsl::KeyType TlsKey::type() const
+1317     \internal
+1318 
+1319     Returns the type of this key (public or private).
+1320 */
+1321 
+1322 /*!
+1323     \fn QSsl::KeyAlgorithm TlsKey::algorithm() const
+1324     \internal
+1325 
+1326     Return this key's algorithm.
+1327 */
+1328 
+1329 /*!
+1330     \fn int TlsKey::length() const
+1331     \internal
+1332 
+1333     Returns the length of the key in bits, or -1 if the key is null.
+1334 */
+1335 
+1336 /*!
+1337     \fn void TlsKey::clear(bool deep)
+1338     \internal
+1339 
+1340     Clears the contents of this key, making it a null key. The meaning
+1341     of \a deep is implementation-specific (e.g. if some internal objects
+1342     representing a key can be shared using reference counting, \a deep equal
+1343     to \c true would imply decrementing a reference count).
+1344 
+1345     \sa isNull()
+1346 */
+1347 
+1348 /*!
+1349     \fn bool TlsKey::isPkcs8() const
+1350     \internal
+1351 
+1352     This function is internally used only by Qt's own TLS plugins and affects
+1353     the way PEM file is generated by TlsKey. It's sufficient to override it
+1354     and return \c false in case a new TLS backend is not using Qt's plugin
+1355     as a base.
+1356 */
+1357 
+1358 /*!
+1359     \fn QByteArray TlsKey::decrypt(Cipher cipher, const QByteArray &data, const QByteArray &passPhrase, const QByteArray &iv) const
+1360     \internal
+1361 
+1362     This function allows to decrypt \a data (for example, a private key read from a file), using
+1363     \a passPhrase, initialization vector \a iv. \a cipher is describing a block cipher and its
+1364     mode (for example, AES256 + CBC). decrypt() is needed to implement QSslKey's constructor.
+1365 
+1366     \note A TLS backend may provide an empty implementation, but as a result QSslKey will not be able
+1367     to work with private encrypted keys.
+1368 
+1369     \sa QSslKey
+1370 */
+1371 
+1372 /*!
+1373     \fn QByteArray TlsKey::encrypt(Cipher cipher, const QByteArray &data, const QByteArray &passPhrase, const QByteArray &iv) const
+1374     \internal
+1375 
+1376     This function is needed to implement QSslKey::toPem() with encryption (for a private
+1377     key). \a cipher names a block cipher to use to encrypt \a data, using
+1378     \a passPhrase and initialization vector \a iv.
+1379 
+1380     \note An empty implementation is sufficient, but QSslKey::toPem() will fail for
+1381     a private key and non-empty passphrase.
+1382 
+1383     \sa QSslKey
+1384 */
+1385 
+1386 /*!
+1387     \internal
+1388 
+1389     Destroys this key.
+1390 */
+1391 TlsKey::~TlsKey() = default;
+1392 
+1393 /*!
+1394     \internal
+1395 
+1396     A convenience function that returns a string, corresponding to the
+1397     key type or algorithm, which can be used as a header in a PEM file.
+1398 */
+1399 QByteArray TlsKey::pemHeader() const
+1400 {
+1401     if (type() == QSsl::PublicKey)
+1402         return QByteArrayLiteral("-----BEGIN PUBLIC KEY-----");
+1403     else if (algorithm() == QSsl::Rsa)
+1404         return QByteArrayLiteral("-----BEGIN RSA PRIVATE KEY-----");
+1405     else if (algorithm() == QSsl::Dsa)
+1406         return QByteArrayLiteral("-----BEGIN DSA PRIVATE KEY-----");
+1407     else if (algorithm() == QSsl::Ec)
+1408         return QByteArrayLiteral("-----BEGIN EC PRIVATE KEY-----");
+1409     else if (algorithm() == QSsl::Dh)
+1410         return QByteArrayLiteral("-----BEGIN PRIVATE KEY-----");
+1411 
+1412     Q_UNREACHABLE();
+1413     return {};
+1414 }
+1415 
+1416 /*!
+1417     \internal
+1418     A convenience function that returns a string, corresponding to the
+1419     key type or algorithm, which can be used as a footer in a PEM file.
+1420 */
+1421 QByteArray TlsKey::pemFooter() const
+1422 {
+1423     if (type() == QSsl::PublicKey)
+1424         return QByteArrayLiteral("-----END PUBLIC KEY-----");
+1425     else if (algorithm() == QSsl::Rsa)
+1426         return QByteArrayLiteral("-----END RSA PRIVATE KEY-----");
+1427     else if (algorithm() == QSsl::Dsa)
+1428         return QByteArrayLiteral("-----END DSA PRIVATE KEY-----");
+1429     else if (algorithm() == QSsl::Ec)
+1430         return QByteArrayLiteral("-----END EC PRIVATE KEY-----");
+1431     else if (algorithm() == QSsl::Dh)
+1432         return QByteArrayLiteral("-----END PRIVATE KEY-----");
+1433 
+1434     Q_UNREACHABLE();
+1435     return {};
+1436 }
+1437 
+1438 /*!
+1439     \class X509Certificate
+1440     \internal (Network-private)
+1441     \brief X509Certificate is an abstract class that allows a TLS backend to
+1442     provide an implementation of the QSslCertificate class.
+1443 
+1444     This class provides an interface that must be reimplemented by a TLS plugin,
+1445     that supports QSslCertificate. Most functions are pure virtual, and thus
+1446     have to be overridden. For some of them, an empty overrider is acceptable,
+1447     though a part of functionality in QSslCertificate will be missing.
+1448 
+1449     \sa QTlsBackend::createCertificate(), QTlsBackend::X509PemReader(), QTlsBackend::X509DerReader()
+1450 */
+1451 
+1452 /*!
+1453     \fn bool X509Certificate::isEqual(const X509Certificate &other) const
+1454     \internal
+1455 
+1456     This function is expected to return \c true if this certificate is the same as
+1457     the \a other, \c false otherwise. Used by QSslCertificate's comparison operators.
+1458 */
+1459 
+1460 /*!
+1461     \fn bool X509Certificate::isNull() const
+1462     \internal
+1463 
+1464     Returns true if this certificate was default-constructed and not initialized yet.
+1465     This function is called by QSslCertificate::isNull().
+1466 
+1467     \sa QSslCertificate::isNull()
+1468 */
+1469 
+1470 /*!
+1471     \fn bool X509Certificate::isSelfSigned() const
+1472     \internal
+1473 
+1474     This function is needed to implement QSslCertificate::isSelfSigned()
+1475 
+1476     \sa QSslCertificate::isSelfSigned()
+1477 */
+1478 
+1479 /*!
+1480     \fn QByteArray X509Certificate::version() const
+1481     \internal
+1482 
+1483     Implements QSslCertificate::version().
+1484 
+1485     \sa QSslCertificate::version()
+1486 */
+1487 
+1488 /*!
+1489     \fn QByteArray X509Certificate::serialNumber() const
+1490     \internal
+1491 
+1492     This function is expected to return the certificate's serial number string in
+1493     hexadecimal format.
+1494 
+1495     \sa QSslCertificate::serialNumber()
+1496 */
+1497 
+1498 /*!
+1499     \fn QStringList X509Certificate::issuerInfo(QSslCertificate::SubjectInfo subject) const
+1500     \internal
+1501 
+1502     This function is expected to return the issuer information for the \a subject
+1503     from the certificate, or an empty list if there is no information for subject
+1504     in the certificate. There can be more than one entry of each type.
+1505 
+1506     \sa QSslCertificate::issuerInfo().
+1507 */
+1508 
+1509 /*!
+1510     \fn QStringList X509Certificate::issuerInfo(const QByteArray &attribute) const
+1511     \internal
+1512 
+1513     This function is expected to return the issuer information for attribute from
+1514     the certificate, or an empty list if there is no information for \a attribute
+1515     in the certificate. There can be more than one entry for an attribute.
+1516 
+1517     \sa QSslCertificate::issuerInfo().
+1518 */
+1519 
+1520 /*!
+1521     \fn QStringList X509Certificate::subjectInfo(QSslCertificate::SubjectInfo subject) const
+1522     \internal
+1523 
+1524     This function is expected to return the information for the \a subject, or an empty list
+1525     if there is no information for subject in the certificate. There can be more than one
+1526     entry of each type.
+1527 
+1528     \sa QSslCertificate::subjectInfo().
+1529 */
+1530 
+1531 /*!
+1532     \fn QStringList X509Certificate::subjectInfo(const QByteArray &attribute) const
+1533     \internal
+1534 
+1535     This function is expected to return the subject information for \a attribute, or
+1536     an empty list if there is no information for attribute in the certificate.
+1537     There can be more than one entry for an attribute.
+1538 
+1539     \sa QSslCertificate::subjectInfo().
+1540 */
+1541 
+1542 /*!
+1543     \fn QList<QByteArray> X509Certificate::subjectInfoAttributes() const
+1544     \internal
+1545 
+1546     This function is expected to return a list of the attributes that have values
+1547     in the subject information of this certificate. The information associated
+1548     with a given attribute can be accessed using the subjectInfo() method. Note
+1549     that this list may include the OIDs for any elements that are not known by
+1550     the TLS backend.
+1551 
+1552     \note This function is needed for QSslCertificate:::subjectInfoAttributes().
+1553 
+1554     \sa subjectInfo()
+1555 */
+1556 
+1557 /*!
+1558     \fn QList<QByteArray> X509Certificate::issuerInfoAttributes() const
+1559     \internal
+1560 
+1561     This function is expected to return a list of the attributes that have
+1562     values in the issuer information of this certificate. The information
+1563     associated with a given attribute can be accessed using the issuerInfo()
+1564     method. Note that this list may include the OIDs for any
+1565     elements that are not known by the TLS backend.
+1566 
+1567     \note This function implements QSslCertificate::issuerInfoAttributes().
+1568 
+1569     \sa issuerInfo()
+1570 */
+1571 
+1572 /*!
+1573     \fn QMultiMap<QSsl::AlternativeNameEntryType, QString> X509Certificate::subjectAlternativeNames() const
+1574     \internal
+1575 
+1576     This function is expected to return the list of alternative subject names for
+1577     this certificate. The alternative names typically contain host names, optionally
+1578     with wildcards, that are valid for this certificate.
+1579 
+1580     \sa subjectInfo()
+1581 */
+1582 
+1583 /*!
+1584     \fn QDateTime X509Certificate::effectiveDate() const
+1585     \internal
+1586 
+1587     This function is expected to return the date-time that the certificate
+1588     becomes valid, or an empty QDateTime if this is a null certificate.
+1589 
+1590     \sa expiryDate()
+1591 */
+1592 
+1593 /*!
+1594     \fn QDateTime X509Certificate::expiryDate() const
+1595     \internal
+1596 
+1597     This function is expected to return the date-time that the certificate expires,
+1598     or an empty QDateTime if this is a null certificate.
+1599 
+1600     \sa effectiveDate()
+1601 */
+1602 
+1603 /*!
+1604     \fn qsizetype X509Certificate::numberOfExtensions() const
+1605     \internal
+1606 
+1607     This function is expected to return the number of X509 extensions of
+1608     this certificate.
+1609 */
+1610 
+1611 /*!
+1612     \fn QString X509Certificate::oidForExtension(qsizetype i) const
+1613     \internal
+1614 
+1615     This function is expected to return the ASN.1 OID for the extension
+1616     with index \a i.
+1617 
+1618     \sa numberOfExtensions()
+1619 */
+1620 
+1621 /*!
+1622     \fn QString X509Certificate::nameForExtension(qsizetype i) const
+1623     \internal
+1624 
+1625     This function is expected to return the name for the extension
+1626     with index \a i. If no name is known for the extension then the
+1627     OID will be returned.
+1628 
+1629     \sa numberOfExtensions(), oidForExtension()
+1630 */
+1631 
+1632 /*!
+1633     \fn QVariant X509Certificate::valueForExtension(qsizetype i) const
+1634     \internal
+1635 
+1636     This function is expected to return the value of the extension
+1637     with index \a i. The structure of the value returned depends on
+1638     the extension type
+1639 
+1640     \sa numberOfExtensions()
+1641 */
+1642 
+1643 /*!
+1644     \fn bool X509Certificate::isExtensionCritical(qsizetype i) const
+1645     \internal
+1646 
+1647     This function is expected to return the criticality of the extension
+1648     with index \a i.
+1649 
+1650     \sa numberOfExtensions()
+1651 */
+1652 
+1653 /*!
+1654     \fn bool X509Certificate::isExtensionSupported(qsizetype i) const
+1655     \internal
+1656 
+1657     This function is expected to return \c true if this extension is supported.
+1658     In this case, supported simply means that the structure of the QVariant returned
+1659     by the valueForExtension() accessor will remain unchanged between versions.
+1660 
+1661     \sa numberOfExtensions()
+1662 */
+1663 
+1664 /*!
+1665     \fn QByteArray X509Certificate::toPem() const
+1666     \internal
+1667 
+1668     This function is expected to return this certificate converted to a PEM (Base64)
+1669     encoded representation.
+1670 */
+1671 
+1672 /*!
+1673     \fn QByteArray X509Certificate::toDer() const
+1674     \internal
+1675 
+1676     This function is expected to return this certificate converted to a DER (binary)
+1677     encoded representation.
+1678 */
+1679 
+1680 /*!
+1681     \fn QString X509Certificate::toText() const
+1682     \internal
+1683 
+1684     This function is expected to return this certificate converted to a human-readable
+1685     text representation.
+1686 */
+1687 
+1688 /*!
+1689     \fn Qt::HANDLE X509Certificate::handle() const
+1690     \internal
+1691 
+1692     This function is expected to return a pointer to the native certificate handle,
+1693     if there is one, else nullptr.
+1694 */
+1695 
+1696 /*!
+1697     \fn size_t X509Certificate::hash(size_t seed) const
+1698     \internal
+1699 
+1700     This function is expected to return the hash value for this certificate,
+1701     using \a seed to seed the calculation.
+1702 */
+1703 
+1704 /*!
+1705     \internal
+1706 
+1707     Destroys this certificate.
+1708 */
+1709 X509Certificate::~X509Certificate() = default;
+1710 
+1711 /*!
+1712     \internal
+1713 
+1714     Returns the certificate subject's public key.
+1715 */
+1716 TlsKey *X509Certificate::publicKey() const
+1717 {
+1718     return nullptr;
+1719 }
+1720 
+1721 #if QT_CONFIG(ssl)
+1722 
+1723 /*!
+1724     \class TlsCryptograph
+1725     \internal (Network-private)
+1726     \brief TlsCryptograph is an abstract class, that allows a TLS pluging to implement QSslSocket.
+1727 
+1728     This abstract base class provides an interface that must be reimplemented by a TLS plugin,
+1729     that supports QSslSocket. A class, implementing TlsCryptograph's interface, is responsible
+1730     for TLS handshake, reading and writing encryped application data; it is expected
+1731     to work with QSslSocket and it's private implementation - QSslSocketPrivate.
+1732     QSslSocketPrivate provides access to its read/write buffers, QTcpSocket it
+1733     internally uses for connecting, reading and writing. QSslSocketPrivate
+1734     can also be used for reporting errors and storing the certificates received
+1735     during the handshake phase.
+1736 
+1737     \note Most of the functions in this class are pure virtual and have no actual implementation
+1738     in the QtNetwork module. This documentation is mostly conceptual and only describes what those
+1739     functions are expected to do, but not how they must be implemented.
+1740 
+1741     \sa QTlsBackend::createTlsCryptograph()
+1742 */
+1743 
+1744 /*!
+1745     \fn void TlsCryptograph::init(QSslSocket *q, QSslSocketPrivate *d)
+1746     \internal
+1747 
+1748     When initializing this TlsCryptograph, QSslSocket will pass a pointer to self and
+1749     its d-object using this function.
+1750 */
+1751 
+1752 /*!
+1753     \fn QList<QSslError> TlsCryptograph::tlsErrors() const
+1754     \internal
+1755 
+1756     Returns a list of QSslError, describing errors encountered during
+1757     the TLS handshake.
+1758 
+1759     \sa QSslSocket::sslHandshakeErrors()
+1760 */
+1761 
+1762 /*!
+1763     \fn void TlsCryptograph::startClientEncryption()
+1764     \internal
+1765 
+1766     A client-side QSslSocket calls this function after its internal TCP socket
+1767     establishes a connection with a remote host, or from QSslSocket::startClientEncryption().
+1768     This TlsCryptograph is expected to initialize some implementation-specific TLS context,
+1769     if needed, and then start the client side of the TLS handshake (for example, by calling
+1770     transmit()), using TCP socket from QSslSocketPrivate.
+1771 
+1772     \sa init(), transmit(), QSslSocket::startClientEncryption(), QSslSocket::connectToHostEncrypted()
+1773 */
+1774 
+1775 /*!
+1776     \fn void TlsCryptograph::startServerEncryption()
+1777     \internal
+1778 
+1779     This function is called by QSslSocket::startServerEncryption(). The TlsCryptograph
+1780     is expected to initialize some implementation-specific TLS context, if needed,
+1781     and then try to read the ClientHello message and continue the TLS handshake
+1782     (for example, by calling transmit()).
+1783 
+1784     \sa transmit(), QSslSocket::startServerEncryption()
+1785 */
+1786 
+1787 /*!
+1788     \fn void TlsCryptograph::continueHandshake()
+1789     \internal
+1790 
+1791     QSslSocket::resume() calls this function if its pause mode is QAbstractSocket::PauseOnSslErrors,
+1792     and errors, found during the handshake, were ignored. If implemented, this function is expected
+1793     to emit QSslSocket::encrypted().
+1794 
+1795     \sa QAbstractSocket::pauseMode(), QSslSocket::sslHandshakeErrors(), QSslSocket::ignoreSslErrors(), QSslSocket::resume()
+1796 */
+1797 
+1798 /*!
+1799     \fn void TlsCryptograph::disconnectFromHost()
+1800     \internal
+1801 
+1802     This function is expected to call disconnectFromHost() on the TCP socket
+1803     that can be obtained from QSslSocketPrivate. Any additional actions
+1804     are implementation-specific (e.g., sending shutdown alert message).
+1805 
+1806 */
+1807 
+1808 /*!
+1809     \fn void TlsCryptograph::disconnected()
+1810     \internal
+1811 
+1812     This function is called when the remote has disconnected. If there
+1813     is data left to be read you may ignore the maxReadBufferSize restriction
+1814     and read it all now.
+1815 */
+1816 
+1817 /*!
+1818     \fn QSslCipher TlsCryptograph::sessionCipher() const
+1819     \internal
+1820 
+1821     This function returns a QSslCipher object describing the ciphersuite negotiated
+1822     during the handshake.
+1823 */
+1824 
+1825 /*!
+1826     \fn QSsl::SslProtocol TlsCryptograph::sessionProtocol() const
+1827     \internal
+1828 
+1829     This function returns the version of TLS (or DTLS) protocol negotiated during the handshake.
+1830 */
+1831 
+1832 /*!
+1833     \fn void TlsCryptograph::transmit()
+1834     \internal
+1835 
+1836     This function is responsible for reading and writing data. The meaning of these I/O
+1837     operations depends on an implementation-specific TLS state machine. These read and write
+1838     operations can be reading and writing parts of a TLS handshake (e.g. by calling handshake-specific
+1839     functions), or reading and writing application data (if encrypted connection was already
+1840     established). transmit() is expected to use the QSslSocket's TCP socket (accessible via
+1841     QSslSocketPrivate) to read the incoming data and write the outgoing data. When in encrypted
+1842     state, transmit() is also using QSslSocket's internal read and write buffers: the read buffer
+1843     to fill with decrypted incoming data; the write buffer - for the data to encrypt and send.
+1844     This TlsCryptograph can also use QSslSocketPrivate to check which TLS errors were ignored during
+1845     the handshake.
+1846 
+1847     \note This function is responsible for emitting QSslSocket's signals, that occur during the
+1848     handshake (e.g. QSslSocket::sslErrors() or QSslSocket::encrypted()), and also read/write signals,
+1849     e.g. QSslSocket::bytesWritten() and QSslSocket::readyRead().
+1850 
+1851     \sa init()
+1852 */
+1853 
+1854 /*!
+1855     \internal
+1856 
+1857     Destroys this object.
+1858 */
+1859 TlsCryptograph::~TlsCryptograph() = default;
+1860 
+1861 /*!
+1862     \internal
+1863 
+1864     This function allows to share QSslContext between several QSslSocket objects.
+1865     The default implementation does nothing.
+1866 
+1867     \note The definition of the class QSslContext is implementation-specific.
+1868 
+1869     \sa sslContext()
+1870 */
+1871 void TlsCryptograph::checkSettingSslContext(std::shared_ptr<QSslContext> tlsContext)
+1872 {
+1873     Q_UNUSED(tlsContext);
+1874 }
+1875 
+1876 /*!
+1877     \internal
+1878 
+1879     Returns the context previously set by checkSettingSslContext() or \nullptr,
+1880     if no context was set. The default implementation returns \nullptr.
+1881 
+1882     \sa checkSettingSslContext()
+1883 */
+1884 std::shared_ptr<QSslContext> TlsCryptograph::sslContext() const
+1885 {
+1886     return {};
+1887 }
+1888 
+1889 /*!
+1890     \internal
+1891 
+1892     If this TLS backend supports reporting errors before handshake is finished,
+1893     e.g. from a verification callback function, enableHandshakeContinuation()
+1894     allows this object to continue handshake. The default implementation does
+1895     nothing.
+1896 
+1897     \sa QSslSocket::handshakeInterruptedOnError(), QSslConfiguration::setHandshakeMustInterruptOnError()
+1898 */
+1899 void TlsCryptograph::enableHandshakeContinuation()
+1900 {
+1901 }
+1902 
+1903 /*!
+1904     \internal
+1905 
+1906     Windows and OpenSSL-specific, only used internally by Qt's OpenSSL TLS backend.
+1907 
+1908     \note The default empty implementation is sufficient.
+1909 */
+1910 void TlsCryptograph::cancelCAFetch()
+1911 {
+1912 }
+1913 
+1914 /*!
+1915     \internal
+1916 
+1917     Windows and Schannel-specific, only used by Qt's Schannel TLS backend, in
+1918     general, if a backend has its own buffer where it stores undecrypted data
+1919     then it must report true if it contains any data through this function.
+1920 
+1921     \note The default empty implementation, returning \c false is sufficient.
+1922 */
+1923 bool TlsCryptograph::hasUndecryptedData() const
+1924 {
+1925     return false;
+1926 }
+1927 
+1928 /*!
+1929     \internal
+1930 
+1931     Returns the list of OCSP (Online Certificate Status Protocol) responses,
+1932     received during the handshake. The default implementation returns an empty
+1933     list.
+1934 */
+1935 QList<QOcspResponse> TlsCryptograph::ocsps() const
+1936 {
+1937     return {};
+1938 }
+1939 
+1940 /*!
+1941     \internal
+1942 
+1943     A helper function that can be used during a handshake. Returns \c true if the \a peerName
+1944     matches one of subject alternative names or common names found in the \a certificate.
+1945 */
+1946 bool TlsCryptograph::isMatchingHostname(const QSslCertificate &certificate, const QString &peerName)
+1947 {
+1948     return QSslSocketPrivate::isMatchingHostname(certificate, peerName);
+1949 }
+1950 
+1951 /*!
+1952     \internal
+1953     Calls QAbstractSocketPrivate::setErrorAndEmit() for \a d, passing \a errorCode and
+1954     \a errorDescription as parameters.
+1955 */
+1956 void TlsCryptograph::setErrorAndEmit(QSslSocketPrivate *d, QAbstractSocket::SocketError errorCode,
+1957                                      const QString &errorDescription) const
+1958 {
+1959     Q_ASSERT(d);
+1960     d->setErrorAndEmit(errorCode, errorDescription);
+1961 }
+1962 
+1963 #if QT_CONFIG(dtls)
+1964 /*!
+1965     \class DtlsBase
+1966     \internal (Network-private)
+1967     \brief DtlsBase is a base class for the classes DtlsCryptograph and DtlsCookieVerifier.
+1968 
+1969     DtlsBase is the base class for the classes DtlsCryptograph and DtlsCookieVerifier. It's
+1970     an abstract class, an interface that these before-mentioned classes share. It allows to
+1971     set, get and clear the last error that occurred, set and get cookie generation parameters,
+1972     set and get QSslConfiguration.
+1973 
+1974     \note This class is not supposed to be inherited directly, it's only needed by DtlsCryptograph
+1975     and DtlsCookieVerifier.
+1976 
+1977     \sa QDtls, QDtlsClientVerifier, DtlsCryptograph, DtlsCookieVerifier
+1978 */
+1979 
+1980 /*!
+1981     \fn void DtlsBase::setDtlsError(QDtlsError code, const QString &description)
+1982     \internal
+1983 
+1984     Sets the last error to \a code and its textual description to \a description.
+1985 
+1986     \sa QDtlsError, error(), errorString()
+1987 */
+1988 
+1989 /*!
+1990     \fn QDtlsError DtlsBase::error() const
+1991     \internal
+1992 
+1993     This function, when overridden, is expected to return the code for the last error that occurred.
+1994     If no error occurred it should return QDtlsError::NoError.
+1995 
+1996     \sa QDtlsError, errorString(), setDtlsError()
+1997 */
+1998 
+1999 /*!
+2000     \fn QDtlsError DtlsBase::errorString() const
+2001     \internal
+2002 
+2003     This function, when overridden, is expected to return the textual description for the last error
+2004     that occurred or an empty string if no error occurred.
+2005 
+2006     \sa QDtlsError, error(), setDtlsError()
+2007 */
+2008 
+2009 /*!
+2010     \fn void DtlsBase::clearDtlsError()
+2011     \internal
+2012 
+2013     This function is expected to set the error code for the last error to QDtlsError::NoError and
+2014     its textual description to an empty string.
+2015 
+2016     \sa QDtlsError, setDtlsError(), error(), errorString()
+2017 */
+2018 
+2019 /*!
+2020     \fn void DtlsBase::setConfiguration(const QSslConfiguration &configuration)
+2021     \internal
+2022 
+2023     Sets a TLS configuration that an object of a class inheriting from DtlsCookieVerifier or
+2024     DtlsCryptograph will use, to \a configuration.
+2025 
+2026     \sa configuration()
+2027 */
+2028 
+2029 /*!
+2030     \fn QSslConfiguration DtlsBase::configuration() const
+2031     \internal
+2032 
+2033     Returns TLS configuration this object is using (either set by setConfiguration()
+2034     previously, or the default DTLS configuration).
+2035 
+2036     \sa setConfiguration(), QSslConfiguration::defaultDtlsConfiguration()
+2037 */
+2038 
+2039 /*!
+2040     \fn bool DtlsBase::setCookieGeneratorParameters(const QDtlsClientVerifier::GeneratorParameters &params)
+2041     \internal
+2042 
+2043     Sets the DTLS cookie generation parameters that DtlsCookieVerifier or DtlsCryptograph will use to
+2044     \a params.
+2045 
+2046     \note This function returns \c false if parameters were invalid - if the secret was empty. Otherwise,
+2047     this function must return true.
+2048 
+2049     \sa QDtlsClientVerifier::GeneratorParameters, cookieGeneratorParameters()
+2050 */
+2051 
+2052 /*!
+2053     \fn QDtlsClientVerifier::GeneratorParameters DtlsBase::cookieGeneratorParameters() const
+2054     \internal
+2055 
+2056     Returns DTLS cookie generation parameters that were either previously set by setCookieGeneratorParameters(),
+2057     or default parameters.
+2058 
+2059     \sa setCookieGeneratorParameters()
+2060 */
+2061 
+2062 /*!
+2063     \internal
+2064 
+2065     Destroys this object.
+2066 */
+2067 DtlsBase::~DtlsBase() = default;
+2068 
+2069 /*!
+2070     \class DtlsCookieVerifier
+2071     \internal (Network-private)
+2072     \brief DtlsCookieVerifier is an interface that allows a TLS plugin to support the class QDtlsClientVerifier.
+2073 
+2074     DtlsCookieVerifier is an interface, an abstract class, that has to be implemented by
+2075     a TLS plugin that supports DTLS cookie verification.
+2076 
+2077     \sa QDtlsClientVerifier
+2078 */
+2079 
+2080 /*!
+2081     \fn bool DtlsCookieVerifier::verifyClient(QUdpSocket *socket, const QByteArray &dgram, const QHostAddress &address, quint16 port)
+2082     \internal
+2083 
+2084     This function is expected to verify a ClientHello message, found in \a dgram, using \a address,
+2085     \a port, and cookie generator parameters. The function returns \c true if such cookie was found
+2086     and \c false otherwise. If no valid cookie was found in the \a dgram, this verifier should use
+2087     \a socket to send a HelloVerifyRequest message, using \a address and \a port as the destination
+2088     and a source material for cookie generation, see also
+2089     \l {RFC 6347, section 4.2.1}
+2090 
+2091     \sa QDtlsClientVerifier
+2092 */
+2093 
+2094 /*!
+2095     \fn QByteArray DtlsCookieVerifier::verifiedHello() const
+2096     \internal
+2097 
+2098     Returns the last ClientHello message containing the DTLS cookie that this verifier was
+2099     able to verify as correct, or an empty byte array.
+2100 
+2101     \sa verifyClient()
+2102 */
+2103 
+2104 /*!
+2105     \class DtlsCryptograph
+2106     \internal (Network-private)
+2107     \brief DtlsCryptograph is an interface that allows a TLS plugin to implement the class QDtls.
+2108 
+2109     DtlsCryptograph is an abstract class; a TLS plugin can provide a class, inheriting from
+2110     DtlsCryptograph and implementing its pure virtual functions, thus implementing the class
+2111     QDtls and enabling DTLS over UDP.
+2112 
+2113     To write DTLS datagrams, a class, inheriting DtlsCryptograph, is expected to use
+2114     QUdpSocket. In general, all reading is done externally, so DtlsCryptograph is
+2115     expected to only write into QUdpSocket, check possible socket errors, change socket
+2116     options if needed.
+2117 
+2118     \note All functions in this class are pure virtual and have no actual implementation
+2119     in the QtNetwork module. This documentation is mostly conceptual and only describes
+2120     what those functions are expected to do, but not how they must be implemented.
+2121 
+2122     \sa QDtls, QUdpSocket
+2123 */
+2124 
+2125 /*!
+2126     \fn QSslSocket::SslMode DtlsCryptograph::cryptographMode() const
+2127     \internal
+2128 
+2129     Returns the mode (client or server) this object operates in.
+2130 
+2131     \note This mode is set once when a new DtlsCryptograph is created
+2132     by QTlsBackend and cannot change.
+2133 
+2134     \sa QTlsBackend::createDtlsCryptograph()
+2135 */
+2136 
+2137 /*!
+2138     \fn void DtlsCryptograph::setPeer(const QHostAddress &addr, quint16 port, const QString &name)
+2139     \internal
+2140 
+2141     Sets the remote peer's address to \a addr and remote port to \a port. \a name,
+2142     if not empty, is to be used when validating the peer's certificate.
+2143 
+2144     \sa peerAddress(), peerPort(), peerVerificationName()
+2145 */
+2146 
+2147 /*!
+2148     \fn QHostAddress DtlsCryptograph::peerAddress() const
+2149     \internal
+2150 
+2151     Returns the remote peer's address previously set by setPeer() or,
+2152     if no address was set, an empty address.
+2153 
+2154     \sa setPeer()
+2155 */
+2156 
+2157 /*!
+2158     \fn quint16 DtlsCryptograph::peerPort() const
+2159     \internal
+2160 
+2161     Returns the remote peer's port previously set by setPeer() or
+2162     0 if no port was set.
+2163 
+2164     \sa setPeer(), peerAddress()
+2165 */
+2166 
+2167 /*!
+2168     \fn void DtlsCryptograph::setPeerVerificationName(const QString &name)
+2169     \internal
+2170 
+2171     Sets the host name to use during certificate validation to \a name.
+2172 
+2173     \sa peerVerificationName(), setPeer()
+2174 */
+2175 
+2176 /*!
+2177     \fn QString DtlsCryptograph::peerVerificationName() const
+2178     \internal
+2179 
+2180     Returns the name that this object is using during the certificate validation,
+2181     previously set by setPeer() or setPeerVerificationName(). Returns an empty string
+2182     if no peer verification name was set.
+2183 
+2184     \sa setPeer(), setPeerVerificationName()
+2185 */
+2186 
+2187 /*!
+2188     \fn void DtlsCryptograph::setDtlsMtuHint(quint16 mtu)
+2189     \internal
+2190 
+2191     Sets the maximum transmission unit (MTU), if it is supported by a TLS implementation, to \a mtu.
+2192 
+2193     \sa dtlsMtuHint()
+2194 */
+2195 
+2196 /*!
+2197     \fn quint16 DtlsCryptograph::dtlsMtuHint() const
+2198     \internal
+2199 
+2200     Returns the value of the maximum transmission unit either previously set by setDtlsMtuHint(),
+2201     or some implementation-specific value (guessed or somehow known to this DtlsCryptograph).
+2202 
+2203     \sa setDtlsMtuHint()
+2204 */
+2205 
+2206 /*!
+2207     \fn QDtls::HandshakeState DtlsCryptograph::state() const
+2208     \internal
+2209 
+2210     Returns the current handshake state for this DtlsCryptograph (not started, in progress,
+2211     peer verification error found, complete).
+2212 
+2213     \sa isConnectionEncrypted(), startHandshake()
+2214 */
+2215 
+2216 /*!
+2217     \fn bool DtlsCryptograph::isConnectionEncrypted() const
+2218     \internal
+2219 
+2220     Returns \c true if this DtlsCryptograph has completed a handshake without validation
+2221     errors (or these errors were ignored). Returns \c false otherwise.
+2222 */
+2223 
+2224 /*!
+2225     \fn bool DtlsCryptograph::startHandshake(QUdpSocket *socket, const QByteArray &dgram)
+2226     \internal
+2227 
+2228     This function is expected to initialize some implementation-specific context and to start a DTLS
+2229     handshake, using \a socket to write datagrams (but not to read them). If this object is operating
+2230     as a server, \a dgram is non-empty and contains the ClientHello message. This function returns
+2231     \c true if no error occurred (and this DtlsCryptograph's state switching to
+2232     QDtls::HandshakeState::HandshakeInProgress), \c false otherwise.
+2233 
+2234     \sa continueHandshake(), handleTimeout(), resumeHandshake(), abortHandshake(), state()
+2235 */
+2236 
+2237 /*!
+2238     \fn bool DtlsCryptograph::handleTimeout(QUdpSocket *socket)
+2239     \internal
+2240 
+2241     In case a timeout occurred during the handshake, allows to re-transmit the last message,
+2242     using \a socket to write the datagram. Returns \c true if no error occurred, \c false otherwise.
+2243 
+2244     \sa QDtls::handshakeTimeout(), QDtls::handleTimeout()
+2245 */
+2246 
+2247 /*!
+2248     \fn bool DtlsCryptograph::continueHandshake(QUdpSocket *socket, const QByteArray &dgram)
+2249     \internal
+2250 
+2251     Continues the handshake, using \a socket to write datagrams (a handshake-specific message).
+2252     \a dgram contains the peer's handshake-specific message. Returns \c false in case some error
+2253     was encountered (this can include socket-related errors and errors found during the certificate
+2254     validation). Returns \c true if the handshake was complete successfully, or is still in progress.
+2255 
+2256     This function, depending on the implementation-specific state machine, may leave the handshake
+2257     state in QDtls::HandshakeState::HandshakeInProgress, or switch to QDtls::HandshakeState::HandshakeComplete
+2258     or QDtls::HandshakeState::PeerVerificationFailed.
+2259 
+2260     This function may store the peer's certificate (or chain of certificates), extract and store
+2261     the information about the negotiated session protocol and ciphersuite.
+2262 
+2263     \sa startHandshake()
+2264 */
+2265 
+2266 /*!
+2267     \fn bool DtlsCryptograph::resumeHandshake(QUdpSocket *socket)
+2268     \internal
+2269 
+2270     If peer validation errors were found duing the handshake, this function tries to
+2271     continue and complete the handshake. If errors were ignored, the function switches
+2272     this object's state to QDtls::HandshakeState::HandshakeComplete and returns \c true.
+2273 
+2274     \sa abortHandshake()
+2275 */
+2276 
+2277 /*!
+2278     \fn void DtlsCryptograph::abortHandshake(QUdpSocket *socket)
+2279     \internal
+2280 
+2281     Aborts the handshake if it's in progress or in the state QDtls::HandshakeState::PeerVerificationFailed.
+2282     The use of \a socket is implementation-specific (for example, this DtlsCryptograph may send
+2283     ShutdownAlert message).
+2284 
+2285     \sa resumeHandshake()
+2286 */
+2287 
+2288 /*!
+2289     \fn void DtlsCryptograph::sendShutdownAlert(QUdpSocket *socket)
+2290     \internal
+2291 
+2292     If the underlying TLS library provides the required functionality, this function
+2293     may sent ShutdownAlert message using \a socket.
+2294 */
+2295 
+2296 /*!
+2297     \fn QList<QSslError> DtlsCryptograph::peerVerificationErrors() const
+2298     \internal
+2299 
+2300     Returns the list of errors that this object encountered during DTLS handshake
+2301     and certificate validation.
+2302 
+2303     \sa ignoreVerificationErrors()
+2304 */
+2305 
+2306 /*!
+2307     \fn void DtlsCryptograph::ignoreVerificationErrors(const QList<QSslError> &errorsToIgnore)
+2308     \internal
+2309 
+2310     Tells this object to ignore errors from \a errorsToIgnore when they are found during
+2311     DTLS handshake.
+2312 
+2313     \sa peerVerificationErrors()
+2314 */
+2315 
+2316 /*!
+2317     \fn QSslCipher DtlsCryptograph::dtlsSessionCipher() const
+2318     \internal
+2319 
+2320     If such information is available, returns the ciphersuite, negotiated during
+2321     the handshake.
+2322 
+2323     \sa continueHandshake(), dtlsSessionProtocol()
+2324 */
+2325 
+2326 /*!
+2327     \fn QSsl::SslProtocol DtlsCryptograph::dtlsSessionProtocol() const
+2328     \internal
+2329 
+2330     Returns the version of the session protocol that was negotiated during the handshake or
+2331     QSsl::UnknownProtocol if the handshake is incomplete or no information about the session
+2332     protocol is available.
+2333 
+2334     \sa continueHandshake(), dtlsSessionCipher()
+2335 */
+2336 
+2337 /*!
+2338     \fn qint64 DtlsCryptograph::writeDatagramEncrypted(QUdpSocket *socket, const QByteArray &dgram)
+2339     \internal
+2340 
+2341     If this DtlsCryptograph is in the QDtls::HandshakeState::HandshakeComplete state, this function
+2342     encrypts \a dgram and writes this encrypted data into \a socket.
+2343 
+2344     Returns the number of bytes (of \a dgram) written, or -1 in case of error. This function should
+2345     set the error code and description if some error was encountered.
+2346 
+2347     \sa decryptDatagram()
+2348 */
+2349 
+2350 /*!
+2351     \fn QByteArray DtlsCryptograph::decryptDatagram(QUdpSocket *socket, const QByteArray &dgram)
+2352     \internal
+2353 
+2354     If this DtlsCryptograph is in the QDtls::HandshakeState::HandshakeComplete state, decrypts \a dgram.
+2355     The use of \a socket is implementation-specific. This function should return an empty byte array
+2356     and set the error code and description if some error was encountered.
+2357 */
+2358 
+2359 #endif // QT_CONFIG(dtls)
+2360 #endif // QT_CONFIG(ssl)
+2361 
+2362 } // namespace QTlsPrivate
+2363 
+2364 #if QT_CONFIG(ssl)
+2365 /*!
+2366     \internal
+2367 */
+2368 Q_NETWORK_EXPORT void qt_ForceTlsSecurityLevel()
+2369 {
+2370     if (auto *backend = QSslSocketPrivate::tlsBackendInUse())
+2371         backend->forceAutotestSecurityLevel();
+2372 }
+2373 
+2374 #endif // QT_CONFIG(ssl)
+2375 
+2376 QT_END_NAMESPACE

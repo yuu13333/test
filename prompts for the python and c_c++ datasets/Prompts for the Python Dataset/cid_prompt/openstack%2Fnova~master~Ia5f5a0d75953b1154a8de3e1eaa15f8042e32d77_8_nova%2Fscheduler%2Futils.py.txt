@@ -1,0 +1,877 @@
+Please review the code below for security defects. You can consider defect types in terms of:
+1.CWE-284 (Improper Access Control)
+2.CWE-435 (Improper Interaction Between Multiple Entities)
+3.CWE-664 (Improper Control of a Resource Through its Lifetime)
+4.CWE-682 (Incorrect Calculation)
+5.CWE-691 (Insufficient Control Flow Management)
+6.CWE-693 (Protection Mechanism Failure)
+7.CWE-697 (Incorrect Comparison)
+8.CWE-703 (Improper Check or Handling of Exceptional Conditions)
+9.CWE-707 (Improper Neutralization)
+10.CWE-710 (Improper Adherence to Coding Standards)
+If any are found, please describe the security defect in detail and indicate the corresponding line number of code and solution. If none are detected, states: 'No security defects are detected in the code'.
+
+1 # All Rights Reserved.
+2 #
+3 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
+4 #    not use this file except in compliance with the License. You may obtain
+5 #    a copy of the License at
+6 #
+7 #         http://www.apache.org/licenses/LICENSE-2.0
+8 #
+9 #    Unless required by applicable law or agreed to in writing, software
+10 #    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+11 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+12 #    License for the specific language governing permissions and limitations
+13 #    under the License.
+14 
+15 """Utility methods for scheduling."""
+16 
+17 import collections
+18 import functools
+19 import re
+20 import sys
+21 
+22 from oslo_log import log as logging
+23 import oslo_messaging as messaging
+24 from oslo_serialization import jsonutils
+25 
+26 from nova.api.openstack.placement import lib as placement_lib
+27 from nova.compute import flavors
+28 from nova.compute import utils as compute_utils
+29 import nova.conf
+30 from nova import context as nova_context
+31 from nova import exception
+32 from nova.i18n import _, _LE, _LW
+33 from nova import objects
+34 from nova.objects import base as obj_base
+35 from nova.objects import fields
+36 from nova.objects import instance as obj_instance
+37 from nova import rpc
+38 
+39 
+40 LOG = logging.getLogger(__name__)
+41 
+42 CONF = nova.conf.CONF
+43 
+44 GroupDetails = collections.namedtuple('GroupDetails', ['hosts', 'policies',
+45                                                        'members'])
+46 
+47 
+48 class ResourceRequest(object):
+49     """Presents a granular resource request via RequestGroup instances."""
+50     # extra_specs-specific consts
+51     XS_RES_PREFIX = 'resources'
+52     XS_TRAIT_PREFIX = 'trait'
+53     # Regex patterns for numbered or un-numbered resources/trait keys
+54     XS_KEYPAT = re.compile(r"^(%s)([1-9][0-9]*)?:(.*)$" %
+55                            '|'.join((XS_RES_PREFIX, XS_TRAIT_PREFIX)))
+56 
+57     def __init__(self):
+58         # { ident: RequestGroup }
+59         self._rg_by_id = {}
+60 
+61     def get_request_group(self, ident):
+62         if ident not in self._rg_by_id:
+63             rq_grp = placement_lib.RequestGroup(use_same_provider=bool(ident))
+64             self._rg_by_id[ident] = rq_grp
+65         return self._rg_by_id[ident]
+66 
+67     def _add_resource(self, groupid, rclass, amount):
+68         # Validate the class.
+69         if not (rclass.startswith(fields.ResourceClass.CUSTOM_NAMESPACE) or
+70                         rclass in fields.ResourceClass.STANDARD):
+71             LOG.warning(
+72                 "Received an invalid ResourceClass '%(key)s' in extra_specs.",
+73                 {"key": rclass})
+74             return
+75         # val represents the amount.  Convert to int, or warn and skip.
+76         try:
+77             amount = int(amount)
+78             if amount < 0:
+79                 raise ValueError()
+80         except ValueError:
+81             LOG.warning(
+82                 "Resource amounts must be nonnegative integers. Received "
+83                 "'%(val)s' for key resources%(groupid)s.",
+84                 {"groupid": groupid, "val": amount})
+85             return
+86         self.get_request_group(groupid).resources[rclass] = amount
+87 
+88     def _add_trait(self, groupid, trait_name, trait_type):
+89         # Currently the only valid value for a trait entry is 'required'.
+90         trait_vals = ('required',)
+91         # Ensure the value is supported.
+92         if trait_type not in trait_vals:
+93             LOG.warning(
+94                 "Only (%(tvals)s) traits are supported. Received '%(val)s' "
+95                 "for key trait%(groupid)s.",
+96                 {"tvals": ', '.join(trait_vals), "groupid": groupid,
+97                  "val": trait_type})
+98             return
+99         self.get_request_group(groupid).required_traits.add(trait_name)
+100 
+101     @classmethod
+102     def from_extra_specs(cls, extra_specs):
+103         """Processes resources and traits in numbered groupings in extra_specs.
+104 
+105         Examines extra_specs for items of the following forms:
+106             "resources:$RESOURCE_CLASS": $AMOUNT
+107             "resources$N:$RESOURCE_CLASS": $AMOUNT
+108             "trait:$TRAIT_NAME": "required"
+109             "trait$N:$TRAIT_NAME": "required"
+110 
+111         :param extra_specs: The flavor extra_specs dict.
+112         :return: A ResourceRequest object representing the resources and
+113                  required traits in the extra_specs.
+114         """
+115         ret = cls()
+116         for key, val in extra_specs.items():
+117             match = cls.XS_KEYPAT.match(key)
+118             if not match:
+119                 continue
+120 
+121             # 'prefix' is 'resources' or 'trait'
+122             # 'suffix' is $N or None
+123             # 'name' is either the resource class name or the trait name.
+124             prefix, suffix, name = match.groups()
+125 
+126             # Process "resources[$N]"
+127             if prefix == cls.XS_RES_PREFIX:
+128                 ret._add_resource(suffix, name, val)
+129 
+130             # Process "trait[$N]"
+131             elif prefix == cls.XS_TRAIT_PREFIX:
+132                 ret._add_trait(suffix, name, val)
+133 
+134         return ret
+135 
+136     def resource_groups(self):
+137         for rg in self._rg_by_id.values():
+138             yield rg.resources
+139 
+140     def merged_resources(self, flavor_resources=None):
+141         """Returns a merge of {resource_class: amount} for all resource groups.
+142 
+143         Amounts of the same resource class from different groups are added
+144         together.
+145 
+146         :param flavor_resources: A flat dict of {resource_class: amount}.  If
+147                                  specified, the resources therein are folded
+148                                  into the return dict, such that any resource
+149                                  in flavor_resources is included only if that
+150                                  resource class does not exist elsewhere in the
+151                                  merged ResourceRequest.
+152         :return: A dict of the form {resource_class: amount}
+153         """
+154         ret = collections.defaultdict(lambda: 0)
+155         for resource_dict in self.resource_groups():
+156             for resource_class, amount in resource_dict.items():
+157                 ret[resource_class] += amount
+158         if flavor_resources:
+159             for resource_class, amount in flavor_resources.items():
+160                 # If it's in there - even if zero - ignore the one from the
+161                 # flavor.
+162                 if resource_class not in ret:
+163                     ret[resource_class] = amount
+164             # Now strip zeros.  This has to be done after the above - we can't
+165             # use strip_zeros :(
+166             ret = {rc: amt for rc, amt in ret.items() if amt}
+167         return dict(ret)
+168 
+169     def _clean_empties(self):
+170         """Get rid of any empty ResourceGroup instances."""
+171         for ident, rg in list(self._rg_by_id.items()):
+172             if not any((rg.resources, rg.required_traits)):
+173                 self._rg_by_id.pop(ident)
+174 
+175     def strip_zeros(self):
+176         """Remove any resources whose amounts are zero."""
+177         for resource_dict in self.resource_groups():
+178             for rclass in list(resource_dict):
+179                 if resource_dict[rclass] == 0:
+180                     resource_dict.pop(rclass)
+181         self._clean_empties()
+182 
+183 
+184 def build_request_spec(image, instances, instance_type=None):
+185     """Build a request_spec for the scheduler.
+186 
+187     The request_spec assumes that all instances to be scheduled are the same
+188     type.
+189 
+190     :param image: optional primitive image meta dict
+191     :param instances: list of instances; objects will be converted to
+192         primitives
+193     :param instance_type: optional flavor; objects will be converted to
+194         primitives
+195     :return: dict with the following keys::
+196 
+197         'image': the image dict passed in or {}
+198         'instance_properties': primitive version of the first instance passed
+199         'instance_type': primitive version of the instance_type or None
+200         'num_instances': the number of instances passed in
+201     """
+202     instance = instances[0]
+203     if instance_type is None:
+204         if isinstance(instance, obj_instance.Instance):
+205             instance_type = instance.get_flavor()
+206         else:
+207             instance_type = flavors.extract_flavor(instance)
+208 
+209     if isinstance(instance, obj_instance.Instance):
+210         instance = obj_base.obj_to_primitive(instance)
+211         # obj_to_primitive doesn't copy this enough, so be sure
+212         # to detach our metadata blob because we modify it below.
+213         instance['system_metadata'] = dict(instance.get('system_metadata', {}))
+214 
+215     if isinstance(instance_type, objects.Flavor):
+216         instance_type = obj_base.obj_to_primitive(instance_type)
+217         # NOTE(danms): Replicate this old behavior because the
+218         # scheduler RPC interface technically expects it to be
+219         # there. Remove this when we bump the scheduler RPC API to
+220         # v5.0
+221         try:
+222             flavors.save_flavor_info(instance.get('system_metadata', {}),
+223                                      instance_type)
+224         except KeyError:
+225             # If the flavor isn't complete (which is legit with a
+226             # flavor object, just don't put it in the request spec
+227             pass
+228 
+229     request_spec = {
+230             'image': image or {},
+231             'instance_properties': instance,
+232             'instance_type': instance_type,
+233             'num_instances': len(instances)}
+234     # NOTE(mriedem): obj_to_primitive above does not serialize everything
+235     # in an object, like datetime fields, so we need to still call to_primitive
+236     # to recursively serialize the items in the request_spec dict.
+237     return jsonutils.to_primitive(request_spec)
+238 
+239 
+240 def resources_from_flavor(instance, flavor):
+241     """Convert a flavor into a set of resources for placement, taking into
+242     account boot-from-volume instances.
+243 
+244     This takes an instance and a flavor and returns a dict of
+245     resource_class:amount based on the attributes of the flavor, accounting for
+246     any overrides that are made in extra_specs.
+247     """
+248     is_bfv = compute_utils.is_volume_backed_instance(instance._context,
+249                                                      instance)
+250     swap_in_gb = compute_utils.convert_mb_to_ceil_gb(flavor.swap)
+251     disk = ((0 if is_bfv else flavor.root_gb) +
+252             swap_in_gb + flavor.ephemeral_gb)
+253 
+254     resources = {
+255         fields.ResourceClass.VCPU: flavor.vcpus,
+256         fields.ResourceClass.MEMORY_MB: flavor.memory_mb,
+257         fields.ResourceClass.DISK_GB: disk,
+258     }
+259     if "extra_specs" in flavor:
+260         # TODO(efried): This method is currently only used from places that
+261         # assume the compute node is the only resource provider.  So for now,
+262         # we just merge together all the resources specified in the flavor and
+263         # pass them along.  This will need to be adjusted when nested and/or
+264         # shared RPs are in play.
+265         rreq = ResourceRequest.from_extra_specs(flavor.extra_specs)
+266         resources = rreq.merged_resources(flavor_resources=resources)
+267 
+268     return resources
+269 
+270 
+271 def merge_resources(original_resources, new_resources, sign=1):
+272     """Merge a list of new resources with existing resources.
+273 
+274     Either add the resources (if sign is 1) or subtract (if sign is -1).
+275     If the resulting value is 0 do not include the resource in the results.
+276     """
+277 
+278     all_keys = set(original_resources.keys()) | set(new_resources.keys())
+279     for key in all_keys:
+280         value = (original_resources.get(key, 0) +
+281                  (sign * new_resources.get(key, 0)))
+282         if value:
+283             original_resources[key] = value
+284         else:
+285             original_resources.pop(key, None)
+286 
+287 
+288 def resources_from_request_spec(spec_obj):
+289     """Given a RequestSpec object, returns a ResourceRequest of the resources
+290     and traits it represents.
+291     """
+292     spec_resources = {
+293         fields.ResourceClass.VCPU: spec_obj.vcpus,
+294         fields.ResourceClass.MEMORY_MB: spec_obj.memory_mb,
+295     }
+296 
+297     requested_disk_mb = (1024 * (spec_obj.root_gb +
+298                                  spec_obj.ephemeral_gb) +
+299                          spec_obj.swap)
+300     # NOTE(sbauza): Disk request is expressed in MB but we count
+301     # resources in GB. Since there could be a remainder of the division
+302     # by 1024, we need to ceil the result to the next bigger Gb so we
+303     # can be sure there would be enough disk space in the destination
+304     # to sustain the request.
+305     # FIXME(sbauza): All of that could be using math.ceil() but since
+306     # we support both py2 and py3, let's fake it until we only support
+307     # py3.
+308     requested_disk_gb = requested_disk_mb // 1024
+309     if requested_disk_mb % 1024 != 0:
+310         # Let's ask for a bit more space since we count in GB
+311         requested_disk_gb += 1
+312     # NOTE(sbauza): Some flavors provide zero size for disk values, we need
+313     # to avoid asking for disk usage.
+314     if requested_disk_gb != 0:
+315         spec_resources[fields.ResourceClass.DISK_GB] = requested_disk_gb
+316 
+317     # Process extra_specs
+318     if "extra_specs" in spec_obj.flavor:
+319         res_req = ResourceRequest.from_extra_specs(spec_obj.flavor.extra_specs)
+320         # If any of the three standard resources above was explicitly given in
+321         # the extra_specs - in any group - we need to replace it, or delete it
+322         # if it was given as zero.  We'll do this by grabbing a merged version
+323         # of the ResourceRequest resources and removing matching items from the
+324         # spec_resources.
+325         spec_resources = {rclass: amt for rclass, amt in spec_resources.items()
+326                           if rclass not in res_req.merged_resources()}
+327         # Now we don't need (or want) any remaining zero entries - remove them.
+328         res_req.strip_zeros()
+329     else:
+330         # Start with an empty one
+331         res_req = ResourceRequest()
+332 
+333     # Add the (remaining) items from the spec_resources to the sharing group
+334     for rclass, amount in spec_resources.items():
+335         res_req.get_request_group(None).resources[rclass] = amount
+336 
+337     return res_req
+338 
+339 
+340 # TODO(mriedem): Remove this when select_destinations() in the scheduler takes
+341 # some sort of skip_filters flag.
+342 def claim_resources_on_destination(
+343         reportclient, instance, source_node, dest_node,
+344         source_node_allocations=None):
+345     """Copies allocations from source node to dest node in Placement
+346 
+347     Normally the scheduler will allocate resources on a chosen destination
+348     node during a move operation like evacuate and live migration. However,
+349     because of the ability to force a host and bypass the scheduler, this
+350     method can be used to manually copy allocations from the source node to
+351     the forced destination node.
+352 
+353     This is only appropriate when the instance flavor on the source node
+354     is the same on the destination node, i.e. don't use this for resize.
+355 
+356     :param reportclient: An instance of the SchedulerReportClient.
+357     :param instance: The instance being moved.
+358     :param source_node: source ComputeNode where the instance currently
+359                         lives
+360     :param dest_node: destination ComputeNode where the instance is being
+361                       moved
+362     :raises NoValidHost: If the allocation claim on the destination
+363                          node fails.
+364     """
+365     # Get the current allocations for the source node and the instance.
+366     if not source_node_allocations:
+367         source_node_allocations = (
+368             reportclient.get_allocations_for_consumer_by_provider(
+369                 source_node.uuid, instance.uuid))
+370     if source_node_allocations:
+371         # Generate an allocation request for the destination node.
+372         alloc_request = {
+373             'allocations': {
+374                 dest_node.uuid: {'resources': source_node_allocations}
+375             }
+376         }
+377         # The claim_resources method will check for existing allocations
+378         # for the instance and effectively "double up" the allocations for
+379         # both the source and destination node. That's why when requesting
+380         # allocations for resources on the destination node before we move,
+381         # we use the existing resource allocations from the source node.
+382         if reportclient.claim_resources(
+383                 instance.uuid, alloc_request,
+384                 instance.project_id, instance.user_id,
+385                 allocation_request_version='1.12'):
+386             LOG.debug('Instance allocations successfully created on '
+387                       'destination node %(dest)s: %(alloc_request)s',
+388                       {'dest': dest_node.uuid,
+389                        'alloc_request': alloc_request},
+390                       instance=instance)
+391         else:
+392             # We have to fail even though the user requested that we force
+393             # the host. This is because we need Placement to have an
+394             # accurate reflection of what's allocated on all nodes so the
+395             # scheduler can make accurate decisions about which nodes have
+396             # capacity for building an instance. We also cannot rely on the
+397             # resource tracker in the compute service automatically healing
+398             # the allocations since that code is going away in Queens.
+399             reason = (_('Unable to move instance %(instance_uuid)s to '
+400                         'host %(host)s. There is not enough capacity on '
+401                         'the host for the instance.') %
+402                       {'instance_uuid': instance.uuid,
+403                        'host': dest_node.host})
+404             raise exception.NoValidHost(reason=reason)
+405     else:
+406         # This shouldn't happen, but it could be a case where there are
+407         # older (Ocata) computes still so the existing allocations are
+408         # getting overwritten by the update_available_resource periodic
+409         # task in the compute service.
+410         # TODO(mriedem): Make this an error when the auto-heal
+411         # compatibility code in the resource tracker is removed.
+412         LOG.warning('No instance allocations found for source node '
+413                     '%(source)s in Placement. Not creating allocations '
+414                     'for destination node %(dest)s and assuming the '
+415                     'compute service will heal the allocations.',
+416                     {'source': source_node.uuid, 'dest': dest_node.uuid},
+417                     instance=instance)
+418 
+419 
+420 def set_vm_state_and_notify(context, instance_uuid, service, method, updates,
+421                             ex, request_spec):
+422     """Updates the instance, sets the fault and sends an error notification.
+423 
+424     :param context: The request context.
+425     :param instance_uuid: The UUID of the instance to update.
+426     :param service: The name of the originating service, e.g. 'compute_task'.
+427         This becomes part of the publisher_id for the notification payload.
+428     :param method: The method that failed, e.g. 'migrate_server'.
+429     :param updates: dict of updates for the instance object, typically a
+430         vm_state and/or task_state value.
+431     :param ex: An exception which occurred during the given method.
+432     :param request_spec: Optional request spec.
+433     """
+434     # e.g. "Failed to compute_task_migrate_server: No valid host was found"
+435     LOG.warning("Failed to %(service)s_%(method)s: %(ex)s",
+436                 {'service': service, 'method': method, 'ex': ex})
+437 
+438     # Convert the request spec to a dict if needed.
+439     if request_spec is not None:
+440         if isinstance(request_spec, objects.RequestSpec):
+441             request_spec = request_spec.to_legacy_request_spec_dict()
+442     else:
+443         request_spec = {}
+444 
+445     vm_state = updates['vm_state']
+446     properties = request_spec.get('instance_properties', {})
+447     notifier = rpc.get_notifier(service)
+448     state = vm_state.upper()
+449     LOG.warning('Setting instance to %s state.', state,
+450                 instance_uuid=instance_uuid)
+451 
+452     instance = objects.Instance(context=context, uuid=instance_uuid,
+453                                 **updates)
+454     instance.obj_reset_changes(['uuid'])
+455     instance.save()
+456     compute_utils.add_instance_fault_from_exc(
+457         context, instance, ex, sys.exc_info())
+458 
+459     payload = dict(request_spec=request_spec,
+460                    instance_properties=properties,
+461                    instance_id=instance_uuid,
+462                    state=vm_state,
+463                    method=method,
+464                    reason=ex)
+465 
+466     event_type = '%s.%s' % (service, method)
+467     # TODO(mriedem): Send a versioned notification.
+468     notifier.error(context, event_type, payload)
+469 
+470 
+471 def build_filter_properties(scheduler_hints, forced_host,
+472         forced_node, instance_type):
+473     """Build the filter_properties dict from data in the boot request."""
+474     filter_properties = dict(scheduler_hints=scheduler_hints)
+475     filter_properties['instance_type'] = instance_type
+476     # TODO(alaski): It doesn't seem necessary that these are conditionally
+477     # added.  Let's just add empty lists if not forced_host/node.
+478     if forced_host:
+479         filter_properties['force_hosts'] = [forced_host]
+480     if forced_node:
+481         filter_properties['force_nodes'] = [forced_node]
+482     return filter_properties
+483 
+484 
+485 def populate_filter_properties(filter_properties, selection):
+486     """Add additional information to the filter properties after a node has
+487     been selected by the scheduling process.
+488     """
+489     if isinstance(selection, dict):
+490         # TODO(edleafe): remove support for dicts
+491         host = selection['host']
+492         nodename = selection['nodename']
+493         limits = selection['limits']
+494     else:
+495         host = selection.service_host
+496         nodename = selection.nodename
+497         # Need to convert SchedulerLimits object to older dict format.
+498         if "limits" in selection and selection.limits is not None:
+499             limits = selection.limits.to_dict()
+500         else:
+501             limits = {}
+502     # Adds a retry entry for the selected compute host and node:
+503     _add_retry_host(filter_properties, host, nodename)
+504 
+505     # Adds oversubscription policy
+506     if not filter_properties.get('force_hosts'):
+507         filter_properties['limits'] = limits
+508 
+509 
+510 def populate_retry(filter_properties, instance_uuid):
+511     max_attempts = CONF.scheduler.max_attempts
+512     force_hosts = filter_properties.get('force_hosts', [])
+513     force_nodes = filter_properties.get('force_nodes', [])
+514 
+515     # In the case of multiple force hosts/nodes, scheduler should not
+516     # disable retry filter but traverse all force hosts/nodes one by
+517     # one till scheduler gets a valid target host.
+518     if (max_attempts == 1 or len(force_hosts) == 1
+519                            or len(force_nodes) == 1):
+520         # re-scheduling is disabled.
+521         return
+522 
+523     # retry is enabled, update attempt count:
+524     retry = filter_properties.setdefault(
+525         'retry', {
+526             'num_attempts': 0,
+527             'hosts': []  # list of compute hosts tried
+528     })
+529     retry['num_attempts'] += 1
+530 
+531     _log_compute_error(instance_uuid, retry)
+532     exc_reason = retry.pop('exc_reason', None)
+533 
+534     if retry['num_attempts'] > max_attempts:
+535         msg = (_('Exceeded max scheduling attempts %(max_attempts)d '
+536                  'for instance %(instance_uuid)s. '
+537                  'Last exception: %(exc_reason)s')
+538                % {'max_attempts': max_attempts,
+539                   'instance_uuid': instance_uuid,
+540                   'exc_reason': exc_reason})
+541         raise exception.MaxRetriesExceeded(reason=msg)
+542 
+543 
+544 def _log_compute_error(instance_uuid, retry):
+545     """If the request contained an exception from a previous compute
+546     build/resize operation, log it to aid debugging
+547     """
+548     exc = retry.get('exc')  # string-ified exception from compute
+549     if not exc:
+550         return  # no exception info from a previous attempt, skip
+551 
+552     hosts = retry.get('hosts', None)
+553     if not hosts:
+554         return  # no previously attempted hosts, skip
+555 
+556     last_host, last_node = hosts[-1]
+557     LOG.error(_LE('Error from last host: %(last_host)s (node %(last_node)s):'
+558                   ' %(exc)s'),
+559               {'last_host': last_host,
+560                'last_node': last_node,
+561                'exc': exc},
+562               instance_uuid=instance_uuid)
+563 
+564 
+565 def _add_retry_host(filter_properties, host, node):
+566     """Add a retry entry for the selected compute node. In the event that
+567     the request gets re-scheduled, this entry will signal that the given
+568     node has already been tried.
+569     """
+570     retry = filter_properties.get('retry', None)
+571     if not retry:
+572         return
+573     hosts = retry['hosts']
+574     hosts.append([host, node])
+575 
+576 
+577 def parse_options(opts, sep='=', converter=str, name=""):
+578     """Parse a list of options, each in the format of <key><sep><value>. Also
+579     use the converter to convert the value into desired type.
+580 
+581     :params opts: list of options, e.g. from oslo_config.cfg.ListOpt
+582     :params sep: the separator
+583     :params converter: callable object to convert the value, should raise
+584                        ValueError for conversion failure
+585     :params name: name of the option
+586 
+587     :returns: a lists of tuple of values (key, converted_value)
+588     """
+589     good = []
+590     bad = []
+591     for opt in opts:
+592         try:
+593             key, seen_sep, value = opt.partition(sep)
+594             value = converter(value)
+595         except ValueError:
+596             key = None
+597             value = None
+598         if key and seen_sep and value is not None:
+599             good.append((key, value))
+600         else:
+601             bad.append(opt)
+602     if bad:
+603         LOG.warning(_LW("Ignoring the invalid elements of the option "
+604                         "%(name)s: %(options)s"),
+605                     {'name': name,
+606                      'options': ", ".join(bad)})
+607     return good
+608 
+609 
+610 def validate_filter(filter):
+611     """Validates that the filter is configured in the default filters."""
+612     return filter in CONF.filter_scheduler.enabled_filters
+613 
+614 
+615 def validate_weigher(weigher):
+616     """Validates that the weigher is configured in the default weighers."""
+617     weight_classes = CONF.filter_scheduler.weight_classes
+618     if 'nova.scheduler.weights.all_weighers' in weight_classes:
+619         return True
+620     return weigher in weight_classes
+621 
+622 
+623 _SUPPORTS_AFFINITY = None
+624 _SUPPORTS_ANTI_AFFINITY = None
+625 _SUPPORTS_SOFT_AFFINITY = None
+626 _SUPPORTS_SOFT_ANTI_AFFINITY = None
+627 
+628 
+629 def _get_group_details(context, instance_uuid, user_group_hosts=None):
+630     """Provide group_hosts and group_policies sets related to instances if
+631     those instances are belonging to a group and if corresponding filters are
+632     enabled.
+633 
+634     :param instance_uuid: UUID of the instance to check
+635     :param user_group_hosts: Hosts from the group or empty set
+636 
+637     :returns: None or namedtuple GroupDetails
+638     """
+639     global _SUPPORTS_AFFINITY
+640     if _SUPPORTS_AFFINITY is None:
+641         _SUPPORTS_AFFINITY = validate_filter(
+642             'ServerGroupAffinityFilter')
+643     global _SUPPORTS_ANTI_AFFINITY
+644     if _SUPPORTS_ANTI_AFFINITY is None:
+645         _SUPPORTS_ANTI_AFFINITY = validate_filter(
+646             'ServerGroupAntiAffinityFilter')
+647     global _SUPPORTS_SOFT_AFFINITY
+648     if _SUPPORTS_SOFT_AFFINITY is None:
+649         _SUPPORTS_SOFT_AFFINITY = validate_weigher(
+650             'nova.scheduler.weights.affinity.ServerGroupSoftAffinityWeigher')
+651     global _SUPPORTS_SOFT_ANTI_AFFINITY
+652     if _SUPPORTS_SOFT_ANTI_AFFINITY is None:
+653         _SUPPORTS_SOFT_ANTI_AFFINITY = validate_weigher(
+654             'nova.scheduler.weights.affinity.'
+655             'ServerGroupSoftAntiAffinityWeigher')
+656 
+657     if not instance_uuid:
+658         return
+659 
+660     try:
+661         group = objects.InstanceGroup.get_by_instance_uuid(context,
+662                                                            instance_uuid)
+663     except exception.InstanceGroupNotFound:
+664         return
+665 
+666     policies = set(('anti-affinity', 'affinity', 'soft-affinity',
+667                     'soft-anti-affinity'))
+668     if any((policy in policies) for policy in group.policies):
+669         if not _SUPPORTS_AFFINITY and 'affinity' in group.policies:
+670             msg = _("ServerGroupAffinityFilter not configured")
+671             LOG.error(msg)
+672             raise exception.UnsupportedPolicyException(reason=msg)
+673         if not _SUPPORTS_ANTI_AFFINITY and 'anti-affinity' in group.policies:
+674             msg = _("ServerGroupAntiAffinityFilter not configured")
+675             LOG.error(msg)
+676             raise exception.UnsupportedPolicyException(reason=msg)
+677         if (not _SUPPORTS_SOFT_AFFINITY
+678                 and 'soft-affinity' in group.policies):
+679             msg = _("ServerGroupSoftAffinityWeigher not configured")
+680             LOG.error(msg)
+681             raise exception.UnsupportedPolicyException(reason=msg)
+682         if (not _SUPPORTS_SOFT_ANTI_AFFINITY
+683                 and 'soft-anti-affinity' in group.policies):
+684             msg = _("ServerGroupSoftAntiAffinityWeigher not configured")
+685             LOG.error(msg)
+686             raise exception.UnsupportedPolicyException(reason=msg)
+687         # NOTE(melwitt): If the context is already targeted to a cell (during a
+688         # move operation), we don't need to scatter-gather.
+689         if context.db_connection:
+690             # We don't need to target the group object's context because it was
+691             # retrieved with the targeted context earlier in this method.
+692             group_hosts = set(group.get_hosts())
+693         else:
+694             group_hosts = set(_get_instance_group_hosts_all_cells(context,
+695                                                                   group))
+696         user_hosts = set(user_group_hosts) if user_group_hosts else set()
+697         return GroupDetails(hosts=user_hosts | group_hosts,
+698                             policies=group.policies, members=group.members)
+699 
+700 
+701 def _get_instance_group_hosts_all_cells(context, instance_group):
+702     def get_hosts_in_cell(cell_context):
+703         cell_instance_group = instance_group.obj_clone()
+704         with cell_instance_group.obj_alternate_context(cell_context):
+705             return cell_instance_group.get_hosts()
+706 
+707     results = nova_context.scatter_gather_skip_cell0(context,
+708                                                      get_hosts_in_cell)
+709     hosts = []
+710     for result in results.values():
+711         if result not in (nova_context.did_not_respond_sentinel,
+712                           nova_context.raised_exception_sentinel):
+713             hosts.extend(result)
+714     return hosts
+715 
+716 
+717 def setup_instance_group(context, request_spec):
+718     """Add group_hosts and group_policies fields to filter_properties dict
+719     based on instance uuids provided in request_spec, if those instances are
+720     belonging to a group.
+721 
+722     :param request_spec: Request spec
+723     """
+724     # NOTE(melwitt): Proactively query for the instance group hosts instead of
+725     # relying on a lazy-load via the 'hosts' field of the InstanceGroup object.
+726     if (request_spec.instance_group and
+727             'hosts' not in request_spec.instance_group):
+728         group = request_spec.instance_group
+729         # If the context is already targeted to a cell (during a move
+730         # operation), we don't need to scatter-gather. We do need to use
+731         # obj_alternate_context here because the RequestSpec is queried at the
+732         # start of a move operation in compute/api, before the context has been
+733         # targeted.
+734         if context.db_connection:
+735             with group.obj_alternate_context(context):
+736                 group.hosts = group.get_hosts()
+737         else:
+738             group.hosts = _get_instance_group_hosts_all_cells(context, group)
+739 
+740     if request_spec.instance_group and request_spec.instance_group.hosts:
+741         group_hosts = request_spec.instance_group.hosts
+742     else:
+743         group_hosts = None
+744     instance_uuid = request_spec.instance_uuid
+745     # This queries the group details for the group where the instance is a
+746     # member. The group_hosts passed in are the hosts that contain members of
+747     # the requested instance group.
+748     group_info = _get_group_details(context, instance_uuid, group_hosts)
+749     if group_info is not None:
+750         request_spec.instance_group.hosts = list(group_info.hosts)
+751         request_spec.instance_group.policies = group_info.policies
+752         request_spec.instance_group.members = group_info.members
+753 
+754 
+755 def retry_on_timeout(retries=1):
+756     """Retry the call in case a MessagingTimeout is raised.
+757 
+758     A decorator for retrying calls when a service dies mid-request.
+759 
+760     :param retries: Number of retries
+761     :returns: Decorator
+762     """
+763     def outer(func):
+764         @functools.wraps(func)
+765         def wrapped(*args, **kwargs):
+766             attempt = 0
+767             while True:
+768                 try:
+769                     return func(*args, **kwargs)
+770                 except messaging.MessagingTimeout:
+771                     attempt += 1
+772                     if attempt <= retries:
+773                         LOG.warning(_LW(
+774                             "Retrying %(name)s after a MessagingTimeout, "
+775                             "attempt %(attempt)s of %(retries)s."),
+776                                  {'attempt': attempt, 'retries': retries,
+777                                   'name': func.__name__})
+778                     else:
+779                         raise
+780         return wrapped
+781     return outer
+782 
+783 retry_select_destinations = retry_on_timeout(CONF.scheduler.max_attempts - 1)
+784 
+785 
+786 def request_is_rebuild(spec_obj):
+787     """Returns True if request is for a rebuild.
+788 
+789     :param spec_obj: An objects.RequestSpec to examine (or None).
+790     """
+791     if not spec_obj:
+792         return False
+793     if 'scheduler_hints' not in spec_obj:
+794         return False
+795     check_type = spec_obj.scheduler_hints.get('_nova_check_type')
+796     return check_type == ['rebuild']
+797 
+798 
+799 def claim_resources(ctx, client, spec_obj, instance_uuid, alloc_req,
+800         allocation_request_version=None):
+801     """Given an instance UUID (representing the consumer of resources) and the
+802     allocation_request JSON object returned from Placement, attempt to claim
+803     resources for the instance in the placement API. Returns True if the claim
+804     process was successful, False otherwise.
+805 
+806     :param ctx: The RequestContext object
+807     :param client: The scheduler client to use for making the claim call
+808     :param spec_obj: The RequestSpec object - needed to get the project_id
+809     :param instance_uuid: The UUID of the consuming instance
+810     :param alloc_req: The allocation_request received from placement for the
+811                       resources we want to claim against the chosen host. The
+812                       allocation_request satisfies the original request for
+813                       resources and can be supplied as-is (along with the
+814                       project and user ID to the placement API's PUT
+815                       /allocations/{consumer_uuid} call to claim resources for
+816                       the instance
+817     :param allocation_request_version: The microversion used to request the
+818                                        allocations.
+819     """
+820     if request_is_rebuild(spec_obj):
+821         # NOTE(danms): This is a rebuild-only scheduling request, so we should
+822         # not be doing any extra claiming
+823         LOG.debug('Not claiming resources in the placement API for '
+824                   'rebuild-only scheduling of instance %(uuid)s',
+825                   {'uuid': instance_uuid})
+826         return True
+827 
+828     LOG.debug("Attempting to claim resources in the placement API for "
+829               "instance %s", instance_uuid)
+830 
+831     project_id = spec_obj.project_id
+832 
+833     # NOTE(jaypipes): So, the RequestSpec doesn't store the user_id,
+834     # only the project_id, so we need to grab the user information from
+835     # the context. Perhaps we should consider putting the user ID in
+836     # the spec object?
+837     user_id = ctx.user_id
+838 
+839     return client.claim_resources(instance_uuid, alloc_req, project_id,
+840             user_id, allocation_request_version=allocation_request_version)
+841 
+842 
+843 def remove_allocation_from_compute(instance, compute_node_uuid, reportclient,
+844                                    flavor=None):
+845     """Removes the instance allocation from the compute host.
+846 
+847     :param instance: the instance object owning the allocation
+848     :param compute_node_uuid: the UUID of the compute node where the allocation
+849                               needs to be removed
+850     :param reportclient: the SchedulerReportClient instances to be used to
+851                          communicate with Placement
+852     :param flavor: If provided then it is used to calculate the amount of
+853                    resource that needs to be removed. If not provided then
+854                    instance.flavor will be used
+855     :return: True if the removal was successful, False otherwise
+856     """
+857 
+858     if not flavor:
+859         flavor = instance.flavor
+860 
+861     my_resources = resources_from_flavor(instance, flavor)
+862     return reportclient.remove_provider_from_instance_allocation(
+863         instance.uuid, compute_node_uuid, instance.user_id,
+864         instance.project_id, my_resources)

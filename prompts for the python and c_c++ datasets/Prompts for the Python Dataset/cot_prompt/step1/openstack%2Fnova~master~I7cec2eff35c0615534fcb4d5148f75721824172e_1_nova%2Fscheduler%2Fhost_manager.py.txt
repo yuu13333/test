@@ -1,0 +1,845 @@
+Based on the given code from a commit, please generate supplementary code files according to the commit message.
+####commit message
+WIP: Handle new hosts for updating instance info in scheduler
+
+As of change 791cf0643401f72ce834e580938057e325945169 we have
+to go through host and cell mappings to get to a cell database
+for host (compute node) and instance information.
+
+When a new compute service starts up it casts to update_instance_info
+and sends an empty list, which triggers the scheduler to try and
+lookup all instances on that host. If the new compute host is not
+yet mapped in a cell, we'll get a HostMappingNotFound error.
+
+We can handle this case in both the HostManager and ComputeManager
+by not casting from the compute if there is no information to send,
+and we can also handle it in the HostManager (for older computes)
+but just dealing with the HostMappingNotFound gracefully.
+
+This information eventually self-heals via normal operation.
+
+Change-Id: I7cec2eff35c0615534fcb4d5148f75721824172e
+Closes-Bug: #1680661
+
+####code 
+1 # Copyright (c) 2011 OpenStack Foundation
+2 # All Rights Reserved.
+3 #
+4 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
+5 #    not use this file except in compliance with the License. You may obtain
+6 #    a copy of the License at
+7 #
+8 #         http://www.apache.org/licenses/LICENSE-2.0
+9 #
+10 #    Unless required by applicable law or agreed to in writing, software
+11 #    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+12 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+13 #    License for the specific language governing permissions and limitations
+14 #    under the License.
+15 
+16 """
+17 Manage hosts in the current zone.
+18 """
+19 
+20 import collections
+21 import functools
+22 import time
+23 try:
+24     from collections import UserDict as IterableUserDict   # Python 3
+25 except ImportError:
+26     from UserDict import IterableUserDict                  # Python 2
+27 
+28 
+29 import iso8601
+30 from oslo_log import log as logging
+31 from oslo_utils import timeutils
+32 import six
+33 
+34 import nova.conf
+35 from nova import context as context_module
+36 from nova import exception
+37 from nova.i18n import _LI, _LW
+38 from nova import objects
+39 from nova.pci import stats as pci_stats
+40 from nova.scheduler import filters
+41 from nova.scheduler import weights
+42 from nova import utils
+43 from nova.virt import hardware
+44 
+45 
+46 CONF = nova.conf.CONF
+47 
+48 LOG = logging.getLogger(__name__)
+49 HOST_INSTANCE_SEMAPHORE = "host_instance"
+50 
+51 
+52 class ReadOnlyDict(IterableUserDict):
+53     """A read-only dict."""
+54     def __init__(self, source=None):
+55         self.data = {}
+56         if source:
+57             self.data.update(source)
+58 
+59     def __setitem__(self, key, item):
+60         raise TypeError()
+61 
+62     def __delitem__(self, key):
+63         raise TypeError()
+64 
+65     def clear(self):
+66         raise TypeError()
+67 
+68     def pop(self, key, *args):
+69         raise TypeError()
+70 
+71     def popitem(self):
+72         raise TypeError()
+73 
+74     def update(self):
+75         raise TypeError()
+76 
+77 
+78 @utils.expects_func_args('self', 'spec_obj')
+79 def set_update_time_on_success(function):
+80     """Set updated time of HostState when consuming succeed."""
+81 
+82     @functools.wraps(function)
+83     def decorated_function(self, spec_obj):
+84         return_value = None
+85         try:
+86             return_value = function(self, spec_obj)
+87         except Exception as e:
+88             # Ignores exception raised from consume_from_request() so that
+89             # booting instance would fail in the resource claim of compute
+90             # node, other suitable node may be chosen during scheduling retry.
+91             LOG.warning(_LW("Selected host: %(host)s failed to consume from "
+92                             "instance. Error: %(error)s"),
+93                         {'host': self.host, 'error': e})
+94         else:
+95             now = timeutils.utcnow()
+96             # NOTE(sbauza): Objects are UTC tz-aware by default
+97             self.updated = now.replace(tzinfo=iso8601.iso8601.Utc())
+98         return return_value
+99 
+100     return decorated_function
+101 
+102 
+103 class HostState(object):
+104     """Mutable and immutable information tracked for a host.
+105     This is an attempt to remove the ad-hoc data structures
+106     previously used and lock down access.
+107     """
+108 
+109     def __init__(self, host, node, cell_uuid):
+110         self.host = host
+111         self.nodename = node
+112         self._lock_name = (host, node)
+113 
+114         # Mutable available resources.
+115         # These will change as resources are virtually "consumed".
+116         self.total_usable_ram_mb = 0
+117         self.total_usable_disk_gb = 0
+118         self.disk_mb_used = 0
+119         self.free_ram_mb = 0
+120         self.free_disk_mb = 0
+121         self.vcpus_total = 0
+122         self.vcpus_used = 0
+123         self.pci_stats = None
+124         self.numa_topology = None
+125 
+126         # Additional host information from the compute node stats:
+127         self.num_instances = 0
+128         self.num_io_ops = 0
+129 
+130         # Other information
+131         self.host_ip = None
+132         self.hypervisor_type = None
+133         self.hypervisor_version = None
+134         self.hypervisor_hostname = None
+135         self.cpu_info = None
+136         self.supported_instances = None
+137 
+138         # Resource oversubscription values for the compute host:
+139         self.limits = {}
+140 
+141         # Generic metrics from compute nodes
+142         self.metrics = None
+143 
+144         # List of aggregates the host belongs to
+145         self.aggregates = []
+146 
+147         # Instances on this host
+148         self.instances = {}
+149 
+150         # Allocation ratios for this host
+151         self.ram_allocation_ratio = None
+152         self.cpu_allocation_ratio = None
+153         self.disk_allocation_ratio = None
+154 
+155         # Host cell (v2) membership
+156         self.cell_uuid = cell_uuid
+157 
+158         self.updated = None
+159 
+160     def update(self, compute=None, service=None, aggregates=None,
+161             inst_dict=None):
+162         """Update all information about a host."""
+163 
+164         @utils.synchronized(self._lock_name)
+165         def _locked_update(self, compute, service, aggregates, inst_dict):
+166             # Scheduler API is inherently multi-threaded as every incoming RPC
+167             # message will be dispatched in it's own green thread. So the
+168             # shared host state should be updated in a consistent way to make
+169             # sure its data is valid under concurrent write operations.
+170             if compute is not None:
+171                 LOG.debug("Update host state from compute node: %s", compute)
+172                 self._update_from_compute_node(compute)
+173             if aggregates is not None:
+174                 LOG.debug("Update host state with aggregates: %s", aggregates)
+175                 self.aggregates = aggregates
+176             if service is not None:
+177                 LOG.debug("Update host state with service dict: %s", service)
+178                 self.service = ReadOnlyDict(service)
+179             if inst_dict is not None:
+180                 LOG.debug("Update host state with instances: %s", inst_dict)
+181                 self.instances = inst_dict
+182 
+183         return _locked_update(self, compute, service, aggregates, inst_dict)
+184 
+185     def _update_from_compute_node(self, compute):
+186         """Update information about a host from a ComputeNode object."""
+187         # NOTE(jichenjc): if the compute record is just created but not updated
+188         # some field such as free_disk_gb can be None
+189         if 'free_disk_gb' not in compute or compute.free_disk_gb is None:
+190             LOG.debug('Ignoring compute node %s as its usage has not been '
+191                       'updated yet.', compute.uuid)
+192             return
+193 
+194         if (self.updated and compute.updated_at
+195                 and self.updated > compute.updated_at):
+196             return
+197         all_ram_mb = compute.memory_mb
+198 
+199         # Assume virtual size is all consumed by instances if use qcow2 disk.
+200         free_gb = compute.free_disk_gb
+201         least_gb = compute.disk_available_least
+202         if least_gb is not None:
+203             if least_gb > free_gb:
+204                 # can occur when an instance in database is not on host
+205                 LOG.warning(_LW("Host %(hostname)s has more disk space than "
+206                                 "database expected "
+207                                 "(%(physical)s GB > %(database)s GB)"),
+208                             {'physical': least_gb, 'database': free_gb,
+209                              'hostname': compute.hypervisor_hostname})
+210             free_gb = min(least_gb, free_gb)
+211         free_disk_mb = free_gb * 1024
+212 
+213         self.disk_mb_used = compute.local_gb_used * 1024
+214 
+215         # NOTE(jogo) free_ram_mb can be negative
+216         self.free_ram_mb = compute.free_ram_mb
+217         self.total_usable_ram_mb = all_ram_mb
+218         self.total_usable_disk_gb = compute.local_gb
+219         self.free_disk_mb = free_disk_mb
+220         self.vcpus_total = compute.vcpus
+221         self.vcpus_used = compute.vcpus_used
+222         self.updated = compute.updated_at
+223         self.numa_topology = compute.numa_topology
+224         self.pci_stats = pci_stats.PciDeviceStats(
+225             compute.pci_device_pools)
+226 
+227         # All virt drivers report host_ip
+228         self.host_ip = compute.host_ip
+229         self.hypervisor_type = compute.hypervisor_type
+230         self.hypervisor_version = compute.hypervisor_version
+231         self.hypervisor_hostname = compute.hypervisor_hostname
+232         self.cpu_info = compute.cpu_info
+233         if compute.supported_hv_specs:
+234             self.supported_instances = [spec.to_list() for spec
+235                                         in compute.supported_hv_specs]
+236         else:
+237             self.supported_instances = []
+238 
+239         # Don't store stats directly in host_state to make sure these don't
+240         # overwrite any values, or get overwritten themselves. Store in self so
+241         # filters can schedule with them.
+242         self.stats = compute.stats or {}
+243 
+244         # Track number of instances on host
+245         self.num_instances = int(self.stats.get('num_instances', 0))
+246 
+247         self.num_io_ops = int(self.stats.get('io_workload', 0))
+248 
+249         # update metrics
+250         self.metrics = objects.MonitorMetricList.from_json(compute.metrics)
+251 
+252         # update allocation ratios given by the ComputeNode object
+253         self.cpu_allocation_ratio = compute.cpu_allocation_ratio
+254         self.ram_allocation_ratio = compute.ram_allocation_ratio
+255         self.disk_allocation_ratio = compute.disk_allocation_ratio
+256 
+257     def consume_from_request(self, spec_obj):
+258         """Incrementally update host state from a RequestSpec object."""
+259 
+260         @utils.synchronized(self._lock_name)
+261         @set_update_time_on_success
+262         def _locked(self, spec_obj):
+263             # Scheduler API is inherently multi-threaded as every incoming RPC
+264             # message will be dispatched in it's own green thread. So the
+265             # shared host state should be consumed in a consistent way to make
+266             # sure its data is valid under concurrent write operations.
+267             self._locked_consume_from_request(spec_obj)
+268 
+269         return _locked(self, spec_obj)
+270 
+271     def _locked_consume_from_request(self, spec_obj):
+272         disk_mb = (spec_obj.root_gb +
+273                    spec_obj.ephemeral_gb) * 1024
+274         ram_mb = spec_obj.memory_mb
+275         vcpus = spec_obj.vcpus
+276         self.free_ram_mb -= ram_mb
+277         self.free_disk_mb -= disk_mb
+278         self.vcpus_used += vcpus
+279 
+280         # Track number of instances on host
+281         self.num_instances += 1
+282 
+283         pci_requests = spec_obj.pci_requests
+284         if pci_requests and self.pci_stats:
+285             pci_requests = pci_requests.requests
+286         else:
+287             pci_requests = None
+288 
+289         # Calculate the numa usage
+290         host_numa_topology, _fmt = hardware.host_topology_and_format_from_host(
+291                                 self)
+292         instance_numa_topology = spec_obj.numa_topology
+293 
+294         spec_obj.numa_topology = hardware.numa_fit_instance_to_host(
+295             host_numa_topology, instance_numa_topology,
+296             limits=self.limits.get('numa_topology'),
+297             pci_requests=pci_requests, pci_stats=self.pci_stats)
+298         if pci_requests:
+299             instance_cells = None
+300             if spec_obj.numa_topology:
+301                 instance_cells = spec_obj.numa_topology.cells
+302             self.pci_stats.apply_requests(pci_requests, instance_cells)
+303 
+304         # NOTE(sbauza): Yeah, that's crap. We should get rid of all of those
+305         # NUMA helpers because now we're 100% sure that spec_obj.numa_topology
+306         # is an InstanceNUMATopology object. Unfortunately, since
+307         # HostState.host_numa_topology is still limbo between an NUMATopology
+308         # object (when updated by consume_from_request), a ComputeNode object
+309         # (when updated by update_from_compute_node), we need to keep the call
+310         # to get_host_numa_usage_from_instance until it's fixed (and use a
+311         # temporary orphaned Instance object as a proxy)
+312         instance = objects.Instance(numa_topology=spec_obj.numa_topology)
+313 
+314         self.numa_topology = hardware.get_host_numa_usage_from_instance(
+315                 self, instance)
+316 
+317         # NOTE(sbauza): By considering all cases when the scheduler is called
+318         # and when consume_from_request() is run, we can safely say that there
+319         # is always an IO operation because we want to move the instance
+320         self.num_io_ops += 1
+321 
+322     def __repr__(self):
+323         return ("(%(host)s, %(node)s) ram: %(free_ram)sMB "
+324                 "disk: %(free_disk)sMB io_ops: %(num_io_ops)s "
+325                 "instances: %(num_instances)s" %
+326                 {'host': self.host, 'node': self.nodename,
+327                  'free_ram': self.free_ram_mb, 'free_disk': self.free_disk_mb,
+328                  'num_io_ops': self.num_io_ops,
+329                  'num_instances': self.num_instances})
+330 
+331 
+332 class HostManager(object):
+333     """Base HostManager class."""
+334 
+335     # Can be overridden in a subclass
+336     def host_state_cls(self, host, node, cell, **kwargs):
+337         return HostState(host, node, cell)
+338 
+339     def __init__(self):
+340         self.cells = None
+341         self.host_state_map = {}
+342         self.filter_handler = filters.HostFilterHandler()
+343         filter_classes = self.filter_handler.get_matching_classes(
+344                 CONF.filter_scheduler.available_filters)
+345         self.filter_cls_map = {cls.__name__: cls for cls in filter_classes}
+346         self.filter_obj_map = {}
+347         self.enabled_filters = self._choose_host_filters(self._load_filters())
+348         self.weight_handler = weights.HostWeightHandler()
+349         weigher_classes = self.weight_handler.get_matching_classes(
+350                 CONF.filter_scheduler.weight_classes)
+351         self.weighers = [cls() for cls in weigher_classes]
+352         # Dict of aggregates keyed by their ID
+353         self.aggs_by_id = {}
+354         # Dict of set of aggregate IDs keyed by the name of the host belonging
+355         # to those aggregates
+356         self.host_aggregates_map = collections.defaultdict(set)
+357         self._init_aggregates()
+358         self.track_instance_changes = (
+359                 CONF.filter_scheduler.track_instance_changes)
+360         # Dict of instances and status, keyed by host
+361         self._instance_info = {}
+362         if self.track_instance_changes:
+363             self._init_instance_info()
+364 
+365     def _load_filters(self):
+366         return CONF.filter_scheduler.enabled_filters
+367 
+368     def _init_aggregates(self):
+369         elevated = context_module.get_admin_context()
+370         aggs = objects.AggregateList.get_all(elevated)
+371         for agg in aggs:
+372             self.aggs_by_id[agg.id] = agg
+373             for host in agg.hosts:
+374                 self.host_aggregates_map[host].add(agg.id)
+375 
+376     def update_aggregates(self, aggregates):
+377         """Updates internal HostManager information about aggregates."""
+378         if isinstance(aggregates, (list, objects.AggregateList)):
+379             for agg in aggregates:
+380                 self._update_aggregate(agg)
+381         else:
+382             self._update_aggregate(aggregates)
+383 
+384     def _update_aggregate(self, aggregate):
+385         self.aggs_by_id[aggregate.id] = aggregate
+386         for host in aggregate.hosts:
+387             self.host_aggregates_map[host].add(aggregate.id)
+388         # Refreshing the mapping dict to remove all hosts that are no longer
+389         # part of the aggregate
+390         for host in self.host_aggregates_map:
+391             if (aggregate.id in self.host_aggregates_map[host]
+392                     and host not in aggregate.hosts):
+393                 self.host_aggregates_map[host].remove(aggregate.id)
+394 
+395     def delete_aggregate(self, aggregate):
+396         """Deletes internal HostManager information about a specific aggregate.
+397         """
+398         if aggregate.id in self.aggs_by_id:
+399             del self.aggs_by_id[aggregate.id]
+400         for host in self.host_aggregates_map:
+401             if aggregate.id in self.host_aggregates_map[host]:
+402                 self.host_aggregates_map[host].remove(aggregate.id)
+403 
+404     def _init_instance_info(self, computes_by_cell=None):
+405         """Creates the initial view of instances for all hosts.
+406 
+407         As this initial population of instance information may take some time,
+408         we don't wish to block the scheduler's startup while this completes.
+409         The async method allows us to simply mock out the _init_instance_info()
+410         method in tests.
+411 
+412         :param compute_nodes: a list of nodes to populate instances info for
+413         if is None, compute_nodes will be looked up in database
+414         """
+415 
+416         def _async_init_instance_info(computes_by_cell):
+417             context = context_module.RequestContext()
+418             self._load_cells(context)
+419             LOG.debug("START:_async_init_instance_info")
+420             self._instance_info = {}
+421 
+422             count = 0
+423             if not computes_by_cell:
+424                 computes_by_cell = {}
+425                 for cell in self.cells:
+426                     with context_module.target_cell(context, cell):
+427                         cell_cns = objects.ComputeNodeList.get_all(
+428                             context).objects
+429                         computes_by_cell[cell] = cell_cns
+430                         count += len(cell_cns)
+431 
+432             LOG.debug("Total number of compute nodes: %s", count)
+433 
+434             for cell, compute_nodes in computes_by_cell.items():
+435                 # Break the queries into batches of 10 to reduce the total
+436                 # number of calls to the DB.
+437                 batch_size = 10
+438                 start_node = 0
+439                 end_node = batch_size
+440                 while start_node <= len(compute_nodes):
+441                     curr_nodes = compute_nodes[start_node:end_node]
+442                     start_node += batch_size
+443                     end_node += batch_size
+444                     filters = {"host": [curr_node.host
+445                                         for curr_node in curr_nodes],
+446                                "deleted": False}
+447                     with context_module.target_cell(context, cell):
+448                         result = objects.InstanceList.get_by_filters(
+449                             context.elevated(), filters)
+450                     instances = result.objects
+451                     LOG.debug("Adding %s instances for hosts %s-%s",
+452                               len(instances), start_node, end_node)
+453                     for instance in instances:
+454                         host = instance.host
+455                         if host not in self._instance_info:
+456                             self._instance_info[host] = {"instances": {},
+457                                                          "updated": False}
+458                         inst_dict = self._instance_info[host]
+459                         inst_dict["instances"][instance.uuid] = instance
+460                     # Call sleep() to cooperatively yield
+461                     time.sleep(0)
+462                 LOG.debug("END:_async_init_instance_info")
+463 
+464         # Run this async so that we don't block the scheduler start-up
+465         utils.spawn_n(_async_init_instance_info, computes_by_cell)
+466 
+467     def _choose_host_filters(self, filter_cls_names):
+468         """Since the caller may specify which filters to use we need
+469         to have an authoritative list of what is permissible. This
+470         function checks the filter names against a predefined set
+471         of acceptable filters.
+472         """
+473         if not isinstance(filter_cls_names, (list, tuple)):
+474             filter_cls_names = [filter_cls_names]
+475 
+476         good_filters = []
+477         bad_filters = []
+478         for filter_name in filter_cls_names:
+479             if filter_name not in self.filter_obj_map:
+480                 if filter_name not in self.filter_cls_map:
+481                     bad_filters.append(filter_name)
+482                     continue
+483                 filter_cls = self.filter_cls_map[filter_name]
+484                 self.filter_obj_map[filter_name] = filter_cls()
+485             good_filters.append(self.filter_obj_map[filter_name])
+486         if bad_filters:
+487             msg = ", ".join(bad_filters)
+488             raise exception.SchedulerHostFilterNotFound(filter_name=msg)
+489         return good_filters
+490 
+491     def get_filtered_hosts(self, hosts, spec_obj, index=0):
+492         """Filter hosts and return only ones passing all filters."""
+493 
+494         def _strip_ignore_hosts(host_map, hosts_to_ignore):
+495             ignored_hosts = []
+496             for host in hosts_to_ignore:
+497                 for (hostname, nodename) in list(host_map.keys()):
+498                     if host.lower() == hostname.lower():
+499                         del host_map[(hostname, nodename)]
+500                         ignored_hosts.append(host)
+501             ignored_hosts_str = ', '.join(ignored_hosts)
+502             LOG.info(_LI('Host filter ignoring hosts: %s'), ignored_hosts_str)
+503 
+504         def _match_forced_hosts(host_map, hosts_to_force):
+505             forced_hosts = []
+506             lowered_hosts_to_force = [host.lower() for host in hosts_to_force]
+507             for (hostname, nodename) in list(host_map.keys()):
+508                 if hostname.lower() not in lowered_hosts_to_force:
+509                     del host_map[(hostname, nodename)]
+510                 else:
+511                     forced_hosts.append(hostname)
+512             if host_map:
+513                 forced_hosts_str = ', '.join(forced_hosts)
+514                 msg = _LI('Host filter forcing available hosts to %s')
+515             else:
+516                 forced_hosts_str = ', '.join(hosts_to_force)
+517                 msg = _LI("No hosts matched due to not matching "
+518                           "'force_hosts' value of '%s'")
+519             LOG.info(msg, forced_hosts_str)
+520 
+521         def _match_forced_nodes(host_map, nodes_to_force):
+522             forced_nodes = []
+523             for (hostname, nodename) in list(host_map.keys()):
+524                 if nodename not in nodes_to_force:
+525                     del host_map[(hostname, nodename)]
+526                 else:
+527                     forced_nodes.append(nodename)
+528             if host_map:
+529                 forced_nodes_str = ', '.join(forced_nodes)
+530                 msg = _LI('Host filter forcing available nodes to %s')
+531             else:
+532                 forced_nodes_str = ', '.join(nodes_to_force)
+533                 msg = _LI("No nodes matched due to not matching "
+534                           "'force_nodes' value of '%s'")
+535             LOG.info(msg, forced_nodes_str)
+536 
+537         def _get_hosts_matching_request(hosts, requested_destination):
+538             (host, node) = (requested_destination.host,
+539                             requested_destination.node)
+540             requested_nodes = [x for x in hosts
+541                                if x.host == host and x.nodename == node]
+542             if requested_nodes:
+543                 LOG.info(_LI('Host filter only checking host %(host)s and '
+544                              'node %(node)s'), {'host': host, 'node': node})
+545             else:
+546                 # NOTE(sbauza): The API level should prevent the user from
+547                 # providing a wrong destination but let's make sure a wrong
+548                 # destination doesn't trample the scheduler still.
+549                 LOG.info(_LI('No hosts matched due to not matching requested '
+550                              'destination (%(host)s, %(node)s)'),
+551                          {'host': host, 'node': node})
+552             return iter(requested_nodes)
+553 
+554         ignore_hosts = spec_obj.ignore_hosts or []
+555         force_hosts = spec_obj.force_hosts or []
+556         force_nodes = spec_obj.force_nodes or []
+557         requested_node = spec_obj.requested_destination
+558 
+559         if requested_node is not None and 'host' in requested_node:
+560             # NOTE(sbauza): Reduce a potentially long set of hosts as much as
+561             # possible to any requested destination nodes before passing the
+562             # list to the filters
+563             hosts = _get_hosts_matching_request(hosts, requested_node)
+564         if ignore_hosts or force_hosts or force_nodes:
+565             # NOTE(deva): we can't assume "host" is unique because
+566             #             one host may have many nodes.
+567             name_to_cls_map = {(x.host, x.nodename): x for x in hosts}
+568             if ignore_hosts:
+569                 _strip_ignore_hosts(name_to_cls_map, ignore_hosts)
+570                 if not name_to_cls_map:
+571                     return []
+572             # NOTE(deva): allow force_hosts and force_nodes independently
+573             if force_hosts:
+574                 _match_forced_hosts(name_to_cls_map, force_hosts)
+575             if force_nodes:
+576                 _match_forced_nodes(name_to_cls_map, force_nodes)
+577             if force_hosts or force_nodes:
+578                 # NOTE(deva): Skip filters when forcing host or node
+579                 if name_to_cls_map:
+580                     return name_to_cls_map.values()
+581                 else:
+582                     return []
+583             hosts = six.itervalues(name_to_cls_map)
+584 
+585         return self.filter_handler.get_filtered_objects(self.enabled_filters,
+586                 hosts, spec_obj, index)
+587 
+588     def get_weighed_hosts(self, hosts, spec_obj):
+589         """Weigh the hosts."""
+590         return self.weight_handler.get_weighed_objects(self.weighers,
+591                 hosts, spec_obj)
+592 
+593     def _get_computes_for_cells(self, context, cells, compute_uuids=None):
+594         """Get a tuple of compute node and service information.
+595 
+596         Returns a tuple (compute_nodes, services) where:
+597          - compute_nodes is cell-uuid keyed dict of compute node lists
+598          - services is a dict of services indexed by hostname
+599         """
+600 
+601         compute_nodes = collections.defaultdict(list)
+602         services = {}
+603         for cell in cells:
+604             LOG.debug('Getting compute nodes and services for cell %(cell)s',
+605                       {'cell': cell.identity})
+606             with context_module.target_cell(context, cell):
+607                 if compute_uuids is None:
+608                     compute_nodes[cell.uuid].extend(
+609                         objects.ComputeNodeList.get_all(
+610                             context))
+611                 else:
+612                     compute_nodes[cell.uuid].extend(
+613                         objects.ComputeNodeList.get_all_by_uuids(
+614                             context, compute_uuids))
+615                 services.update(
+616                     {service.host: service
+617                      for service in objects.ServiceList.get_by_binary(
+618                              context, 'nova-compute',
+619                              include_disabled=True)})
+620         return compute_nodes, services
+621 
+622     def _load_cells(self, context):
+623         if not self.cells:
+624             # NOTE(danms): global list of cells cached forever right now
+625             self.cells = objects.CellMappingList.get_all(context)
+626             LOG.debug('Found %(count)i cells: %(cells)s',
+627                       {'count': len(self.cells),
+628                        'cells': ', '.join([c.uuid for c in self.cells])})
+629 
+630     def get_host_states_by_uuids(self, context, compute_uuids, spec_obj):
+631 
+632         self._load_cells(context)
+633         if (spec_obj and 'requested_destination' in spec_obj and
+634                 spec_obj.requested_destination and
+635                 'cell' in spec_obj.requested_destination):
+636             only_cell = spec_obj.requested_destination.cell
+637         else:
+638             only_cell = None
+639 
+640         if only_cell:
+641             cells = [only_cell]
+642         else:
+643             cells = self.cells
+644 
+645         compute_nodes, services = self._get_computes_for_cells(
+646             context, cells, compute_uuids=compute_uuids)
+647         return self._get_host_states(context, compute_nodes, services)
+648 
+649     def get_all_host_states(self, context):
+650         """Returns a list of HostStates that represents all the hosts
+651         the HostManager knows about. Also, each of the consumable resources
+652         in HostState are pre-populated and adjusted based on data in the db.
+653         """
+654         self._load_cells(context)
+655         compute_nodes, services = self._get_computes_for_cells(context,
+656                                                                self.cells)
+657         return self._get_host_states(context, compute_nodes, services)
+658 
+659     def _get_host_states(self, context, compute_nodes, services):
+660         """Returns a tuple of HostStates given a list of computes.
+661 
+662         Also updates the HostStates internal mapping for the HostManager.
+663         """
+664         # Get resource usage across the available compute nodes:
+665         seen_nodes = set()
+666         for cell_uuid, computes in compute_nodes.items():
+667             for compute in computes:
+668                 service = services.get(compute.host)
+669 
+670                 if not service:
+671                     LOG.warning(_LW(
+672                         "No compute service record found for host %(host)s"),
+673                         {'host': compute.host})
+674                     continue
+675                 host = compute.host
+676                 node = compute.hypervisor_hostname
+677                 state_key = (host, node)
+678                 host_state = self.host_state_map.get(state_key)
+679                 if not host_state:
+680                     host_state = self.host_state_cls(host, node,
+681                                                      cell_uuid,
+682                                                      compute=compute)
+683                     self.host_state_map[state_key] = host_state
+684                 # We force to update the aggregates info each time a
+685                 # new request comes in, because some changes on the
+686                 # aggregates could have been happening after setting
+687                 # this field for the first time
+688                 host_state.update(compute,
+689                                   dict(service),
+690                                   self._get_aggregates_info(host),
+691                                   self._get_instance_info(context, compute))
+692 
+693                 seen_nodes.add(state_key)
+694 
+695         # remove compute nodes from host_state_map if they are not active
+696         dead_nodes = set(self.host_state_map.keys()) - seen_nodes
+697         for state_key in dead_nodes:
+698             host, node = state_key
+699             LOG.info(_LI("Removing dead compute node %(host)s:%(node)s "
+700                          "from scheduler"), {'host': host, 'node': node})
+701             del self.host_state_map[state_key]
+702 
+703         return (self.host_state_map[host] for host in seen_nodes)
+704 
+705     def _get_aggregates_info(self, host):
+706         return [self.aggs_by_id[agg_id] for agg_id in
+707                 self.host_aggregates_map[host]]
+708 
+709     def _get_instances_by_host(self, context, host_name):
+710         try:
+711             hm = objects.HostMapping.get_by_host(context, host_name)
+712         except exception.HostMappingNotFound:
+713             # It's possible to hit this when the compute service first starts
+714             # up and casts to update_instance_info with an empty list but
+715             # before the host is mapped in the API database.
+716             LOG.info('Host mapping not found for host %s. Not tracking '
+717                      'instance info for this host.', host_name)
+718             return {}
+719         with context_module.target_cell(context, hm.cell_mapping):
+720             inst_list = objects.InstanceList.get_by_host(context, host_name)
+721             return {inst.uuid: inst for inst in inst_list}
+722 
+723     def _get_instance_info(self, context, compute):
+724         """Gets the host instance info from the compute host.
+725 
+726         Some older compute nodes may not be sending instance change updates to
+727         the Scheduler; other sites may disable this feature for performance
+728         reasons. In either of these cases, there will either be no information
+729         for the host, or the 'updated' value for that host dict will be False.
+730         In those cases, we need to grab the current InstanceList instead of
+731         relying on the version in _instance_info.
+732         """
+733         host_name = compute.host
+734         host_info = self._instance_info.get(host_name)
+735         if host_info and host_info.get("updated"):
+736             inst_dict = host_info["instances"]
+737         else:
+738             # Host is running old version, or updates aren't flowing.
+739             inst_dict = self._get_instances_by_host(context, host_name)
+740         return inst_dict
+741 
+742     def _recreate_instance_info(self, context, host_name):
+743         """Get the InstanceList for the specified host, and store it in the
+744         _instance_info dict.
+745         """
+746         inst_dict = self._get_instances_by_host(context, host_name)
+747         host_info = self._instance_info[host_name] = {}
+748         host_info["instances"] = inst_dict
+749         host_info["updated"] = False
+750 
+751     @utils.synchronized(HOST_INSTANCE_SEMAPHORE)
+752     def update_instance_info(self, context, host_name, instance_info):
+753         """Receives an InstanceList object from a compute node.
+754 
+755         This method receives information from a compute node when it starts up,
+756         or when its instances have changed, and updates its view of hosts and
+757         instances with it.
+758         """
+759         host_info = self._instance_info.get(host_name)
+760         if host_info:
+761             inst_dict = host_info.get("instances")
+762             for instance in instance_info.objects:
+763                 # Overwrite the entry (if any) with the new info.
+764                 inst_dict[instance.uuid] = instance
+765             host_info["updated"] = True
+766         else:
+767             instances = instance_info.objects
+768             if len(instances) > 1:
+769                 # This is a host sending its full instance list, so use it.
+770                 host_info = self._instance_info[host_name] = {}
+771                 host_info["instances"] = {instance.uuid: instance
+772                                           for instance in instances}
+773                 host_info["updated"] = True
+774             else:
+775                 self._recreate_instance_info(context, host_name)
+776                 LOG.info(_LI("Received an update from an unknown host '%s'. "
+777                              "Re-created its InstanceList."), host_name)
+778 
+779     @utils.synchronized(HOST_INSTANCE_SEMAPHORE)
+780     def delete_instance_info(self, context, host_name, instance_uuid):
+781         """Receives the UUID from a compute node when one of its instances is
+782         terminated.
+783 
+784         The instance in the local view of the host's instances is removed.
+785         """
+786         host_info = self._instance_info.get(host_name)
+787         if host_info:
+788             inst_dict = host_info["instances"]
+789             # Remove the existing Instance object, if any
+790             inst_dict.pop(instance_uuid, None)
+791             host_info["updated"] = True
+792         else:
+793             self._recreate_instance_info(context, host_name)
+794             LOG.info(_LI("Received a delete update from an unknown host '%s'. "
+795                          "Re-created its InstanceList."), host_name)
+796 
+797     @utils.synchronized(HOST_INSTANCE_SEMAPHORE)
+798     def sync_instance_info(self, context, host_name, instance_uuids):
+799         """Receives the uuids of the instances on a host.
+800 
+801         This method is periodically called by the compute nodes, which send a
+802         list of all the UUID values for the instances on that node. This is
+803         used by the scheduler's HostManager to detect when its view of the
+804         compute node's instances is out of sync.
+805         """
+806         host_info = self._instance_info.get(host_name)
+807         if host_info:
+808             local_set = set(host_info["instances"].keys())
+809             compute_set = set(instance_uuids)
+810             if not local_set == compute_set:
+811                 self._recreate_instance_info(context, host_name)
+812                 LOG.info(_LI("The instance sync for host '%s' did not match. "
+813                              "Re-created its InstanceList."), host_name)
+814                 return
+815             host_info["updated"] = True
+816             LOG.info(_LI("Successfully synced instances from host '%s'."),
+817                      host_name)
+818         else:
+819             self._recreate_instance_info(context, host_name)
+820             LOG.info(_LI("Received a sync request from an unknown host '%s'. "
+821                          "Re-created its InstanceList."), host_name)

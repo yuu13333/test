@@ -1,0 +1,3758 @@
+I want you to act as a code reviewer of Nova in OpenStack. Please review the code below to detect security defects. If any are found, please describe the security defect in detail and indicate the corresponding line number of code and solution. If none are found, please state '''No security defects are detected in the code'''.
+
+1 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
+2 #    not use this file except in compliance with the License. You may obtain
+3 #    a copy of the License at
+4 #
+5 #         http://www.apache.org/licenses/LICENSE-2.0
+6 #
+7 #    Unless required by applicable law or agreed to in writing, software
+8 #    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+9 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+10 #    License for the specific language governing permissions and limitations
+11 #    under the License.
+12 
+13 import collections
+14 import copy
+15 import itertools
+16 import random
+17 
+18 # NOTE(cdent): The resource provider objects are designed to never be
+19 # used over RPC. Remote manipulation is done with the placement HTTP
+20 # API. The 'remotable' decorators should not be used, the objects should
+21 # not be registered and there is no need to express VERSIONs nor handle
+22 # obj_make_compatible.
+23 
+24 import os_traits
+25 from oslo_concurrency import lockutils
+26 from oslo_config import cfg
+27 from oslo_db import api as oslo_db_api
+28 from oslo_db import exception as db_exc
+29 from oslo_log import log as logging
+30 from oslo_versionedobjects import base
+31 from oslo_versionedobjects import fields
+32 import six
+33 import sqlalchemy as sa
+34 from sqlalchemy import exc as sqla_exc
+35 from sqlalchemy import func
+36 from sqlalchemy import sql
+37 from sqlalchemy.sql import null
+38 
+39 from nova.api.openstack.placement import exception
+40 from nova.db.sqlalchemy import api as db_api
+41 from nova.db.sqlalchemy import api_models as models
+42 from nova.db.sqlalchemy import resource_class_cache as rc_cache
+43 from nova.i18n import _
+44 from nova import rc_fields
+45 
+46 _TRAIT_TBL = models.Trait.__table__
+47 _ALLOC_TBL = models.Allocation.__table__
+48 _INV_TBL = models.Inventory.__table__
+49 _RP_TBL = models.ResourceProvider.__table__
+50 # Not used in this file but used in tests.
+51 _RC_TBL = models.ResourceClass.__table__
+52 _AGG_TBL = models.PlacementAggregate.__table__
+53 _RP_AGG_TBL = models.ResourceProviderAggregate.__table__
+54 _RP_TRAIT_TBL = models.ResourceProviderTrait.__table__
+55 _PROJECT_TBL = models.Project.__table__
+56 _USER_TBL = models.User.__table__
+57 _CONSUMER_TBL = models.Consumer.__table__
+58 _RC_CACHE = None
+59 _TRAIT_LOCK = 'trait_sync'
+60 _TRAITS_SYNCED = False
+61 
+62 CONF = cfg.CONF
+63 LOG = logging.getLogger(__name__)
+64 
+65 
+66 @db_api.api_context_manager.reader
+67 def _ensure_rc_cache(ctx):
+68     """Ensures that a singleton resource class cache has been created in the
+69     module's scope.
+70 
+71     :param ctx: `nova.context.RequestContext` that may be used to grab a DB
+72                 connection.
+73     """
+74     global _RC_CACHE
+75     if _RC_CACHE is not None:
+76         return
+77     _RC_CACHE = rc_cache.ResourceClassCache(ctx)
+78 
+79 
+80 @oslo_db_api.wrap_db_retry(max_retries=5, retry_on_deadlock=True)
+81 @db_api.api_context_manager.writer
+82 def _trait_sync(ctx):
+83     """Sync the os_traits symbols to the database.
+84 
+85     Reads all symbols from the os_traits library, checks if any of them do
+86     not exist in the database and bulk-inserts those that are not. This is
+87     done once per process using this code if either Trait.get_by_name or
+88     TraitList.get_all is called.
+89 
+90     :param ctx: `nova.context.RequestContext` that may be used to grab a DB
+91                 connection.
+92     """
+93     # Create a set of all traits in the os_traits library.
+94     std_traits = set(os_traits.get_traits())
+95     sel = sa.select([_TRAIT_TBL.c.name])
+96     res = ctx.session.execute(sel).fetchall()
+97     # Create a set of all traits in the db that are not custom
+98     # traits.
+99     db_traits = set(
+100         r[0] for r in res
+101         if not os_traits.is_custom(r[0])
+102     )
+103     # Determine those traits which are in os_traits but not
+104     # currently in the database, and insert them.
+105     need_sync = std_traits - db_traits
+106     ins = _TRAIT_TBL.insert()
+107     batch_args = [
+108         {'name': six.text_type(trait)}
+109         for trait in need_sync
+110     ]
+111     if batch_args:
+112         try:
+113             ctx.session.execute(ins, batch_args)
+114             LOG.info("Synced traits from os_traits into API DB: %s",
+115                      need_sync)
+116         except db_exc.DBDuplicateEntry:
+117             pass  # some other process sync'd, just ignore
+118 
+119 
+120 def _ensure_trait_sync(ctx):
+121     """Ensures that the os_traits library is synchronized to the traits db.
+122 
+123     If _TRAITS_SYNCED is False then this process has not tried to update the
+124     traits db. Do so by calling _trait_sync. Since the placement API server
+125     could be multi-threaded, lock around testing _TRAITS_SYNCED to avoid
+126     duplicating work.
+127 
+128     Different placement API server processes that talk to the same database
+129     will avoid issues through the power of transactions.
+130 
+131     :param ctx: `nova.context.RequestContext` that may be used to grab a DB
+132                 connection.
+133     """
+134     global _TRAITS_SYNCED
+135     # If another thread is doing this work, wait for it to complete.
+136     # When that thread is done _TRAITS_SYNCED will be true in this
+137     # thread and we'll simply return.
+138     with lockutils.lock(_TRAIT_LOCK):
+139         if not _TRAITS_SYNCED:
+140             _trait_sync(ctx)
+141             _TRAITS_SYNCED = True
+142 
+143 
+144 def _get_current_inventory_resources(ctx, rp):
+145     """Returns a set() containing the resource class IDs for all resources
+146     currently having an inventory record for the supplied resource provider.
+147 
+148     :param ctx: `nova.context.RequestContext` that may be used to grab a DB
+149                 connection.
+150     :param rp: Resource provider to query inventory for.
+151     """
+152     cur_res_sel = sa.select([_INV_TBL.c.resource_class_id]).where(
+153             _INV_TBL.c.resource_provider_id == rp.id)
+154     existing_resources = ctx.session.execute(cur_res_sel).fetchall()
+155     return set([r[0] for r in existing_resources])
+156 
+157 
+158 def _delete_inventory_from_provider(ctx, rp, to_delete):
+159     """Deletes any inventory records from the supplied provider and set() of
+160     resource class identifiers.
+161 
+162     If there are allocations for any of the inventories to be deleted raise
+163     InventoryInUse exception.
+164 
+165     :param ctx: `nova.context.RequestContext` that contains an oslo_db Session
+166     :param rp: Resource provider from which to delete inventory.
+167     :param to_delete: set() containing resource class IDs for records to
+168                       delete.
+169     """
+170     allocation_query = sa.select(
+171         [_ALLOC_TBL.c.resource_class_id.label('resource_class')]).where(
+172              sa.and_(_ALLOC_TBL.c.resource_provider_id == rp.id,
+173                      _ALLOC_TBL.c.resource_class_id.in_(to_delete))
+174          ).group_by(_ALLOC_TBL.c.resource_class_id)
+175     allocations = ctx.session.execute(allocation_query).fetchall()
+176     if allocations:
+177         resource_classes = ', '.join([_RC_CACHE.string_from_id(alloc[0])
+178                                       for alloc in allocations])
+179         raise exception.InventoryInUse(resource_classes=resource_classes,
+180                                        resource_provider=rp.uuid)
+181 
+182     del_stmt = _INV_TBL.delete().where(sa.and_(
+183             _INV_TBL.c.resource_provider_id == rp.id,
+184             _INV_TBL.c.resource_class_id.in_(to_delete)))
+185     res = ctx.session.execute(del_stmt)
+186     return res.rowcount
+187 
+188 
+189 def _add_inventory_to_provider(ctx, rp, inv_list, to_add):
+190     """Inserts new inventory records for the supplied resource provider.
+191 
+192     :param ctx: `nova.context.RequestContext` that contains an oslo_db Session
+193     :param rp: Resource provider to add inventory to.
+194     :param inv_list: InventoryList object
+195     :param to_add: set() containing resource class IDs to search inv_list for
+196                    adding to resource provider.
+197     """
+198     for rc_id in to_add:
+199         rc_str = _RC_CACHE.string_from_id(rc_id)
+200         inv_record = inv_list.find(rc_str)
+201         if inv_record.capacity <= 0:
+202             raise exception.InvalidInventoryCapacity(
+203                 resource_class=rc_str,
+204                 resource_provider=rp.uuid)
+205         ins_stmt = _INV_TBL.insert().values(
+206                 resource_provider_id=rp.id,
+207                 resource_class_id=rc_id,
+208                 total=inv_record.total,
+209                 reserved=inv_record.reserved,
+210                 min_unit=inv_record.min_unit,
+211                 max_unit=inv_record.max_unit,
+212                 step_size=inv_record.step_size,
+213                 allocation_ratio=inv_record.allocation_ratio)
+214         ctx.session.execute(ins_stmt)
+215 
+216 
+217 def _update_inventory_for_provider(ctx, rp, inv_list, to_update):
+218     """Updates existing inventory records for the supplied resource provider.
+219 
+220     :param ctx: `nova.context.RequestContext` that contains an oslo_db Session
+221     :param rp: Resource provider on which to update inventory.
+222     :param inv_list: InventoryList object
+223     :param to_update: set() containing resource class IDs to search inv_list
+224                       for updating in resource provider.
+225     :returns: A list of (uuid, class) tuples that have exceeded their
+226               capacity after this inventory update.
+227     """
+228     exceeded = []
+229     for rc_id in to_update:
+230         rc_str = _RC_CACHE.string_from_id(rc_id)
+231         inv_record = inv_list.find(rc_str)
+232         if inv_record.capacity <= 0:
+233             raise exception.InvalidInventoryCapacity(
+234                 resource_class=rc_str,
+235                 resource_provider=rp.uuid)
+236         allocation_query = sa.select(
+237             [func.sum(_ALLOC_TBL.c.used).label('usage')]).\
+238             where(sa.and_(
+239                 _ALLOC_TBL.c.resource_provider_id == rp.id,
+240                 _ALLOC_TBL.c.resource_class_id == rc_id))
+241         allocations = ctx.session.execute(allocation_query).first()
+242         if (allocations
+243             and allocations['usage'] is not None
+244             and allocations['usage'] > inv_record.capacity):
+245             exceeded.append((rp.uuid, rc_str))
+246         upd_stmt = _INV_TBL.update().where(sa.and_(
+247                 _INV_TBL.c.resource_provider_id == rp.id,
+248                 _INV_TBL.c.resource_class_id == rc_id)).values(
+249                         total=inv_record.total,
+250                         reserved=inv_record.reserved,
+251                         min_unit=inv_record.min_unit,
+252                         max_unit=inv_record.max_unit,
+253                         step_size=inv_record.step_size,
+254                         allocation_ratio=inv_record.allocation_ratio)
+255         res = ctx.session.execute(upd_stmt)
+256         if not res.rowcount:
+257             raise exception.InventoryWithResourceClassNotFound(
+258                     resource_class=rc_str)
+259     return exceeded
+260 
+261 
+262 def _increment_provider_generation(ctx, rp):
+263     """Increments the supplied provider's generation value, supplying the
+264     currently-known generation. Returns whether the increment succeeded.
+265 
+266     :param ctx: `nova.context.RequestContext` that contains an oslo_db Session
+267     :param rp: `ResourceProvider` whose generation should be updated.
+268     :returns: The new resource provider generation value if successful.
+269     :raises nova.exception.ConcurrentUpdateDetected: if another thread updated
+270             the same resource provider's view of its inventory or allocations
+271             in between the time when this object was originally read
+272             and the call to set the inventory.
+273     """
+274     rp_gen = rp.generation
+275     new_generation = rp_gen + 1
+276     upd_stmt = _RP_TBL.update().where(sa.and_(
+277             _RP_TBL.c.id == rp.id,
+278             _RP_TBL.c.generation == rp_gen)).values(
+279                     generation=(new_generation))
+280 
+281     res = ctx.session.execute(upd_stmt)
+282     if res.rowcount != 1:
+283         raise exception.ConcurrentUpdateDetected
+284     return new_generation
+285 
+286 
+287 def _increment_consumer_generation(ctx, consumer_uuid, consumer_dict):
+288     """Increments the supplied consumer's generation value, supplying the
+289     currently-known generation. Returns whether the increment succeeded.
+290 
+291     :param ctx: `nova.context.RequestContext` that contains an oslo_db Session
+292     :param consumer_uuid: The UUID of the consumer
+293     :param consumer_generation: The current generation of the consumer. It may
+294                                 be None for older code; in that case, we should
+295                                 not raise a conflict, so simply increment the
+296                                 generation and return the new value.
+297     :param consumer_dict: A dictionary containing the project_id, user_id,
+298                           consumer_generation, and a flag that indicates if we
+299                           enforce a match between the supplied
+300                           consumer_generation value and the value in the DB.
+301                           Older versions did not include this logic, so we want
+302                           to preserve the previous behavior of accepting those
+303                           requests.
+304     :returns: The new consumer generation value if successful.
+305     :raises nova.exception.ConcurrentUpdateDetected: if another thread updated
+306             the same consumer's allocations in between the time when this
+307             object was originally read and the call to change its allocations.
+308     """
+309     ct = _CONSUMER_TBL
+310     consumer_generation = consumer_dict.get("generation")
+311     project_id = consumer_dict.get("project_id")
+312     user_id = consumer_dict.get("user_id")
+313     enforce_cgen = consumer_dict.get("enforce_cgen")
+314     # We allow null project/user in the Consumer table, but not in the
+315     # underlying `projects` and `users` tables.
+316     if project_id is None:
+317         pid = None
+318     else:
+319         pid = _ensure_project(ctx, project_id)
+320     if user_id is None:
+321         uid = None
+322     else:
+323         uid = _ensure_user(ctx, user_id)
+324     # Make sure that there is a consumer record. If not, add it.
+325     sel_stmt = sa.select([_CONSUMER_TBL.c.uuid]).where(
+326             _CONSUMER_TBL.c.uuid == consumer_uuid)
+327     result = ctx.session.execute(sel_stmt).fetchall()
+328     if not result:
+329         # There can't be any conflict, as no matching record exists. Add the
+330         # record with a generation of 0, and return.
+331         ctx.session.execute(_CONSUMER_TBL.insert().values(
+332                 uuid=consumer_uuid,
+333                 project_id=pid,
+334                 user_id=uid,
+335                 generation=0))
+336         return 0
+337     else:
+338         if consumer_generation is None:
+339             new_generation = 0
+340         else:
+341             new_generation = consumer_generation + 1
+342     upd_stmt = ct.update().where(sa.and_(
+343             ct.c.uuid == consumer_uuid,
+344             ct.c.generation == consumer_generation)).values(
+345                     generation=(new_generation))
+346     res = ctx.session.execute(upd_stmt)
+347     if res.rowcount != 1 and enforce_cgen:
+348         raise exception.ConcurrentUpdateDetected
+349     return new_generation
+350 
+351 
+352 @db_api.api_context_manager.writer
+353 def _add_inventory(context, rp, inventory):
+354     """Add one Inventory that wasn't already on the provider.
+355 
+356     :raises `exception.ResourceClassNotFound` if inventory.resource_class
+357             cannot be found in either the standard classes or the DB.
+358     """
+359     _ensure_rc_cache(context)
+360     rc_id = _RC_CACHE.id_from_string(inventory.resource_class)
+361     inv_list = InventoryList(objects=[inventory])
+362     _add_inventory_to_provider(
+363         context, rp, inv_list, set([rc_id]))
+364     rp.generation = _increment_provider_generation(context, rp)
+365 
+366 
+367 @db_api.api_context_manager.writer
+368 def _update_inventory(context, rp, inventory):
+369     """Update an inventory already on the provider.
+370 
+371     :raises `exception.ResourceClassNotFound` if inventory.resource_class
+372             cannot be found in either the standard classes or the DB.
+373     """
+374     _ensure_rc_cache(context)
+375     rc_id = _RC_CACHE.id_from_string(inventory.resource_class)
+376     inv_list = InventoryList(objects=[inventory])
+377     exceeded = _update_inventory_for_provider(
+378         context, rp, inv_list, set([rc_id]))
+379     rp.generation = _increment_provider_generation(context, rp)
+380     return exceeded
+381 
+382 
+383 @db_api.api_context_manager.writer
+384 def _delete_inventory(context, rp, resource_class):
+385     """Delete up to one Inventory of the given resource_class string.
+386 
+387     :raises `exception.ResourceClassNotFound` if resource_class
+388             cannot be found in either the standard classes or the DB.
+389     """
+390     _ensure_rc_cache(context)
+391     rc_id = _RC_CACHE.id_from_string(resource_class)
+392     if not _delete_inventory_from_provider(context, rp, [rc_id]):
+393         raise exception.NotFound(
+394             'No inventory of class %s found for delete'
+395             % resource_class)
+396     rp.generation = _increment_provider_generation(context, rp)
+397 
+398 
+399 @db_api.api_context_manager.writer
+400 def _set_inventory(context, rp, inv_list):
+401     """Given an InventoryList object, replaces the inventory of the
+402     resource provider in a safe, atomic fashion using the resource
+403     provider's generation as a consistent view marker.
+404 
+405     :param context: Nova RequestContext.
+406     :param rp: `ResourceProvider` object upon which to set inventory.
+407     :param inv_list: `InventoryList` object to save to backend storage.
+408     :returns: A list of (uuid, class) tuples that have exceeded their
+409               capacity after this inventory update.
+410     :raises nova.exception.ConcurrentUpdateDetected: if another thread updated
+411             the same resource provider's view of its inventory or allocations
+412             in between the time when this object was originally read
+413             and the call to set the inventory.
+414     :raises `exception.ResourceClassNotFound` if any resource class in any
+415             inventory in inv_list cannot be found in either the standard
+416             classes or the DB.
+417     :raises `exception.InventoryInUse` if we attempt to delete inventory
+418             from a provider that has allocations for that resource class.
+419     """
+420     _ensure_rc_cache(context)
+421 
+422     existing_resources = _get_current_inventory_resources(context, rp)
+423     these_resources = set([_RC_CACHE.id_from_string(r.resource_class)
+424                            for r in inv_list.objects])
+425 
+426     # Determine which resources we should be adding, deleting and/or
+427     # updating in the resource provider's inventory by comparing sets
+428     # of resource class identifiers.
+429     to_add = these_resources - existing_resources
+430     to_delete = existing_resources - these_resources
+431     to_update = these_resources & existing_resources
+432     exceeded = []
+433 
+434     if to_delete:
+435         _delete_inventory_from_provider(context, rp, to_delete)
+436     if to_add:
+437         _add_inventory_to_provider(context, rp, inv_list, to_add)
+438     if to_update:
+439         exceeded = _update_inventory_for_provider(context, rp, inv_list,
+440                                                   to_update)
+441 
+442     # Here is where we update the resource provider's generation value.  If
+443     # this update updates zero rows, that means that another thread has updated
+444     # the inventory for this resource provider between the time the caller
+445     # originally read the resource provider record and inventory information
+446     # and this point. We raise an exception here which will rollback the above
+447     # transaction and return an error to the caller to indicate that they can
+448     # attempt to retry the inventory save after reverifying any capacity
+449     # conditions and re-reading the existing inventory information.
+450     rp.generation = _increment_provider_generation(context, rp)
+451 
+452     return exceeded
+453 
+454 
+455 @db_api.api_context_manager.reader
+456 def _get_provider_by_uuid(context, uuid):
+457     """Given a UUID, return a dict of information about the resource provider
+458     from the database.
+459 
+460     :raises: NotFound if no such provider was found
+461     :param uuid: The UUID to look up
+462     """
+463     rpt = sa.alias(_RP_TBL, name="rp")
+464     parent = sa.alias(_RP_TBL, name="parent")
+465     root = sa.alias(_RP_TBL, name="root")
+466     # TODO(jaypipes): Change this to an inner join when we are sure all
+467     # root_provider_id values are NOT NULL
+468     rp_to_root = sa.outerjoin(rpt, root, rpt.c.root_provider_id == root.c.id)
+469     rp_to_parent = sa.outerjoin(rp_to_root, parent,
+470         rpt.c.parent_provider_id == parent.c.id)
+471     cols = [
+472         rpt.c.id,
+473         rpt.c.uuid,
+474         rpt.c.name,
+475         rpt.c.generation,
+476         root.c.uuid.label("root_provider_uuid"),
+477         parent.c.uuid.label("parent_provider_uuid"),
+478         rpt.c.updated_at,
+479         rpt.c.created_at,
+480     ]
+481     sel = sa.select(cols).select_from(rp_to_parent).where(rpt.c.uuid == uuid)
+482     res = context.session.execute(sel).fetchone()
+483     if not res:
+484         raise exception.NotFound(
+485             'No resource provider with uuid %s found' % uuid)
+486     return dict(res)
+487 
+488 
+489 @db_api.api_context_manager.reader
+490 def _get_aggregates_by_provider_id(context, rp_id):
+491     join_statement = sa.join(
+492         _AGG_TBL, _RP_AGG_TBL, sa.and_(
+493             _AGG_TBL.c.id == _RP_AGG_TBL.c.aggregate_id,
+494             _RP_AGG_TBL.c.resource_provider_id == rp_id))
+495     sel = sa.select([_AGG_TBL.c.uuid]).select_from(join_statement)
+496     return [r[0] for r in context.session.execute(sel).fetchall()]
+497 
+498 
+499 @db_api.api_context_manager.writer
+500 def _set_aggregates(context, resource_provider, provided_aggregates,
+501                     increment_generation=False):
+502     rp_id = resource_provider.id
+503     # When aggregate uuids are persisted no validation is done
+504     # to ensure that they refer to something that has meaning
+505     # elsewhere. It is assumed that code which makes use of the
+506     # aggregates, later, will validate their fitness.
+507     # TODO(cdent): At the moment we do not delete
+508     # a PlacementAggregate that no longer has any associations
+509     # with at least one resource provider. We may wish to do that
+510     # to avoid bloat if it turns out we're creating a lot of noise.
+511     # Not doing now to move things along.
+512     provided_aggregates = set(provided_aggregates)
+513     existing_aggregates = set(_get_aggregates_by_provider_id(context, rp_id))
+514     to_add = provided_aggregates - existing_aggregates
+515     target_aggregates = list(provided_aggregates)
+516 
+517     # Create any aggregates that do not yet exist in
+518     # PlacementAggregates. This is different from
+519     # the set in existing_aggregates; those are aggregates for
+520     # which there are associations for the resource provider
+521     # at rp_id. The following loop checks for the existence of any
+522     # aggregate with the provided uuid. In this way we only
+523     # create a new row in the PlacementAggregate table if the
+524     # aggregate uuid has never been seen before. Code further
+525     # below will update the associations.
+526     for agg_uuid in to_add:
+527         found_agg = context.session.query(models.PlacementAggregate.uuid).\
+528             filter_by(uuid=agg_uuid).first()
+529         if not found_agg:
+530             new_aggregate = models.PlacementAggregate(uuid=agg_uuid)
+531             try:
+532                 context.session.add(new_aggregate)
+533                 # Flush each aggregate to explicitly call the INSERT
+534                 # statement that could result in an integrity error
+535                 # if some other thread has added this agg_uuid. This
+536                 # also makes sure that the new aggregates have
+537                 # ids when the SELECT below happens.
+538                 context.session.flush()
+539             except db_exc.DBDuplicateEntry:
+540                 # Something else has already added this agg_uuid
+541                 pass
+542 
+543     # Remove all aggregate associations so we can refresh them
+544     # below. This means that all associations are added, but the
+545     # aggregates themselves stay around.
+546     context.session.query(models.ResourceProviderAggregate).filter_by(
+547         resource_provider_id=rp_id).delete()
+548 
+549     # Set resource_provider_id, aggregate_id pairs to
+550     # ResourceProviderAggregate table.
+551     if target_aggregates:
+552         select_agg_id = sa.select([rp_id, models.PlacementAggregate.id]).\
+553             where(models.PlacementAggregate.uuid.in_(target_aggregates))
+554         insert_aggregates = models.ResourceProviderAggregate.__table__.\
+555             insert().from_select(['resource_provider_id', 'aggregate_id'],
+556                                  select_agg_id)
+557         context.session.execute(insert_aggregates)
+558 
+559     if increment_generation:
+560         resource_provider.generation = _increment_provider_generation(
+561             context, resource_provider)
+562 
+563 
+564 @db_api.api_context_manager.reader
+565 def _get_traits_by_provider_id(context, rp_id):
+566     t = sa.alias(_TRAIT_TBL, name='t')
+567     rpt = sa.alias(_RP_TRAIT_TBL, name='rpt')
+568 
+569     join_cond = sa.and_(t.c.id == rpt.c.trait_id,
+570                         rpt.c.resource_provider_id == rp_id)
+571     join = sa.join(t, rpt, join_cond)
+572     sel = sa.select([t.c.id, t.c.name,
+573                      t.c.created_at, t.c.updated_at]).select_from(join)
+574     return [dict(r) for r in context.session.execute(sel).fetchall()]
+575 
+576 
+577 def _add_traits_to_provider(ctx, rp_id, to_add):
+578     """Adds trait associations to the provider with the supplied ID.
+579 
+580     :param ctx: `nova.context.RequestContext` that has an oslo_db Session
+581     :param rp_id: Internal ID of the resource provider on which to add
+582                   trait associations
+583     :param to_add: set() containing internal trait IDs for traits to add
+584     """
+585     for trait_id in to_add:
+586         try:
+587             ins_stmt = _RP_TRAIT_TBL.insert().values(
+588                 resource_provider_id=rp_id,
+589                 trait_id=trait_id)
+590             ctx.session.execute(ins_stmt)
+591         except db_exc.DBDuplicateEntry:
+592             # Another thread already set this trait for this provider. Ignore
+593             # this for now (but ConcurrentUpdateDetected will end up being
+594             # raised almost assuredly when we go to increment the resource
+595             # provider's generation later, but that's also fine)
+596             pass
+597 
+598 
+599 def _delete_traits_from_provider(ctx, rp_id, to_delete):
+600     """Deletes trait associations from the provider with the supplied ID and
+601     set() of internal trait IDs.
+602 
+603     :param ctx: `nova.context.RequestContext` that has an oslo_db Session
+604     :param rp_id: Internal ID of the resource provider from which to delete
+605                   trait associations
+606     :param to_delete: set() containing internal trait IDs for traits to
+607                       delete
+608     """
+609     del_stmt = _RP_TRAIT_TBL.delete().where(
+610         sa.and_(
+611             _RP_TRAIT_TBL.c.resource_provider_id == rp_id,
+612             _RP_TRAIT_TBL.c.trait_id.in_(to_delete)))
+613     ctx.session.execute(del_stmt)
+614 
+615 
+616 @db_api.api_context_manager.writer
+617 def _set_traits(context, rp, traits):
+618     """Given a ResourceProvider object and a TraitList object, replaces the set
+619     of traits associated with the resource provider.
+620 
+621     :raises: ConcurrentUpdateDetected if the resource provider's traits or
+622              inventory was changed in between the time when we first started to
+623              set traits and the end of this routine.
+624 
+625     :param rp: The ResourceProvider object to set traits against
+626     :param traits: A TraitList object or list of Trait objects
+627     """
+628     # Get the internal IDs of our existing traits
+629     existing_traits = _get_traits_by_provider_id(context, rp.id)
+630     existing_traits = set(rec['id'] for rec in existing_traits)
+631     want_traits = set(trait.id for trait in traits)
+632 
+633     to_add = want_traits - existing_traits
+634     to_delete = existing_traits - want_traits
+635 
+636     if not to_add and not to_delete:
+637         return
+638 
+639     if to_delete:
+640         _delete_traits_from_provider(context, rp.id, to_delete)
+641     if to_add:
+642         _add_traits_to_provider(context, rp.id, to_add)
+643     rp.generation = _increment_provider_generation(context, rp)
+644 
+645 
+646 @db_api.api_context_manager.reader
+647 def _has_child_providers(context, rp_id):
+648     """Returns True if the supplied resource provider has any child providers,
+649     False otherwise
+650     """
+651     child_sel = sa.select([_RP_TBL.c.id])
+652     child_sel = child_sel.where(_RP_TBL.c.parent_provider_id == rp_id)
+653     child_res = context.session.execute(child_sel.limit(1)).fetchone()
+654     if child_res:
+655         return True
+656     return False
+657 
+658 
+659 @db_api.api_context_manager.writer
+660 def _set_root_provider_id(context, rp_id, root_id):
+661     """Simply sets the root_provider_id value for a provider identified by
+662     rp_id. Used in online data migration.
+663 
+664     :param rp_id: Internal ID of the provider to update
+665     :param root_id: Value to set root provider to
+666     """
+667     upd = _RP_TBL.update().where(_RP_TBL.c.id == rp_id)
+668     upd = upd.values(root_provider_id=root_id)
+669     context.session.execute(upd)
+670 
+671 
+672 ProviderIds = collections.namedtuple(
+673     'ProviderIds', 'id uuid parent_id parent_uuid root_id root_uuid')
+674 
+675 
+676 def _provider_ids_from_uuid(context, uuid):
+677     """Given the UUID of a resource provider, returns a namedtuple
+678     (ProviderIds) with the internal ID, the UUID, the parent provider's
+679     internal ID, parent provider's UUID, the root provider's internal ID and
+680     the root provider UUID.
+681 
+682     :returns: ProviderIds object containing the internal IDs and UUIDs of the
+683               provider identified by the supplied UUID
+684     :param uuid: The UUID of the provider to look up
+685     """
+686     # SELECT
+687     #   rp.id, rp.uuid,
+688     #   parent.id AS parent_id, parent.uuid AS parent_uuid,
+689     #   root.id AS root_id, root.uuid AS root_uuid
+690     # FROM resource_providers AS rp
+691     # LEFT JOIN resource_providers AS parent
+692     #   ON rp.parent_provider_id = parent.id
+693     # LEFT JOIN resource_providers AS root
+694     #   ON rp.root_provider_id = root.id
+695     me = sa.alias(_RP_TBL, name="me")
+696     parent = sa.alias(_RP_TBL, name="parent")
+697     root = sa.alias(_RP_TBL, name="root")
+698     cols = [
+699         me.c.id,
+700         me.c.uuid,
+701         parent.c.id.label('parent_id'),
+702         parent.c.uuid.label('parent_uuid'),
+703         root.c.id.label('root_id'),
+704         root.c.uuid.label('root_uuid'),
+705     ]
+706     # TODO(jaypipes): Change this to an inner join when we are sure all
+707     # root_provider_id values are NOT NULL
+708     me_to_root = sa.outerjoin(me, root, me.c.root_provider_id == root.c.id)
+709     me_to_parent = sa.outerjoin(me_to_root, parent,
+710         me.c.parent_provider_id == parent.c.id)
+711     sel = sa.select(cols).select_from(me_to_parent)
+712     sel = sel.where(me.c.uuid == uuid)
+713     res = context.session.execute(sel).fetchone()
+714     if not res:
+715         return None
+716     return ProviderIds(**dict(res))
+717 
+718 
+719 @db_api.api_context_manager.writer
+720 def _delete_rp_record(context, _id):
+721     return context.session.query(models.ResourceProvider).\
+722         filter(models.ResourceProvider.id == _id).\
+723         delete(synchronize_session=False)
+724 
+725 
+726 @base.VersionedObjectRegistry.register_if(False)
+727 class ResourceProvider(base.VersionedObject, base.TimestampedObject):
+728     SETTABLE_FIELDS = ('name', 'parent_provider_uuid')
+729 
+730     fields = {
+731         'id': fields.IntegerField(read_only=True),
+732         'uuid': fields.UUIDField(nullable=False),
+733         'name': fields.StringField(nullable=False),
+734         'generation': fields.IntegerField(nullable=False),
+735         # UUID of the root provider in a hierarchy of providers. Will be equal
+736         # to the uuid field if this provider is the root provider of a
+737         # hierarchy. This field is never manually set by the user. Instead, it
+738         # is automatically set to either the root provider UUID of the parent
+739         # or the UUID of the provider itself if there is no parent. This field
+740         # is an optimization field that allows us to very quickly query for all
+741         # providers within a particular tree without doing any recursive
+742         # querying.
+743         'root_provider_uuid': fields.UUIDField(nullable=False),
+744         # UUID of the direct parent provider, or None if this provider is a
+745         # "root" provider.
+746         'parent_provider_uuid': fields.UUIDField(nullable=True, default=None),
+747     }
+748 
+749     def create(self):
+750         if 'id' in self:
+751             raise exception.ObjectActionError(action='create',
+752                                               reason='already created')
+753         if 'uuid' not in self:
+754             raise exception.ObjectActionError(action='create',
+755                                               reason='uuid is required')
+756         if 'name' not in self:
+757             raise exception.ObjectActionError(action='create',
+758                                               reason='name is required')
+759         if 'root_provider_uuid' in self:
+760             raise exception.ObjectActionError(
+761                 action='create',
+762                 reason=_('root provider UUID cannot be manually set.'))
+763 
+764         self.obj_set_defaults()
+765         updates = self.obj_get_changes()
+766         self._create_in_db(self._context, updates)
+767         self.obj_reset_changes()
+768 
+769     def destroy(self):
+770         self._delete(self._context, self.id)
+771 
+772     def save(self):
+773         updates = self.obj_get_changes()
+774         if updates and any(k not in self.SETTABLE_FIELDS
+775                            for k in updates.keys()):
+776             raise exception.ObjectActionError(
+777                 action='save',
+778                 reason='Immutable fields changed')
+779         self._update_in_db(self._context, self.id, updates)
+780         self.obj_reset_changes()
+781 
+782     @classmethod
+783     def get_by_uuid(cls, context, uuid):
+784         """Returns a new ResourceProvider object with the supplied UUID.
+785 
+786         :raises NotFound if no such provider could be found
+787         :param uuid: UUID of the provider to search for
+788         """
+789         rp_rec = _get_provider_by_uuid(context, uuid)
+790         return cls._from_db_object(context, cls(), rp_rec)
+791 
+792     def add_inventory(self, inventory):
+793         """Add one new Inventory to the resource provider.
+794 
+795         Fails if Inventory of the provided resource class is
+796         already present.
+797         """
+798         _add_inventory(self._context, self, inventory)
+799         self.obj_reset_changes()
+800 
+801     def delete_inventory(self, resource_class):
+802         """Delete Inventory of provided resource_class."""
+803         _delete_inventory(self._context, self, resource_class)
+804         self.obj_reset_changes()
+805 
+806     def set_inventory(self, inv_list):
+807         """Set all resource provider Inventory to be the provided list."""
+808         exceeded = _set_inventory(self._context, self, inv_list)
+809         for uuid, rclass in exceeded:
+810             LOG.warning('Resource provider %(uuid)s is now over-'
+811                         'capacity for %(resource)s',
+812                         {'uuid': uuid, 'resource': rclass})
+813         self.obj_reset_changes()
+814 
+815     def update_inventory(self, inventory):
+816         """Update one existing Inventory of the same resource class.
+817 
+818         Fails if no Inventory of the same class is present.
+819         """
+820         exceeded = _update_inventory(self._context, self, inventory)
+821         for uuid, rclass in exceeded:
+822             LOG.warning('Resource provider %(uuid)s is now over-'
+823                         'capacity for %(resource)s',
+824                         {'uuid': uuid, 'resource': rclass})
+825         self.obj_reset_changes()
+826 
+827     def get_aggregates(self):
+828         """Get the aggregate uuids associated with this resource provider."""
+829         return _get_aggregates_by_provider_id(self._context, self.id)
+830 
+831     def set_aggregates(self, aggregate_uuids, increment_generation=False):
+832         """Set the aggregate uuids associated with this resource provider.
+833 
+834         If an aggregate does not exist, one will be created using the
+835         provided uuid.
+836 
+837         The resource provider generation is incremented if and only if the
+838         increment_generation parameter is True.
+839         """
+840         _set_aggregates(self._context, self, aggregate_uuids,
+841                         increment_generation=increment_generation)
+842 
+843     def set_traits(self, traits):
+844         """Replaces the set of traits associated with the resource provider
+845         with the given list of Trait objects.
+846 
+847         :param traits: A list of Trait objects representing the traits to
+848                        associate with the provider.
+849         """
+850         _set_traits(self._context, self, traits)
+851         self.obj_reset_changes()
+852 
+853     @db_api.api_context_manager.writer
+854     def _create_in_db(self, context, updates):
+855         parent_id = None
+856         root_id = None
+857         # User supplied a parent, let's make sure it exists
+858         parent_uuid = updates.pop('parent_provider_uuid')
+859         if parent_uuid is not None:
+860             # Setting parent to ourselves doesn't make any sense
+861             if parent_uuid == self.uuid:
+862                 raise exception.ObjectActionError(
+863                         action='create',
+864                         reason=_('parent provider UUID cannot be same as '
+865                                  'UUID. Please set parent provider UUID to '
+866                                  'None if there is no parent.'))
+867 
+868             parent_ids = _provider_ids_from_uuid(context, parent_uuid)
+869             if parent_ids is None:
+870                 raise exception.ObjectActionError(
+871                         action='create',
+872                         reason=_('parent provider UUID does not exist.'))
+873 
+874             parent_id = parent_ids.id
+875             root_id = parent_ids.root_id
+876             updates['root_provider_id'] = root_id
+877             updates['parent_provider_id'] = parent_id
+878             self.root_provider_uuid = parent_ids.root_uuid
+879 
+880         db_rp = models.ResourceProvider()
+881         db_rp.update(updates)
+882         context.session.add(db_rp)
+883         context.session.flush()
+884 
+885         self.id = db_rp.id
+886         self.generation = db_rp.generation
+887 
+888         if root_id is None:
+889             # User did not specify a parent when creating this provider, so the
+890             # root_provider_id needs to be set to this provider's newly-created
+891             # internal ID
+892             db_rp.root_provider_id = db_rp.id
+893             context.session.add(db_rp)
+894             context.session.flush()
+895             self.root_provider_uuid = self.uuid
+896 
+897     @staticmethod
+898     @db_api.api_context_manager.writer
+899     def _delete(context, _id):
+900         # Do a quick check to see if the provider is a parent. If it is, don't
+901         # allow deleting the provider. Note that the foreign key constraint on
+902         # resource_providers.parent_provider_id will prevent deletion of the
+903         # parent within the transaction below. This is just a quick
+904         # short-circuit outside of the transaction boundary.
+905         if _has_child_providers(context, _id):
+906             raise exception.CannotDeleteParentResourceProvider()
+907 
+908         # Don't delete the resource provider if it has allocations.
+909         rp_allocations = context.session.query(models.Allocation).\
+910              filter(models.Allocation.resource_provider_id == _id).\
+911              count()
+912         if rp_allocations:
+913             raise exception.ResourceProviderInUse()
+914         # Delete any inventory associated with the resource provider
+915         context.session.query(models.Inventory).\
+916             filter(models.Inventory.resource_provider_id == _id).\
+917             delete(synchronize_session=False)
+918         # Delete any aggregate associations for the resource provider
+919         # The name substitution on the next line is needed to satisfy pep8
+920         RPA_model = models.ResourceProviderAggregate
+921         context.session.query(RPA_model).\
+922                 filter(RPA_model.resource_provider_id == _id).delete()
+923         # delete any trait associations for the resource provider
+924         RPT_model = models.ResourceProviderTrait
+925         context.session.query(RPT_model).\
+926                 filter(RPT_model.resource_provider_id == _id).delete()
+927         # set root_provider_id to null to make deletion possible
+928         context.session.query(models.ResourceProvider).\
+929             filter(models.ResourceProvider.id == _id,
+930                    models.ResourceProvider.root_provider_id == _id).\
+931             update({'root_provider_id': None})
+932         # Now delete the RP record
+933         try:
+934             result = _delete_rp_record(context, _id)
+935         except sqla_exc.IntegrityError:
+936             # NOTE(jaypipes): Another thread snuck in and parented this
+937             # resource provider in between the above check for
+938             # _has_child_providers() and our attempt to delete the record
+939             raise exception.CannotDeleteParentResourceProvider()
+940         if not result:
+941             raise exception.NotFound()
+942 
+943     @db_api.api_context_manager.writer
+944     def _update_in_db(self, context, id, updates):
+945         if 'parent_provider_uuid' in updates:
+946             # TODO(jaypipes): For now, "re-parenting" and "un-parenting" are
+947             # not possible. If the provider already had a parent, we don't
+948             # allow changing that parent due to various issues, including:
+949             #
+950             # * if the new parent is a descendant of this resource provider, we
+951             #   introduce the possibility of a loop in the graph, which would
+952             #   be very bad
+953             # * potentially orphaning heretofore-descendants
+954             #
+955             # So, for now, let's just prevent re-parenting...
+956             my_ids = _provider_ids_from_uuid(context, self.uuid)
+957             parent_uuid = updates.pop('parent_provider_uuid')
+958             if parent_uuid is not None:
+959                 parent_ids = _provider_ids_from_uuid(context, parent_uuid)
+960                 # User supplied a parent, let's make sure it exists
+961                 if parent_ids is None:
+962                     raise exception.ObjectActionError(
+963                             action='create',
+964                             reason=_('parent provider UUID does not exist.'))
+965                 if (my_ids.parent_id is not None and
+966                         my_ids.parent_id != parent_ids.id):
+967                     raise exception.ObjectActionError(
+968                             action='update',
+969                             reason=_('re-parenting a provider is not '
+970                                      'currently allowed.'))
+971 
+972                 updates['root_provider_id'] = parent_ids.root_id
+973                 updates['parent_provider_id'] = parent_ids.id
+974                 self.root_provider_uuid = parent_ids.root_uuid
+975             else:
+976                 if my_ids.parent_id is not None:
+977                     raise exception.ObjectActionError(
+978                             action='update',
+979                             reason=_('un-parenting a provider is not '
+980                                      'currently allowed.'))
+981 
+982         db_rp = context.session.query(models.ResourceProvider).filter_by(
+983             id=id).first()
+984         db_rp.update(updates)
+985         try:
+986             db_rp.save(context.session)
+987         except sqla_exc.IntegrityError:
+988             # NOTE(jaypipes): Another thread snuck in and deleted the parent
+989             # for this resource provider in between the above check for a valid
+990             # parent provider and here...
+991             raise exception.ObjectActionError(
+992                     action='update',
+993                     reason=_('parent provider UUID does not exist.'))
+994 
+995     @staticmethod
+996     @db_api.api_context_manager.writer  # Needed for online data migration
+997     def _from_db_object(context, resource_provider, db_resource_provider):
+998         # Online data migration to populate root_provider_id
+999         # TODO(jaypipes): Remove when all root_provider_id values are NOT NULL
+1000         if db_resource_provider['root_provider_uuid'] is None:
+1001             rp_id = db_resource_provider['id']
+1002             uuid = db_resource_provider['uuid']
+1003             db_resource_provider['root_provider_uuid'] = uuid
+1004             _set_root_provider_id(context, rp_id, rp_id)
+1005         for field in resource_provider.fields:
+1006             setattr(resource_provider, field, db_resource_provider[field])
+1007         resource_provider._context = context
+1008         resource_provider.obj_reset_changes()
+1009         return resource_provider
+1010 
+1011 
+1012 @db_api.api_context_manager.reader
+1013 def _get_providers_with_shared_capacity(ctx, rc_id, amount):
+1014     """Returns a list of resource provider IDs (internal IDs, not UUIDs)
+1015     that have capacity for a requested amount of a resource and indicate that
+1016     they share resource via an aggregate association.
+1017 
+1018     Shared resource providers are marked with a standard trait called
+1019     MISC_SHARES_VIA_AGGREGATE. This indicates that the provider allows its
+1020     inventory to be consumed by other resource providers associated via an
+1021     aggregate link.
+1022 
+1023     For example, assume we have two compute nodes, CN_1 and CN_2, each with
+1024     inventory of VCPU and MEMORY_MB but not DISK_GB (in other words, these are
+1025     compute nodes with no local disk). There is a resource provider called
+1026     "NFS_SHARE" that has an inventory of DISK_GB and has the
+1027     MISC_SHARES_VIA_AGGREGATE trait. Both the "CN_1" and "CN_2" compute node
+1028     resource providers and the "NFS_SHARE" resource provider are associated
+1029     with an aggregate called "AGG_1".
+1030 
+1031     The scheduler needs to determine the resource providers that can fulfill a
+1032     request for 2 VCPU, 1024 MEMORY_MB and 100 DISK_GB.
+1033 
+1034     Clearly, no single provider can satisfy the request for all three
+1035     resources, since neither compute node has DISK_GB inventory and the
+1036     NFS_SHARE provider has no VCPU or MEMORY_MB inventories.
+1037 
+1038     However, if we consider the NFS_SHARE resource provider as providing
+1039     inventory of DISK_GB for both CN_1 and CN_2, we can include CN_1 and CN_2
+1040     as potential fits for the requested set of resources.
+1041 
+1042     To facilitate that matching query, this function returns all providers that
+1043     indicate they share their inventory with providers in some aggregate and
+1044     have enough capacity for the requested amount of a resource.
+1045 
+1046     To follow the example above, if we were to call
+1047     _get_providers_with_shared_capacity(ctx, "DISK_GB", 100), we would want to
+1048     get back the ID for the NFS_SHARE resource provider.
+1049     """
+1050     # The SQL we need to generate here looks like this:
+1051     #
+1052     # SELECT rp.id
+1053     # FROM resource_providers AS rp
+1054     #   INNER JOIN resource_provider_traits AS rpt
+1055     #     ON rp.id = rpt.resource_provider_id
+1056     #   INNER JOIN traits AS t
+1057     #     AND rpt.trait_id = t.id
+1058     #     AND t.name = "MISC_SHARES_VIA_AGGREGATE"
+1059     #   INNER JOIN inventories AS inv
+1060     #     ON rp.id = inv.resource_provider_id
+1061     #     AND inv.resource_class_id = $rc_id
+1062     #   LEFT JOIN (
+1063     #     SELECT resource_provider_id, SUM(used) as used
+1064     #     FROM allocations
+1065     #     WHERE resource_class_id = $rc_id
+1066     #     GROUP BY resource_provider_id
+1067     #   ) AS usage
+1068     #     ON rp.id = usage.resource_provider_id
+1069     # WHERE COALESCE(usage.used, 0) + $amount <= (
+1070     #   inv.total - inv.reserved) * inv.allocation_ratio
+1071     # ) AND
+1072     #   inv.min_unit <= $amount AND
+1073     #   inv.max_unit >= $amount AND
+1074     #   $amount % inv.step_size = 0
+1075     # GROUP BY rp.id
+1076 
+1077     rp_tbl = sa.alias(_RP_TBL, name='rp')
+1078     inv_tbl = sa.alias(_INV_TBL, name='inv')
+1079     t_tbl = sa.alias(_TRAIT_TBL, name='t')
+1080     rpt_tbl = sa.alias(_RP_TRAIT_TBL, name='rpt')
+1081 
+1082     rp_to_rpt_join = sa.join(
+1083         rp_tbl, rpt_tbl,
+1084         rp_tbl.c.id == rpt_tbl.c.resource_provider_id,
+1085     )
+1086 
+1087     rpt_to_t_join = sa.join(
+1088         rp_to_rpt_join, t_tbl,
+1089         sa.and_(
+1090             rpt_tbl.c.trait_id == t_tbl.c.id,
+1091             # The traits table wants unicode trait names, but os_traits
+1092             # presents native str, so we need to cast.
+1093             t_tbl.c.name == six.text_type(os_traits.MISC_SHARES_VIA_AGGREGATE),
+1094         ),
+1095     )
+1096 
+1097     rp_to_inv_join = sa.join(
+1098         rpt_to_t_join, inv_tbl,
+1099         sa.and_(
+1100             rpt_tbl.c.resource_provider_id == inv_tbl.c.resource_provider_id,
+1101             inv_tbl.c.resource_class_id == rc_id,
+1102         ),
+1103     )
+1104 
+1105     usage = sa.select([_ALLOC_TBL.c.resource_provider_id,
+1106                        sql.func.sum(_ALLOC_TBL.c.used).label('used')])
+1107     usage = usage.where(_ALLOC_TBL.c.resource_class_id == rc_id)
+1108     usage = usage.group_by(_ALLOC_TBL.c.resource_provider_id)
+1109     usage = sa.alias(usage, name='usage')
+1110 
+1111     inv_to_usage_join = sa.outerjoin(
+1112         rp_to_inv_join, usage,
+1113         inv_tbl.c.resource_provider_id == usage.c.resource_provider_id,
+1114     )
+1115 
+1116     sel = sa.select([rp_tbl.c.id]).select_from(inv_to_usage_join)
+1117     sel = sel.where(
+1118         sa.and_(
+1119             func.coalesce(usage.c.used, 0) + amount <= (
+1120                 inv_tbl.c.total - inv_tbl.c.reserved
+1121             ) * inv_tbl.c.allocation_ratio,
+1122             inv_tbl.c.min_unit <= amount,
+1123             inv_tbl.c.max_unit >= amount,
+1124             amount % inv_tbl.c.step_size == 0,
+1125         ),
+1126     )
+1127     sel = sel.group_by(rp_tbl.c.id)
+1128     return [r[0] for r in ctx.session.execute(sel)]
+1129 
+1130 
+1131 @db_api.api_context_manager.reader
+1132 def _get_all_with_shared(ctx, resources, member_of=None):
+1133     """Uses some more advanced SQL to find providers that either have the
+1134     requested resources "locally" or are associated with a provider that shares
+1135     those requested resources.
+1136 
+1137     :param resources: Dict keyed by resource class integer ID of requested
+1138                       amounts of that resource
+1139     """
+1140     # NOTE(jaypipes): The SQL we generate here depends on which resource
+1141     # classes have providers that share that resource via an aggregate.
+1142     #
+1143     # We begin building a "join chain" by starting with a projection from the
+1144     # resource_providers table:
+1145     #
+1146     # SELECT rp.id
+1147     # FROM resource_providers AS rp
+1148     #
+1149     # in addition to a copy of resource_provider_aggregates for each resource
+1150     # class that has a shared provider:
+1151     #
+1152     #  resource_provider_aggregates AS sharing_{RC_NAME},
+1153     #
+1154     # We then join to a copy of the inventories table for each resource we are
+1155     # requesting:
+1156     #
+1157     # {JOIN TYPE} JOIN inventories AS inv_{RC_NAME}
+1158     #  ON rp.id = inv_{RC_NAME}.resource_provider_id
+1159     #  AND inv_{RC_NAME}.resource_class_id = $RC_ID
+1160     # LEFT JOIN (
+1161     #  SELECT resource_provider_id, SUM(used) AS used
+1162     #  FROM allocations
+1163     #  WHERE resource_class_id = $RC_ID
+1164     #  GROUP BY resource_provider_id
+1165     # ) AS usage_{RC_NAME}
+1166     #  ON rp.id = usage_{RC_NAME}.resource_provider_id
+1167     #
+1168     # For resource classes that DO NOT have any shared resource providers, the
+1169     # {JOIN TYPE} will be an INNER join, because we are filtering out any
+1170     # resource providers that do not have local inventory of that resource
+1171     # class.
+1172     #
+1173     # For resource classes that DO have shared resource providers, the {JOIN
+1174     # TYPE} will be a LEFT (OUTER) join.
+1175     #
+1176     # For the first join, {JOINING TABLE} will be resource_providers. For each
+1177     # subsequent resource class that is added to the SQL expression, {JOINING
+1178     # TABLE} will be the alias of the inventories table that refers to the
+1179     # previously-processed resource class.
+1180     #
+1181     # For resource classes that DO have shared providers, we also perform a
+1182     # "butterfly join" against two copies of the resource_provider_aggregates
+1183     # table:
+1184     #
+1185     # +-----------+  +------------+  +-------------+  +------------+
+1186     # | last_inv  |  | rpa_shared |  | rpa_sharing |  | rp_sharing |
+1187     # +-----------|  +------------+  +-------------+  +------------+
+1188     # | rp_id     |=>| rp_id      |  | rp_id       |<=| id         |
+1189     # |           |  | agg_id     |<=| agg_id      |  |            |
+1190     # +-----------+  +------------+  +-------------+  +------------+
+1191     #
+1192     # Note in the diagram above, we call the _get_providers_sharing_capacity()
+1193     # for a resource class to construct the "rp_sharing" set/table.
+1194     #
+1195     # The first part of the butterfly join is an outer join against a copy of
+1196     # the resource_provider_aggregates table in order to winnow results to
+1197     # providers that are associated with any aggregate that the sharing
+1198     # provider is associated with:
+1199     #
+1200     # LEFT JOIN resource_provider_aggregates AS shared_{RC_NAME}
+1201     #  ON rp.id = shared_{RC_NAME}.resource_provider_id
+1202     #
+1203     # The above is then joined to the set of aggregates associated with the set
+1204     # of sharing providers for that resource:
+1205     #
+1206     # LEFT JOIN resource_provider_aggregates AS sharing_{RC_NAME}
+1207     #  ON shared_{RC_NAME}.aggregate_id = sharing_{RC_NAME}.aggregate_id
+1208     #  AND sharing_{RC_NAME}.resource_provider_id IN($RPS_{RC_NAME})
+1209     #
+1210     # If the request specified limiting resource providers to one or more
+1211     # specific aggregates, we then join the above to another copy of the
+1212     # aggregate table and filter on the provided aggregates.
+1213     #
+1214     # We calculate the WHERE conditions based on whether the resource class has
+1215     # any shared providers.
+1216     #
+1217     # For resource classes that DO NOT have any shared resource providers, the
+1218     # WHERE clause constructed finds resource providers that have inventory for
+1219     # "local" resource providers:
+1220     #
+1221     # WHERE (COALESCE(usage_vcpu.used, 0) + $AMOUNT <=
+1222     #   (inv_{RC_NAME}.total - inv_{RC_NAME}.reserved)
+1223     #   * inv_{RC_NAME}.allocation_ratio
+1224     # AND
+1225     # inv_{RC_NAME}.min_unit <= $AMOUNT AND
+1226     # inv_{RC_NAME}.max_unit >= $AMOUNT AND
+1227     # $AMOUNT % inv_{RC_NAME}.step_size == 0)
+1228     #
+1229     # For resource classes that DO have shared resource providers, the WHERE
+1230     # clause is slightly more complicated:
+1231     #
+1232     # WHERE (
+1233     #   inv_{RC_NAME}.resource_provider_id IS NOT NULL AND
+1234     #   (
+1235     #     (
+1236     #     COALESCE(usage_{RC_NAME}.used, 0) + $AMOUNT <=
+1237     #       (inv_{RC_NAME}.total - inv_{RC_NAME}.reserved)
+1238     #       * inv_{RC_NAME}.allocation_ratio
+1239     #     ) AND
+1240     #     inv_{RC_NAME}.min_unit <= $AMOUNT AND
+1241     #     inv_{RC_NAME}.max_unit >= $AMOUNT AND
+1242     #     $AMOUNT % inv_{RC_NAME}.step_size == 0
+1243     #   ) OR
+1244     #   sharing_{RC_NAME}.resource_provider_id IS NOT NULL
+1245     # )
+1246     #
+1247     # Finally, we GROUP BY the resource provider ID:
+1248     #
+1249     # GROUP BY rp.id
+1250     #
+1251     # To show an example, here is the exact SQL that will be generated in an
+1252     # environment that has a shared storage pool and compute nodes that have
+1253     # vCPU and RAM associated with the same aggregate as the provider
+1254     # representing the shared storage pool, and where the request specified
+1255     # aggregates that the compute nodes had to be associated with:
+1256     #
+1257     # SELECT rp.id
+1258     # FROM resource_providers AS rp
+1259     # INNER JOIN inventories AS inv_vcpu
+1260     #  ON rp.id = inv_vcpu.resource_provider_id
+1261     #  AND inv_vcpu.resource_class_id = $VCPU_ID
+1262     # LEFT JOIN (
+1263     #  SELECT resource_provider_id, SUM(used) AS used
+1264     #  FROM allocations
+1265     #  WHERE resource_class_id = $VCPU_ID
+1266     #  GROUP BY resource_provider_id
+1267     # ) AS usage_vcpu
+1268     #  ON rp.id = usage_vcpu.resource_provider_id
+1269     # INNER JOIN inventories AS inv_memory_mb
+1270     #  ON rp.id = inv_memory_mb.resource_provider_id
+1271     #  AND inv_memory_mb.resource_class_id = $MEMORY_MB_ID
+1272     # LEFT JOIN (
+1273     #  SELECT resource_provider_id, SUM(used) AS used
+1274     #  FROM allocations
+1275     #  WHERE resource_class_id = $MEMORY_MB_ID
+1276     #  GROUP BY resource_provider_id
+1277     # ) AS usage_memory_mb
+1278     #  ON rp.id = usage_memory_mb.resource_provider_id
+1279     # LEFT JOIN inventories AS inv_disk_gb
+1280     #  ON inv_memory_mb.resource_provider_id = \
+1281     #       inv_disk_gb.resource_provider_id
+1282     #  AND inv_disk_gb.resource_class_id = $DISK_GB_ID
+1283     # LEFT JOIN (
+1284     #  SELECT resource_provider_id, SUM(used) AS used
+1285     #  FROM allocations
+1286     #  WHERE resource_class_id = $DISK_GB_ID
+1287     #  GROUP BY resource_provider_id
+1288     # ) AS usage_disk_gb
+1289     #  ON rp.id = usage_disk_gb.resource_provider_id
+1290     # LEFT JOIN resource_provider_aggregates AS shared_disk_gb
+1291     #  ON rp.id = shared_disk.resource_provider_id
+1292     # LEFT JOIN resource_provider_aggregates AS sharing_disk_gb
+1293     #  ON shared_disk_gb.aggregate_id = sharing_disk_gb.aggregate_id
+1294     #  AND sharing_disk_gb.resource_provider_id IN ($RPS_SHARING_DISK)
+1295     # INNER JOIN resource_provider_aggregates AS member_aggs
+1296     #  ON rp.id = member_aggs.resource_provider_id
+1297     #  AND member_aggs.aggregate_id IN ($MEMBER_OF)
+1298     # WHERE (
+1299     #   (
+1300     #     COALESCE(usage_vcpu.used, 0) + $AMOUNT_VCPU <=
+1301     #     (inv_vcpu.total - inv_vcpu.reserved)
+1302     #     * inv_vcpu.allocation_ratio
+1303     #   ) AND
+1304     #   inv_vcpu.min_unit <= $AMOUNT_VCPU AND
+1305     #   inv_vcpu.max_unit >= $AMOUNT_VCPU AND
+1306     #   $AMOUNT_VCPU % inv_vcpu.step_size == 0
+1307     # ) AND (
+1308     #   (
+1309     #     COALESCE(usage_memory_mb.used, 0) + $AMOUNT_MEMORY_MB <=
+1310     #     (inv_memory_mb.total - inv_memory_mb.reserved)
+1311     #     * inv_memory_mb.allocation_ratio
+1312     #   ) AND
+1313     #   inv_memory_mb.min_unit <= $AMOUNT_MEMORY_MB AND
+1314     #   inv_memory_mb.max_unit >= $AMOUNT_MEMORY_MB AND
+1315     #   $AMOUNT_MEMORY_MB % inv_memory_mb.step_size == 0
+1316     # ) AND (
+1317     #   inv_disk.resource_provider_id IS NOT NULL AND
+1318     #   (
+1319     #     (
+1320     #       COALESCE(usage_disk_gb.used, 0) + $AMOUNT_DISK_GB <=
+1321     #         (inv_disk_gb.total - inv_disk_gb.reserved)
+1322     #         * inv_disk_gb.allocation_ratio
+1323     #     ) AND
+1324     #     inv_disk_gb.min_unit <= $AMOUNT_DISK_GB AND
+1325     #     inv_disk_gb.max_unit >= $AMOUNT_DISK_GB AND
+1326     #     $AMOUNT_DISK_GB % inv_disk_gb.step_size == 0
+1327     #   ) OR
+1328     #     sharing_disk_gb.resource_provider_id IS NOT NULL
+1329     # )
+1330     # GROUP BY rp.id
+1331 
+1332     rpt = sa.alias(_RP_TBL, name="rp")
+1333 
+1334     # Contains a set of resource provider IDs for each resource class requested
+1335     sharing_providers = {
+1336         rc_id: _get_providers_with_shared_capacity(ctx, rc_id, amount)
+1337         for rc_id, amount in resources.items()
+1338     }
+1339 
+1340     name_map = {
+1341         rc_id: _RC_CACHE.string_from_id(rc_id).lower() for rc_id in resources
+1342     }
+1343 
+1344     # Dict, keyed by resource class ID, of an aliased table object for the
+1345     # inventories table winnowed to only that resource class.
+1346     inv_tables = {
+1347         rc_id: sa.alias(_INV_TBL, name='inv_%s' % name_map[rc_id])
+1348         for rc_id in resources
+1349     }
+1350 
+1351     # Dict, keyed by resource class ID, of a derived table (subquery in the
+1352     # FROM clause or JOIN) against the allocations table  winnowed to only that
+1353     # resource class, grouped by resource provider.
+1354     usage_tables = {
+1355         rc_id: sa.alias(
+1356             sa.select([
+1357                 _ALLOC_TBL.c.resource_provider_id,
+1358                 sql.func.sum(_ALLOC_TBL.c.used).label('used'),
+1359             ]).where(
+1360                 _ALLOC_TBL.c.resource_class_id == rc_id
+1361             ).group_by(
+1362                 _ALLOC_TBL.c.resource_provider_id
+1363             ),
+1364             name='usage_%s' % name_map[rc_id],
+1365         )
+1366         for rc_id in resources
+1367     }
+1368 
+1369     # Dict, keyed by resource class ID, of an aliased table of
+1370     # resource_provider_aggregates representing the aggregates associated with
+1371     # a provider sharing the resource class
+1372     sharing_tables = {
+1373         rc_id: sa.alias(_RP_AGG_TBL, name='sharing_%s' % name_map[rc_id])
+1374         for rc_id in resources
+1375         if len(sharing_providers[rc_id]) > 0
+1376     }
+1377 
+1378     # Dict, keyed by resource class ID, of an aliased table of
+1379     # resource_provider_aggregates representing the resource providers
+1380     # associated by aggregate to the providers sharing a particular resource
+1381     # class.
+1382     shared_tables = {
+1383         rc_id: sa.alias(_RP_AGG_TBL, name='shared_%s' % name_map[rc_id])
+1384         for rc_id in resources
+1385         if len(sharing_providers[rc_id]) > 0
+1386     }
+1387 
+1388     # List of the WHERE conditions we build up by looking at the contents
+1389     # of the sharing providers
+1390     where_conds = []
+1391 
+1392     # Primary selection is on the resource_providers table and all of the
+1393     # aliased table copies of resource_provider_aggregates for each resource
+1394     # being shared
+1395     sel = sa.select([rpt.c.id])
+1396 
+1397     # The chain of joins that we eventually pass to select_from()
+1398     join_chain = None
+1399 
+1400     for rc_id, sps in sharing_providers.items():
+1401         it = inv_tables[rc_id]
+1402         ut = usage_tables[rc_id]
+1403         amount = resources[rc_id]
+1404 
+1405         rp_link = join_chain if join_chain is not None else rpt
+1406 
+1407         # We can do a more efficient INNER JOIN when we don't have shared
+1408         # resource providers for this resource class
+1409         joiner = sa.join
+1410         if sps:
+1411             joiner = sa.outerjoin
+1412         # Add a join condition winnowing this copy of inventories table
+1413         # to only the resource class being analyzed in this loop...
+1414         inv_join = joiner(rp_link, it,
+1415             sa.and_(rpt.c.id == it.c.resource_provider_id,
+1416                     it.c.resource_class_id == rc_id))
+1417         usage_join = sa.outerjoin(inv_join, ut,
+1418             rpt.c.id == ut.c.resource_provider_id)
+1419         join_chain = usage_join
+1420 
+1421         usage_cond = sa.and_(
+1422             ((sql.func.coalesce(ut.c.used, 0) + amount) <=
+1423              (it.c.total - it.c.reserved) * it.c.allocation_ratio),
+1424             it.c.min_unit <= amount,
+1425             it.c.max_unit >= amount,
+1426             amount % it.c.step_size == 0)
+1427         if not sps:
+1428             where_conds.append(usage_cond)
+1429         else:
+1430             sharing = sharing_tables[rc_id]
+1431             shared = shared_tables[rc_id]
+1432             cond = sa.or_(
+1433                 sa.and_(
+1434                     it.c.resource_provider_id != sa.null(),
+1435                     usage_cond,
+1436                 ),
+1437                 sharing.c.resource_provider_id != sa.null())
+1438             where_conds.append(cond)
+1439 
+1440             # We need to add the "butterfly" join now that produces the set of
+1441             # resource providers associated with a provider that is sharing the
+1442             # resource via an aggregate
+1443             shared_join = sa.outerjoin(join_chain, shared,
+1444                 rpt.c.id == shared.c.resource_provider_id)
+1445             sharing_join = sa.outerjoin(shared_join, sharing,
+1446                 sa.and_(
+1447                     shared.c.aggregate_id == sharing.c.aggregate_id,
+1448                     sharing.c.resource_provider_id.in_(sps),
+1449                 ))
+1450             join_chain = sharing_join
+1451 
+1452     # If 'member_of' has values join with the PlacementAggregates to
+1453     # get those resource providers that are associated with any of the
+1454     # list of aggregate uuids provided with 'member_of'.
+1455     if member_of:
+1456         member_join = sa.join(join_chain, _RP_AGG_TBL,
+1457                 _RP_AGG_TBL.c.resource_provider_id == rpt.c.id)
+1458         agg_join = sa.join(member_join, _AGG_TBL, sa.and_(
+1459                 _AGG_TBL.c.id == _RP_AGG_TBL.c.aggregate_id,
+1460                 _AGG_TBL.c.uuid.in_(member_of)))
+1461         join_chain = agg_join
+1462 
+1463     sel = sel.select_from(join_chain)
+1464     sel = sel.where(sa.and_(*where_conds))
+1465     sel = sel.group_by(rpt.c.id)
+1466 
+1467     return [r for r in ctx.session.execute(sel)]
+1468 
+1469 
+1470 @base.VersionedObjectRegistry.register_if(False)
+1471 class ResourceProviderList(base.ObjectListBase, base.VersionedObject):
+1472 
+1473     fields = {
+1474         'objects': fields.ListOfObjectsField('ResourceProvider'),
+1475     }
+1476 
+1477     @staticmethod
+1478     @db_api.api_context_manager.reader
+1479     def _get_all_by_filters_from_db(context, filters):
+1480         # Eg. filters can be:
+1481         #  filters = {
+1482         #      'name': <name>,
+1483         #      'uuid': <uuid>,
+1484         #      'member_of': [<aggregate_uuid>, <aggregate_uuid>]
+1485         #      'resources': {
+1486         #          'VCPU': 1,
+1487         #          'MEMORY_MB': 1024
+1488         #      },
+1489         #      'in_tree': <uuid>,
+1490         #      'required': [<trait_name>, ...]
+1491         #  }
+1492         if not filters:
+1493             filters = {}
+1494         else:
+1495             # Since we modify the filters, copy them so that we don't modify
+1496             # them in the calling program.
+1497             filters = copy.deepcopy(filters)
+1498         name = filters.pop('name', None)
+1499         uuid = filters.pop('uuid', None)
+1500         member_of = filters.pop('member_of', [])
+1501         required = filters.pop('required', [])
+1502 
+1503         resources = filters.pop('resources', {})
+1504         # NOTE(sbauza): We want to key the dict by the resource class IDs
+1505         # and we want to make sure those class names aren't incorrect.
+1506         resources = {_RC_CACHE.id_from_string(r_name): amount
+1507                      for r_name, amount in resources.items()}
+1508         rp = sa.alias(_RP_TBL, name="rp")
+1509         root_rp = sa.alias(_RP_TBL, name="root_rp")
+1510         parent_rp = sa.alias(_RP_TBL, name="parent_rp")
+1511 
+1512         cols = [
+1513             rp.c.id,
+1514             rp.c.uuid,
+1515             rp.c.name,
+1516             rp.c.generation,
+1517             rp.c.updated_at,
+1518             rp.c.created_at,
+1519             root_rp.c.uuid.label("root_provider_uuid"),
+1520             parent_rp.c.uuid.label("parent_provider_uuid"),
+1521         ]
+1522 
+1523         # TODO(jaypipes): Convert this to an inner join once all
+1524         # root_provider_id values are NOT NULL
+1525         rp_to_root = sa.outerjoin(rp, root_rp,
+1526             rp.c.root_provider_id == root_rp.c.id)
+1527         rp_to_parent = sa.outerjoin(rp_to_root, parent_rp,
+1528             rp.c.parent_provider_id == parent_rp.c.id)
+1529 
+1530         query = sa.select(cols).select_from(rp_to_parent)
+1531 
+1532         if name:
+1533             query = query.where(rp.c.name == name)
+1534         if uuid:
+1535             query = query.where(rp.c.uuid == uuid)
+1536         if 'in_tree' in filters:
+1537             # The 'in_tree' parameter is the UUID of a resource provider that
+1538             # the caller wants to limit the returned providers to only those
+1539             # within its "provider tree". So, we look up the resource provider
+1540             # having the UUID specified by the 'in_tree' parameter and grab the
+1541             # root_provider_id value of that record. We can then ask for only
+1542             # those resource providers having a root_provider_id of that value.
+1543             tree_uuid = filters.pop('in_tree')
+1544             tree_ids = _provider_ids_from_uuid(context, tree_uuid)
+1545             if tree_ids is None:
+1546                 # List operations should simply return an empty list when a
+1547                 # non-existing resource provider UUID is given.
+1548                 return []
+1549             root_id = tree_ids.root_id
+1550             # TODO(jaypipes): Remove this OR condition when root_provider_id
+1551             # is not nullable in the database and all resource provider records
+1552             # have populated the root provider ID.
+1553             where_cond = sa.or_(rp.c.id == root_id,
+1554                 rp.c.root_provider_id == root_id)
+1555             query = query.where(where_cond)
+1556 
+1557         # If 'member_of' has values join with the PlacementAggregates to
+1558         # get those resource providers that are associated with any of the
+1559         # list of aggregate uuids provided with 'member_of'.
+1560         if member_of:
+1561             join_statement = sa.join(_AGG_TBL, _RP_AGG_TBL, sa.and_(
+1562                 _AGG_TBL.c.id == _RP_AGG_TBL.c.aggregate_id,
+1563                 _AGG_TBL.c.uuid.in_(member_of)))
+1564             resource_provider_id = _RP_AGG_TBL.c.resource_provider_id
+1565             rps_in_aggregates = sa.select(
+1566                 [resource_provider_id]).select_from(join_statement)
+1567             query = query.where(rp.c.id.in_(rps_in_aggregates))
+1568 
+1569         # If 'required' has values, add a filter to limit results to providers
+1570         # possessing *all* of the listed traits.
+1571         if required:
+1572             trait_map = _trait_ids_from_names(context, required)
+1573             if len(trait_map) != len(required):
+1574                 missing = required - set(trait_map)
+1575                 raise exception.TraitNotFound(names=', '.join(missing))
+1576             rp_ids = _get_provider_ids_having_all_traits(context, trait_map)
+1577             if not rp_ids:
+1578                 # If no providers have the required traits, we're done
+1579                 return []
+1580             query = query.where(rp.c.id.in_(rp_ids))
+1581 
+1582         if not resources:
+1583             # Returns quickly the list in case we don't need to check the
+1584             # resource usage
+1585             res = context.session.execute(query).fetchall()
+1586             return [dict(r) for r in res]
+1587 
+1588         # NOTE(sbauza): In case we want to look at the resource criteria, then
+1589         # the SQL generated from this case looks something like:
+1590         # SELECT
+1591         #   rp.*
+1592         # FROM resource_providers AS rp
+1593         # JOIN inventories AS inv
+1594         # ON rp.id = inv.resource_provider_id
+1595         # LEFT JOIN (
+1596         #    SELECT resource_provider_id, resource_class_id, SUM(used) AS used
+1597         #    FROM allocations
+1598         #    WHERE resource_class_id IN ($RESOURCE_CLASSES)
+1599         #    GROUP BY resource_provider_id, resource_class_id
+1600         # ) AS usage
+1601         #     ON inv.resource_provider_id = usage.resource_provider_id
+1602         #     AND inv.resource_class_id = usage.resource_class_id
+1603         # AND (inv.resource_class_id = $X AND (used + $AMOUNT_X <= (
+1604         #        total - reserved) * inv.allocation_ratio) AND
+1605         #        inv.min_unit <= $AMOUNT_X AND inv.max_unit >= $AMOUNT_X AND
+1606         #        $AMOUNT_X % inv.step_size == 0)
+1607         #      OR (inv.resource_class_id = $Y AND (used + $AMOUNT_Y <= (
+1608         #        total - reserved) * inv.allocation_ratio) AND
+1609         #        inv.min_unit <= $AMOUNT_Y AND inv.max_unit >= $AMOUNT_Y AND
+1610         #        $AMOUNT_Y % inv.step_size == 0)
+1611         #      OR (inv.resource_class_id = $Z AND (used + $AMOUNT_Z <= (
+1612         #        total - reserved) * inv.allocation_ratio) AND
+1613         #        inv.min_unit <= $AMOUNT_Z AND inv.max_unit >= $AMOUNT_Z AND
+1614         #        $AMOUNT_Z % inv.step_size == 0))
+1615         # GROUP BY rp.id
+1616         # HAVING
+1617         #  COUNT(DISTINCT(inv.resource_class_id)) == len($RESOURCE_CLASSES)
+1618         #
+1619         # with a possible additional WHERE clause for the name and uuid that
+1620         # comes from the above filters
+1621 
+1622         # First JOIN between inventories and RPs is here
+1623         inv_join = sa.join(rp_to_parent, _INV_TBL,
+1624             rp.c.id == _INV_TBL.c.resource_provider_id)
+1625 
+1626         # Now, below is the LEFT JOIN for getting the allocations usage
+1627         usage = sa.select([_ALLOC_TBL.c.resource_provider_id,
+1628                            _ALLOC_TBL.c.resource_class_id,
+1629                            sql.func.sum(_ALLOC_TBL.c.used).label('used')])
+1630         usage = usage.where(_ALLOC_TBL.c.resource_class_id.in_(resources))
+1631         usage = usage.group_by(_ALLOC_TBL.c.resource_provider_id,
+1632                                _ALLOC_TBL.c.resource_class_id)
+1633         usage = sa.alias(usage, name='usage')
+1634         usage_join = sa.outerjoin(inv_join, usage,
+1635             sa.and_(
+1636                 usage.c.resource_provider_id == (
+1637                     _INV_TBL.c.resource_provider_id),
+1638                 usage.c.resource_class_id == _INV_TBL.c.resource_class_id))
+1639 
+1640         # And finally, we verify for each resource class if the requested
+1641         # amount isn't more than the left space (considering the allocation
+1642         # ratio, the reserved space and the min and max amount possible sizes)
+1643         where_clauses = [
+1644             sa.and_(
+1645                 _INV_TBL.c.resource_class_id == r_idx,
+1646                 (func.coalesce(usage.c.used, 0) + amount <= (
+1647                     _INV_TBL.c.total - _INV_TBL.c.reserved
+1648                 ) * _INV_TBL.c.allocation_ratio),
+1649                 _INV_TBL.c.min_unit <= amount,
+1650                 _INV_TBL.c.max_unit >= amount,
+1651                 amount % _INV_TBL.c.step_size == 0
+1652             )
+1653             for (r_idx, amount) in resources.items()]
+1654         query = query.select_from(usage_join)
+1655         query = query.where(sa.or_(*where_clauses))
+1656         query = query.group_by(rp.c.id)
+1657         # NOTE(sbauza): Only RPs having all the asked resources can be provided
+1658         query = query.having(sql.func.count(
+1659             sa.distinct(_INV_TBL.c.resource_class_id)) == len(resources))
+1660 
+1661         res = context.session.execute(query).fetchall()
+1662         return [dict(r) for r in res]
+1663 
+1664     @classmethod
+1665     def get_all_by_filters(cls, context, filters=None):
+1666         """Returns a list of `ResourceProvider` objects that have sufficient
+1667         resources in their inventories to satisfy the amounts specified in the
+1668         `filters` parameter.
+1669 
+1670         If no resource providers can be found, the function will return an
+1671         empty list.
+1672 
+1673         :param context: `nova.context.RequestContext` that may be used to grab
+1674                         a DB connection.
+1675         :param filters: Can be `name`, `uuid`, `member_of`, `in_tree` or
+1676                         `resources` where `member_of` is a list of aggregate
+1677                         uuids, `in_tree` is a UUID of a resource provider that
+1678                         we can use to find the root provider ID of the tree of
+1679                         providers to filter results by and `resources` is a
+1680                         dict of amounts keyed by resource classes.
+1681         :type filters: dict
+1682         """
+1683         _ensure_rc_cache(context)
+1684         _ensure_trait_sync(context)
+1685         resource_providers = cls._get_all_by_filters_from_db(context, filters)
+1686         return base.obj_make_list(context, cls(context),
+1687                                   ResourceProvider, resource_providers)
+1688 
+1689 
+1690 @base.VersionedObjectRegistry.register_if(False)
+1691 class Inventory(base.VersionedObject, base.TimestampedObject):
+1692 
+1693     fields = {
+1694         'id': fields.IntegerField(read_only=True),
+1695         'resource_provider': fields.ObjectField('ResourceProvider'),
+1696         'resource_class': rc_fields.ResourceClassField(read_only=True),
+1697         'total': fields.NonNegativeIntegerField(),
+1698         'reserved': fields.NonNegativeIntegerField(default=0),
+1699         'min_unit': fields.NonNegativeIntegerField(default=1),
+1700         'max_unit': fields.NonNegativeIntegerField(default=1),
+1701         'step_size': fields.NonNegativeIntegerField(default=1),
+1702         'allocation_ratio': fields.NonNegativeFloatField(default=1.0),
+1703     }
+1704 
+1705     @property
+1706     def capacity(self):
+1707         """Inventory capacity, adjusted by allocation_ratio."""
+1708         return int((self.total - self.reserved) * self.allocation_ratio)
+1709 
+1710 
+1711 @db_api.api_context_manager.reader
+1712 def _get_inventory_by_provider_id(ctx, rp_id):
+1713     inv = sa.alias(_INV_TBL, name="i")
+1714     cols = [
+1715         inv.c.resource_class_id,
+1716         inv.c.total,
+1717         inv.c.reserved,
+1718         inv.c.min_unit,
+1719         inv.c.max_unit,
+1720         inv.c.step_size,
+1721         inv.c.allocation_ratio,
+1722         inv.c.updated_at,
+1723         inv.c.created_at,
+1724     ]
+1725     sel = sa.select(cols)
+1726     sel = sel.where(inv.c.resource_provider_id == rp_id)
+1727 
+1728     return [dict(r) for r in ctx.session.execute(sel)]
+1729 
+1730 
+1731 @base.VersionedObjectRegistry.register_if(False)
+1732 class InventoryList(base.ObjectListBase, base.VersionedObject):
+1733 
+1734     fields = {
+1735         'objects': fields.ListOfObjectsField('Inventory'),
+1736     }
+1737 
+1738     def find(self, res_class):
+1739         """Return the inventory record from the list of Inventory records that
+1740         matches the supplied resource class, or None.
+1741 
+1742         :param res_class: An integer or string representing a resource
+1743                           class. If the value is a string, the method first
+1744                           looks up the resource class identifier from the
+1745                           string.
+1746         """
+1747         if not isinstance(res_class, six.string_types):
+1748             raise ValueError
+1749 
+1750         for inv_rec in self.objects:
+1751             if inv_rec.resource_class == res_class:
+1752                 return inv_rec
+1753 
+1754     @classmethod
+1755     def get_all_by_resource_provider(cls, context, rp):
+1756         _ensure_rc_cache(context)
+1757         db_inv = _get_inventory_by_provider_id(context, rp.id)
+1758         # Build up a list of Inventory objects, setting the Inventory object
+1759         # fields to the same-named database record field we got from
+1760         # _get_inventory_by_provider_id(). We already have the ResourceProvider
+1761         # object so we just pass that object to the Inventory object
+1762         # constructor as-is
+1763         objs = [
+1764             Inventory(
+1765                 context, resource_provider=rp,
+1766                 resource_class=_RC_CACHE.string_from_id(
+1767                     rec['resource_class_id']),
+1768                 **rec)
+1769             for rec in db_inv
+1770         ]
+1771         inv_list = cls(context, objects=objs)
+1772         return inv_list
+1773 
+1774 
+1775 @base.VersionedObjectRegistry.register_if(False)
+1776 class Allocation(base.VersionedObject, base.TimestampedObject):
+1777 
+1778     fields = {
+1779         'id': fields.IntegerField(),
+1780         'resource_provider': fields.ObjectField('ResourceProvider'),
+1781         'consumer_id': fields.UUIDField(),
+1782         # 'None' is a valid value for consumer_generation.
+1783         'consumer_generation': fields.IntegerField(nullable=True),
+1784         'resource_class': rc_fields.ResourceClassField(),
+1785         'used': fields.IntegerField(),
+1786         # The following two fields are allowed to be set to None to
+1787         # support Allocations that were created before the fields were
+1788         # required.
+1789         'project_id': fields.StringField(nullable=True),
+1790         'user_id': fields.StringField(nullable=True),
+1791     }
+1792 
+1793     def ensure_project_user(self, ctx):
+1794         """Examines the project_id, user_id of the object and ensures that if
+1795         project_id and user_id are set that there are records in the projects
+1796         and users table for these entities.
+1797 
+1798         :param ctx: `nova.context.RequestContext` object that has the oslo.db
+1799                     Session object in it
+1800         """
+1801         # If project_id and user_id are not set then silently
+1802         # move on. This allows microversion <1.8 to continue to work. Since
+1803         # then the fields are required and the enforcement is at the HTTP
+1804         # API layer.
+1805         if not ('project_id' in self and
+1806                 self.project_id is not None and
+1807                 'user_id' in self and
+1808                 self.user_id is not None):
+1809             return
+1810         # Make sure that there are records in their respective tables.
+1811         _ensure_project(ctx, self.project_id)
+1812         # Grab the user internal ID if it exists in the users table
+1813         _ensure_user(ctx, self.user_id)
+1814 
+1815 
+1816 def _delete_allocations_for_consumer(ctx, consumer_id):
+1817     """Deletes any existing allocations that correspond to the allocations to
+1818     be written. This is wrapped in a transaction, so if the write subsequently
+1819     fails, the deletion will also be rolled back.
+1820     """
+1821     del_sql = _ALLOC_TBL.delete().where(
+1822         _ALLOC_TBL.c.consumer_id == consumer_id)
+1823     ctx.session.execute(del_sql)
+1824 
+1825 
+1826 def _check_capacity_exceeded(ctx, allocs):
+1827     """Checks to see if the supplied allocation records would result in any of
+1828     the inventories involved having their capacity exceeded.
+1829 
+1830     Raises an InvalidAllocationCapacityExceeded exception if any inventory
+1831     would be exhausted by the allocation. Raises an
+1832     InvalidAllocationConstraintsViolated exception if any of the `step_size`,
+1833     `min_unit` or `max_unit` constraints in an inventory will be violated
+1834     by any one of the allocations.
+1835 
+1836     If no inventories would be exceeded or violated by the allocations, the
+1837     function returns a list of `ResourceProvider` objects that contain the
+1838     generation at the time of the check.
+1839 
+1840     :param ctx: `nova.context.RequestContext` that has an oslo_db Session
+1841     :param allocs: List of `Allocation` objects to check
+1842     """
+1843     # The SQL generated below looks like this:
+1844     # SELECT
+1845     #   rp.id,
+1846     #   rp.uuid,
+1847     #   rp.generation,
+1848     #   inv.resource_class_id,
+1849     #   inv.total,
+1850     #   inv.reserved,
+1851     #   inv.allocation_ratio,
+1852     #   allocs.used
+1853     # FROM resource_providers AS rp
+1854     # JOIN inventories AS i1
+1855     # ON rp.id = i1.resource_provider_id
+1856     # LEFT JOIN (
+1857     #    SELECT resource_provider_id, resource_class_id, SUM(used) AS used
+1858     #    FROM allocations
+1859     #    WHERE resource_class_id IN ($RESOURCE_CLASSES)
+1860     #    GROUP BY resource_provider_id, resource_class_id
+1861     # ) AS allocs
+1862     # ON inv.resource_provider_id = allocs.resource_provider_id
+1863     # AND inv.resource_class_id = allocs.resource_class_id
+1864     # WHERE rp.uuid IN ($RESOURCE_PROVIDERS)
+1865     # AND inv.resource_class_id IN ($RESOURCE_CLASSES)
+1866     #
+1867     # We then take the results of the above and determine if any of the
+1868     # inventory will have its capacity exceeded.
+1869     rc_ids = set([_RC_CACHE.id_from_string(a.resource_class)
+1870                        for a in allocs])
+1871     provider_uuids = set([a.resource_provider.uuid for a in allocs])
+1872 
+1873     usage = sa.select([_ALLOC_TBL.c.resource_provider_id,
+1874                        _ALLOC_TBL.c.resource_class_id,
+1875                        sql.func.sum(_ALLOC_TBL.c.used).label('used')])
+1876     usage = usage.where(_ALLOC_TBL.c.resource_class_id.in_(rc_ids))
+1877     usage = usage.group_by(_ALLOC_TBL.c.resource_provider_id,
+1878                            _ALLOC_TBL.c.resource_class_id)
+1879     usage = sa.alias(usage, name='usage')
+1880 
+1881     inv_join = sql.join(_RP_TBL, _INV_TBL,
+1882             sql.and_(_RP_TBL.c.id == _INV_TBL.c.resource_provider_id,
+1883                      _INV_TBL.c.resource_class_id.in_(rc_ids)))
+1884     primary_join = sql.outerjoin(inv_join, usage,
+1885         sql.and_(
+1886             _INV_TBL.c.resource_provider_id == usage.c.resource_provider_id,
+1887             _INV_TBL.c.resource_class_id == usage.c.resource_class_id)
+1888     )
+1889     cols_in_output = [
+1890         _RP_TBL.c.id.label('resource_provider_id'),
+1891         _RP_TBL.c.uuid,
+1892         _RP_TBL.c.generation,
+1893         _INV_TBL.c.resource_class_id,
+1894         _INV_TBL.c.total,
+1895         _INV_TBL.c.reserved,
+1896         _INV_TBL.c.allocation_ratio,
+1897         _INV_TBL.c.min_unit,
+1898         _INV_TBL.c.max_unit,
+1899         _INV_TBL.c.step_size,
+1900         usage.c.used,
+1901     ]
+1902 
+1903     sel = sa.select(cols_in_output).select_from(primary_join)
+1904     sel = sel.where(
+1905             sa.and_(_RP_TBL.c.uuid.in_(provider_uuids),
+1906                     _INV_TBL.c.resource_class_id.in_(rc_ids)))
+1907     records = ctx.session.execute(sel)
+1908     # Create a map keyed by (rp_uuid, res_class) for the records in the DB
+1909     usage_map = {}
+1910     provs_with_inv = set()
+1911     for record in records:
+1912         map_key = (record['uuid'], record['resource_class_id'])
+1913         if map_key in usage_map:
+1914             raise KeyError("%s already in usage_map, bad query" % str(map_key))
+1915         usage_map[map_key] = record
+1916         provs_with_inv.add(record["uuid"])
+1917     # Ensure that all providers have existing inventory
+1918     missing_provs = provider_uuids - provs_with_inv
+1919     if missing_provs:
+1920         class_str = ', '.join([_RC_CACHE.string_from_id(rc_id)
+1921                                for rc_id in rc_ids])
+1922         provider_str = ', '.join(missing_provs)
+1923         raise exception.InvalidInventory(resource_class=class_str,
+1924                 resource_provider=provider_str)
+1925 
+1926     res_providers = {}
+1927     for alloc in allocs:
+1928         rc_id = _RC_CACHE.id_from_string(alloc.resource_class)
+1929         rp_uuid = alloc.resource_provider.uuid
+1930         key = (rp_uuid, rc_id)
+1931         try:
+1932             usage = usage_map[key]
+1933         except KeyError:
+1934             # The resource class at rc_id is not in the usage map.
+1935             raise exception.InvalidInventory(
+1936                     resource_class=alloc.resource_class,
+1937                     resource_provider=rp_uuid)
+1938         amount_needed = alloc.used
+1939         allocation_ratio = usage['allocation_ratio']
+1940         min_unit = usage['min_unit']
+1941         max_unit = usage['max_unit']
+1942         step_size = usage['step_size']
+1943 
+1944         # check min_unit, max_unit, step_size
+1945         if (amount_needed < min_unit or amount_needed > max_unit or
+1946                 amount_needed % step_size != 0):
+1947             LOG.warning(
+1948                 "Allocation for %(rc)s on resource provider %(rp)s "
+1949                 "violates min_unit, max_unit, or step_size. "
+1950                 "Requested: %(requested)s, min_unit: %(min_unit)s, "
+1951                 "max_unit: %(max_unit)s, step_size: %(step_size)s",
+1952                 {'rc': alloc.resource_class,
+1953                  'rp': rp_uuid,
+1954                  'requested': amount_needed,
+1955                  'min_unit': min_unit,
+1956                  'max_unit': max_unit,
+1957                  'step_size': step_size})
+1958             raise exception.InvalidAllocationConstraintsViolated(
+1959                 resource_class=alloc.resource_class,
+1960                 resource_provider=rp_uuid)
+1961 
+1962         # usage["used"] can be returned as None
+1963         used = usage['used'] or 0
+1964         capacity = (usage['total'] - usage['reserved']) * allocation_ratio
+1965         if capacity < (used + amount_needed):
+1966             LOG.warning(
+1967                 "Over capacity for %(rc)s on resource provider %(rp)s. "
+1968                 "Needed: %(needed)s, Used: %(used)s, Capacity: %(cap)s",
+1969                 {'rc': alloc.resource_class,
+1970                  'rp': rp_uuid,
+1971                  'needed': amount_needed,
+1972                  'used': used,
+1973                  'cap': capacity})
+1974             raise exception.InvalidAllocationCapacityExceeded(
+1975                 resource_class=alloc.resource_class,
+1976                 resource_provider=rp_uuid)
+1977         if rp_uuid not in res_providers:
+1978             res_providers[rp_uuid] = alloc.resource_provider
+1979     return res_providers
+1980 
+1981 
+1982 def _ensure_lookup_table_entry(ctx, tbl, external_id):
+1983     """Ensures the supplied external ID exists in the specified lookup table
+1984     and if not, adds it. Returns the internal ID.
+1985 
+1986     :param ctx: `nova.context.RequestContext` object that has the oslo.db
+1987                 Session object in it
+1988     :param tbl: The lookup table
+1989     :param external_id: The external project or user identifier
+1990     :type external_id: string
+1991     """
+1992     # Grab the project internal ID if it exists in the projects table
+1993     sel = sa.select([tbl.c.id]).where(
+1994         tbl.c.external_id == external_id
+1995     )
+1996     res = ctx.session.execute(sel).fetchall()
+1997     if not res:
+1998         try:
+1999             ins_stmt = tbl.insert().values(external_id=external_id)
+2000             res = ctx.session.execute(ins_stmt)
+2001             return res.inserted_primary_key[0]
+2002         except db_exc.DBDuplicateEntry:
+2003             # Another thread added it just before us, so just read the
+2004             # internal ID that that thread created...
+2005             res = ctx.session.execute(sel).fetchall()
+2006 
+2007     return res[0][0]
+2008 
+2009 
+2010 def _ensure_project(ctx, external_id):
+2011     """Ensures the supplied external project ID exists in the projects lookup
+2012     table and if not, adds it. Returns the internal project ID.
+2013 
+2014     :param ctx: `nova.context.RequestContext` object that has the oslo.db
+2015                 Session object in it
+2016     :param external_id: The external project identifier
+2017     :type external_id: string
+2018     """
+2019     return _ensure_lookup_table_entry(ctx, _PROJECT_TBL, external_id)
+2020 
+2021 
+2022 def _ensure_user(ctx, external_id):
+2023     """Ensures the supplied external user ID exists in the users lookup table
+2024     and if not, adds it. Returns the internal user ID.
+2025 
+2026     :param ctx: `nova.context.RequestContext` object that has the oslo.db
+2027                 Session object in it
+2028     :param external_id: The external user identifier
+2029     :type external_id: string
+2030     """
+2031     return _ensure_lookup_table_entry(ctx, _USER_TBL, external_id)
+2032 
+2033 
+2034 @db_api.api_context_manager.reader
+2035 def _get_allocations_by_provider_id(ctx, rp_id):
+2036     allocs = sa.alias(_ALLOC_TBL, name="a")
+2037     consumer = sa.alias(_CONSUMER_TBL, name="c")
+2038     cols = [
+2039         allocs.c.resource_class_id,
+2040         allocs.c.consumer_id,
+2041         allocs.c.used,
+2042         allocs.c.updated_at,
+2043         allocs.c.created_at,
+2044         consumer.c.generation.label("consumer_generation"),
+2045     ]
+2046     consumer_join = sa.outerjoin(allocs, consumer,
+2047             allocs.c.consumer_id == consumer.c.uuid)
+2048     sel = sa.select(cols).select_from(consumer_join)
+2049     sel = sel.where(allocs.c.resource_provider_id == rp_id)
+2050 
+2051     return [dict(r) for r in ctx.session.execute(sel)]
+2052 
+2053 
+2054 @db_api.api_context_manager.reader
+2055 def _get_allocations_by_consumer_uuid(ctx, consumer_uuid):
+2056     allocs = sa.alias(_ALLOC_TBL, name="a")
+2057     rp = sa.alias(_RP_TBL, name="rp")
+2058     consumer = sa.alias(_CONSUMER_TBL, name="c")
+2059     project = sa.alias(_PROJECT_TBL, name="p")
+2060     user = sa.alias(_USER_TBL, name="u")
+2061     cols = [
+2062         allocs.c.resource_provider_id,
+2063         rp.c.name.label("resource_provider_name"),
+2064         rp.c.uuid.label("resource_provider_uuid"),
+2065         rp.c.generation.label("resource_provider_generation"),
+2066         allocs.c.resource_class_id,
+2067         allocs.c.consumer_id,
+2068         allocs.c.used,
+2069         project.c.external_id.label("project_id"),
+2070         user.c.external_id.label("user_id"),
+2071         consumer.c.generation.label("consumer_generation"),
+2072     ]
+2073     # Build up the joins of the five tables we need to interact with.
+2074     rp_join = sa.join(allocs, rp, allocs.c.resource_provider_id == rp.c.id)
+2075     consumer_join = sa.outerjoin(rp_join, consumer,
+2076                                  allocs.c.consumer_id == consumer.c.uuid)
+2077     project_join = sa.outerjoin(consumer_join, project,
+2078                                 consumer.c.project_id == project.c.id)
+2079     user_join = sa.outerjoin(project_join, user,
+2080                              consumer.c.user_id == user.c.id)
+2081 
+2082     sel = sa.select(cols).select_from(user_join)
+2083     sel = sel.where(allocs.c.consumer_id == consumer_uuid)
+2084 
+2085     return [dict(r) for r in ctx.session.execute(sel)]
+2086 
+2087 
+2088 @db_api.api_context_manager.reader
+2089 def _generation_for_consumer(ctx, consumer_uuid):
+2090     consumer = sa.alias(_CONSUMER_TBL, name="c")
+2091     sel = sa.select(["generation"]).select_from(consumer)
+2092     sel = sel.where(consumer.c.uuid == consumer_uuid)
+2093     rec = ctx.session.execute(sel).fetchone()
+2094     if rec:
+2095         return rec["generation"]
+2096     else:
+2097         return None
+2098 
+2099 
+2100 @base.VersionedObjectRegistry.register_if(False)
+2101 class AllocationList(base.ObjectListBase, base.VersionedObject):
+2102 
+2103     fields = {
+2104         'objects': fields.ListOfObjectsField('Allocation'),
+2105         'enforce_consumer_generation': fields.BooleanField(default=False),
+2106     }
+2107 
+2108     @oslo_db_api.wrap_db_retry(max_retries=5, retry_on_deadlock=True)
+2109     @db_api.api_context_manager.writer
+2110     def _set_allocations(self, context):
+2111         """Write a set of allocations.
+2112 
+2113         We must check that there is capacity for each allocation.
+2114         If there is not we roll back the entire set.
+2115 
+2116         :raises `exception.ResourceClassNotFound` if any resource class in any
+2117                 allocation in allocs cannot be found in either the standard
+2118                 classes or the DB.
+2119         :raises `exception.InvalidAllocationCapacityExceeded` if any inventory
+2120                 would be exhausted by the allocation.
+2121         :raises `InvalidAllocationConstraintsViolated` if any of the
+2122                 `step_size`, `min_unit` or `max_unit` constraints in an
+2123                 inventory will be violated by any one of the allocations.
+2124         :raises `exception.ConcurrentUpdateDetected` if another thread updated
+2125                 the allocations for the consumer in between the time when this
+2126                 object was originally read and the call to set the allocations.
+2127         """
+2128         allocs = self.objects
+2129         try:
+2130             enforce_cgen = self.enforce_consumer_generation
+2131         except NotImplementedError:
+2132             # Older tests don't set this value, so we cannot load the attribute
+2133             enforce_cgen = False
+2134         _ensure_rc_cache(context)
+2135         # Make sure that all of the allocations are new.
+2136         for alloc in allocs:
+2137             if 'id' in alloc:
+2138                 raise exception.ObjectActionError(action='create',
+2139                                                   reason='already created')
+2140 
+2141         # First delete any existing allocations for any consumers. This
+2142         # provides a clean slate for the consumers mentioned in the list of
+2143         # allocations being manipulated.
+2144         consumer_ids = set(alloc.consumer_id for alloc in allocs)
+2145         for consumer_id in consumer_ids:
+2146             _delete_allocations_for_consumer(context, consumer_id)
+2147 
+2148         # Before writing any allocation records, we check that the submitted
+2149         # allocations do not cause any inventory capacity to be exceeded for
+2150         # any resource provider and resource class involved in the allocation
+2151         # transaction. _check_capacity_exceeded() raises an exception if any
+2152         # inventory capacity is exceeded. If capacity is not exceeeded, the
+2153         # function returns a list of ResourceProvider objects containing the
+2154         # generation of the resource provider at the time of the check. These
+2155         # objects are used at the end of the allocation transaction as a guard
+2156         # against concurrent updates.
+2157         #
+2158         # Don't check capacity when alloc.used is zero. Zero is not a valid
+2159         # amount when making an allocation (the minimum consumption of a
+2160         # resource is one) but is used in this method to indicate a need for
+2161         # removal. Providing 0 is controlled at the HTTP API layer where PUT
+2162         # /allocations does not allow empty allocations. When POST /allocations
+2163         # is implemented it will for the special case of atomically setting and
+2164         # removing different allocations in the same request.
+2165         # _check_capacity_exceeded will raise a ResourceClassNotFound # if any
+2166         # allocation is using a resource class that does not exist.
+2167         visited_rps = _check_capacity_exceeded(context,
+2168                                                [alloc for alloc in
+2169                                                 allocs if alloc.used > 0])
+2170         seen_consumers = {}
+2171         for alloc in allocs:
+2172             # If alloc.used is set to zero that is a signal that we don't want
+2173             # to (re-)create any allocations for this resource class.
+2174             # _delete_current_allocs has already wiped out allocations so all
+2175             # that's being done here is adding the resource provider to
+2176             # visited_rps so its generation will be checked at the end of the
+2177             # transaction.
+2178             if alloc.used == 0:
+2179                 rp = alloc.resource_provider
+2180                 visited_rps[rp.uuid] = rp
+2181                 continue
+2182             consumer_id = alloc.consumer_id
+2183             if "consumer_generation" in alloc:
+2184                 consumer_generation = alloc.consumer_generation
+2185             else:
+2186                 consumer_generation = None
+2187             # Only set consumer <-> project/user association if we haven't set
+2188             # it already.
+2189             if consumer_id not in seen_consumers:
+2190                 seen_consumers[consumer_id] = {}
+2191                 cdict = seen_consumers[consumer_id]
+2192                 cdict["generation"] = consumer_generation
+2193                 cdict["enforce_cgen"] = enforce_cgen
+2194                 # Handle microversions < 1.8
+2195                 try:
+2196                     cdict["project_id"] = alloc.project_id
+2197                 except NotImplementedError:
+2198                     cdict["project_id"] = None
+2199                 try:
+2200                     cdict["user_id"] = alloc.user_id
+2201                 except NotImplementedError:
+2202                     cdict["user_id"] = None
+2203                 alloc.ensure_project_user(context)
+2204             rp = alloc.resource_provider
+2205             rc_id = _RC_CACHE.id_from_string(alloc.resource_class)
+2206             ins_stmt = _ALLOC_TBL.insert().values(
+2207                     resource_provider_id=rp.id,
+2208                     resource_class_id=rc_id,
+2209                     consumer_id=consumer_id,
+2210                     used=alloc.used)
+2211             context.session.execute(ins_stmt)
+2212 
+2213         # Generation checking happens here. If the inventory for this resource
+2214         # provider changed out from under us, this will raise a
+2215         # ConcurrentUpdateDetected which can be caught by the caller to choose
+2216         # to try again. It will also rollback the transaction so that these
+2217         # changes always happen atomically.
+2218         for rp in visited_rps.values():
+2219             rp.generation = _increment_provider_generation(context, rp)
+2220         # Likewise, check the generation for all the consumers. If some other
+2221         # process changed the allocations for the consumer while this was
+2222         # running, raise a ConcurrentUpdateDetected exception, which will
+2223         # rollback the transaction and notify the caller.
+2224         for consumer_id, consumer_dict in seen_consumers.items():
+2225             _increment_consumer_generation(context, consumer_id, consumer_dict)
+2226 
+2227     @classmethod
+2228     def get_all_by_resource_provider(cls, context, rp):
+2229         _ensure_rc_cache(context)
+2230         db_allocs = _get_allocations_by_provider_id(context, rp.id)
+2231         # Build up a list of Allocation objects, setting the Allocation object
+2232         # fields to the same-named database record field we got from
+2233         # _get_allocations_by_provider_id(). We already have the
+2234         # ResourceProvider object so we just pass that object to the Allocation
+2235         # object constructor as-is
+2236         objs = [
+2237             Allocation(
+2238                 context, resource_provider=rp,
+2239                 resource_class=_RC_CACHE.string_from_id(
+2240                     rec['resource_class_id']),
+2241                 **rec)
+2242             for rec in db_allocs
+2243         ]
+2244         alloc_list = cls(context, objects=objs)
+2245         return alloc_list
+2246 
+2247     @classmethod
+2248     def get_all_by_consumer_id(cls, context, consumer_id):
+2249         _ensure_rc_cache(context)
+2250         db_allocs = _get_allocations_by_consumer_uuid(context, consumer_id)
+2251         # Build up a list of Allocation objects, setting the Allocation object
+2252         # fields to the same-named database record field we got from
+2253         # _get_allocations_by_consumer_id().
+2254         #
+2255         # NOTE(jaypipes):  Unlike with get_all_by_resource_provider(), we do
+2256         # NOT already have the ResourceProvider object so we construct a new
+2257         # ResourceProvider object below by looking at the resource provider
+2258         # fields returned by _get_allocations_by_consumer_id().
+2259         objs = [
+2260             Allocation(
+2261                 context, resource_provider=ResourceProvider(
+2262                     context,
+2263                     id=rec['resource_provider_id'],
+2264                     uuid=rec['resource_provider_uuid'],
+2265                     name=rec['resource_provider_name'],
+2266                     generation=rec['resource_provider_generation']),
+2267                 resource_class=_RC_CACHE.string_from_id(
+2268                     rec['resource_class_id']),
+2269                 **rec)
+2270             for rec in db_allocs
+2271         ]
+2272         alloc_list = cls(context, objects=objs)
+2273         return alloc_list
+2274 
+2275     def create_all(self):
+2276         """Create the supplied allocations.
+2277 
+2278         Note that the Allocation objects that are created are not
+2279         returned to the caller, nor are their database ids set. If
+2280         those ids are required use one of the get_all_by* methods.
+2281         """
+2282         # TODO(jaypipes): Retry the allocation writes on
+2283         # ConcurrentUpdateDetected
+2284         self._set_allocations(self._context)
+2285 
+2286     @db_api.api_context_manager.writer
+2287     def delete_all(self, ctx):
+2288         # Allocations can only have a single consumer, so take advantage of
+2289         # that fact and do an efficient batch delete
+2290         alloc = self.objects[0]
+2291         consumer_uuid = alloc.consumer_id
+2292         if "consumer_generation" in alloc:
+2293             consumer_generation = alloc.consumer_generation
+2294         else:
+2295             consumer_generation = None
+2296         # Handle microversions < 1.8
+2297         try:
+2298             project_id = alloc.project_id
+2299         except NotImplementedError:
+2300             project_id = None
+2301         try:
+2302             user_id = alloc.user_id
+2303         except NotImplementedError:
+2304             user_id = None
+2305         try:
+2306             enforce_cgen = self.enforce_consumer_generation
+2307         except NotImplementedError:
+2308             # Older tests don't set this value, so we cannot load the attribute
+2309             enforce_cgen = False
+2310         consumer_dict = {
+2311                 "generation": consumer_generation,
+2312                 "project_id": project_id,
+2313                 "user_id": user_id,
+2314                 "enforce_cgen": enforce_cgen}
+2315         _delete_allocations_for_consumer(ctx, consumer_uuid)
+2316         _increment_consumer_generation(ctx, consumer_uuid, consumer_dict)
+2317 
+2318     def __repr__(self):
+2319         strings = [repr(x) for x in self.objects]
+2320         return "AllocationList[" + ", ".join(strings) + "]"
+2321 
+2322 
+2323 @base.VersionedObjectRegistry.register_if(False)
+2324 class Usage(base.VersionedObject):
+2325 
+2326     fields = {
+2327         'resource_class': rc_fields.ResourceClassField(read_only=True),
+2328         'usage': fields.NonNegativeIntegerField(),
+2329     }
+2330 
+2331     @staticmethod
+2332     def _from_db_object(context, target, source):
+2333         for field in target.fields:
+2334             if field not in ('resource_class'):
+2335                 setattr(target, field, source[field])
+2336 
+2337         if 'resource_class' not in target:
+2338             rc_str = _RC_CACHE.string_from_id(source['resource_class_id'])
+2339             target.resource_class = rc_str
+2340 
+2341         target._context = context
+2342         target.obj_reset_changes()
+2343         return target
+2344 
+2345 
+2346 @base.VersionedObjectRegistry.register_if(False)
+2347 class UsageList(base.ObjectListBase, base.VersionedObject):
+2348 
+2349     fields = {
+2350         'objects': fields.ListOfObjectsField('Usage'),
+2351     }
+2352 
+2353     @staticmethod
+2354     @db_api.api_context_manager.reader
+2355     def _get_all_by_resource_provider_uuid(context, rp_uuid):
+2356         query = (context.session.query(models.Inventory.resource_class_id,
+2357                  func.coalesce(func.sum(models.Allocation.used), 0))
+2358                  .join(models.ResourceProvider,
+2359                        models.Inventory.resource_provider_id ==
+2360                        models.ResourceProvider.id)
+2361                  .outerjoin(models.Allocation,
+2362                             sql.and_(models.Inventory.resource_provider_id ==
+2363                                      models.Allocation.resource_provider_id,
+2364                                      models.Inventory.resource_class_id ==
+2365                                      models.Allocation.resource_class_id))
+2366                  .filter(models.ResourceProvider.uuid == rp_uuid)
+2367                  .group_by(models.Inventory.resource_class_id))
+2368         result = [dict(resource_class_id=item[0], usage=item[1])
+2369                   for item in query.all()]
+2370         return result
+2371 
+2372     @staticmethod
+2373     @db_api.api_context_manager.reader
+2374     def _get_all_by_project_user(context, project_id, user_id=None):
+2375         query = (context.session.query(models.Allocation.resource_class_id,
+2376                  func.coalesce(func.sum(models.Allocation.used), 0))
+2377                  .join(models.Consumer,
+2378                        models.Allocation.consumer_id == models.Consumer.uuid)
+2379                  .join(models.Project,
+2380                        models.Consumer.project_id == models.Project.id)
+2381                  .filter(models.Project.external_id == project_id))
+2382         if user_id:
+2383             query = query.join(models.User,
+2384                                models.Consumer.user_id == models.User.id)
+2385             query = query.filter(models.User.external_id == user_id)
+2386         query = query.group_by(models.Allocation.resource_class_id)
+2387         result = [dict(resource_class_id=item[0], usage=item[1])
+2388                   for item in query.all()]
+2389         return result
+2390 
+2391     @classmethod
+2392     def get_all_by_resource_provider_uuid(cls, context, rp_uuid):
+2393         usage_list = cls._get_all_by_resource_provider_uuid(context, rp_uuid)
+2394         return base.obj_make_list(context, cls(context), Usage, usage_list)
+2395 
+2396     @classmethod
+2397     def get_all_by_project_user(cls, context, project_id, user_id=None):
+2398         usage_list = cls._get_all_by_project_user(context, project_id,
+2399                                                   user_id=user_id)
+2400         return base.obj_make_list(context, cls(context), Usage, usage_list)
+2401 
+2402     def __repr__(self):
+2403         strings = [repr(x) for x in self.objects]
+2404         return "UsageList[" + ", ".join(strings) + "]"
+2405 
+2406 
+2407 @base.VersionedObjectRegistry.register_if(False)
+2408 class ResourceClass(base.VersionedObject, base.TimestampedObject):
+2409 
+2410     MIN_CUSTOM_RESOURCE_CLASS_ID = 10000
+2411     """Any user-defined resource classes must have an identifier greater than
+2412     or equal to this number.
+2413     """
+2414 
+2415     # Retry count for handling possible race condition in creating resource
+2416     # class. We don't ever want to hit this, as it is simply a race when
+2417     # creating these classes, but this is just a stopgap to prevent a potential
+2418     # infinite loop.
+2419     RESOURCE_CREATE_RETRY_COUNT = 100
+2420 
+2421     fields = {
+2422         'id': fields.IntegerField(read_only=True),
+2423         'name': rc_fields.ResourceClassField(nullable=False),
+2424     }
+2425 
+2426     @staticmethod
+2427     def _from_db_object(context, target, source):
+2428         for field in target.fields:
+2429             setattr(target, field, source[field])
+2430 
+2431         target._context = context
+2432         target.obj_reset_changes()
+2433         return target
+2434 
+2435     @classmethod
+2436     def get_by_name(cls, context, name):
+2437         """Return a ResourceClass object with the given string name.
+2438 
+2439         :param name: String name of the resource class to find
+2440 
+2441         :raises: ResourceClassNotFound if no such resource class was found
+2442         """
+2443         _ensure_rc_cache(context)
+2444         rc = _RC_CACHE.all_from_string(name)
+2445         obj = cls(context, id=rc['id'], name=rc['name'],
+2446                   updated_at=rc['updated_at'], created_at=rc['created_at'])
+2447         obj.obj_reset_changes()
+2448         return obj
+2449 
+2450     @staticmethod
+2451     @db_api.api_context_manager.reader
+2452     def _get_next_id(context):
+2453         """Utility method to grab the next resource class identifier to use for
+2454          user-defined resource classes.
+2455         """
+2456         query = context.session.query(func.max(models.ResourceClass.id))
+2457         max_id = query.one()[0]
+2458         if not max_id:
+2459             return ResourceClass.MIN_CUSTOM_RESOURCE_CLASS_ID
+2460         else:
+2461             return max_id + 1
+2462 
+2463     def create(self):
+2464         if 'id' in self:
+2465             raise exception.ObjectActionError(action='create',
+2466                                               reason='already created')
+2467         if 'name' not in self:
+2468             raise exception.ObjectActionError(action='create',
+2469                                               reason='name is required')
+2470         if self.name in rc_fields.ResourceClass.STANDARD:
+2471             raise exception.ResourceClassExists(resource_class=self.name)
+2472 
+2473         if not self.name.startswith(rc_fields.ResourceClass.CUSTOM_NAMESPACE):
+2474             raise exception.ObjectActionError(
+2475                 action='create',
+2476                 reason='name must start with ' +
+2477                         rc_fields.ResourceClass.CUSTOM_NAMESPACE)
+2478 
+2479         updates = self.obj_get_changes()
+2480         # There is the possibility of a race when adding resource classes, as
+2481         # the ID is generated locally. This loop catches that exception, and
+2482         # retries until either it succeeds, or a different exception is
+2483         # encountered.
+2484         retries = self.RESOURCE_CREATE_RETRY_COUNT
+2485         while retries:
+2486             retries -= 1
+2487             try:
+2488                 rc = self._create_in_db(self._context, updates)
+2489                 self._from_db_object(self._context, self, rc)
+2490                 break
+2491             except db_exc.DBDuplicateEntry as e:
+2492                 if 'id' in e.columns:
+2493                     # Race condition for ID creation; try again
+2494                     continue
+2495                 # The duplication is on the other unique column, 'name'. So do
+2496                 # not retry; raise the exception immediately.
+2497                 raise exception.ResourceClassExists(resource_class=self.name)
+2498         else:
+2499             # We have no idea how common it will be in practice for the retry
+2500             # limit to be exceeded. We set it high in the hope that we never
+2501             # hit this point, but added this log message so we know that this
+2502             # specific situation occurred.
+2503             LOG.warning("Exceeded retry limit on ID generation while "
+2504                         "creating ResourceClass %(name)s",
+2505                         {'name': self.name})
+2506             msg = _("creating resource class %s") % self.name
+2507             raise exception.MaxDBRetriesExceeded(action=msg)
+2508 
+2509     @staticmethod
+2510     @db_api.api_context_manager.writer
+2511     def _create_in_db(context, updates):
+2512         next_id = ResourceClass._get_next_id(context)
+2513         rc = models.ResourceClass()
+2514         rc.update(updates)
+2515         rc.id = next_id
+2516         context.session.add(rc)
+2517         return rc
+2518 
+2519     def destroy(self):
+2520         if 'id' not in self:
+2521             raise exception.ObjectActionError(action='destroy',
+2522                                               reason='ID attribute not found')
+2523         # Never delete any standard resource class, since the standard resource
+2524         # classes don't even exist in the database table anyway.
+2525         _ensure_rc_cache(self._context)
+2526         if self.id in (rc['id'] for rc in _RC_CACHE.STANDARDS):
+2527             raise exception.ResourceClassCannotDeleteStandard(
+2528                     resource_class=self.name)
+2529 
+2530         self._destroy(self._context, self.id, self.name)
+2531         _RC_CACHE.clear()
+2532 
+2533     @staticmethod
+2534     @db_api.api_context_manager.writer
+2535     def _destroy(context, _id, name):
+2536         # Don't delete the resource class if it is referred to in the
+2537         # inventories table.
+2538         num_inv = context.session.query(models.Inventory).filter(
+2539                 models.Inventory.resource_class_id == _id).count()
+2540         if num_inv:
+2541             raise exception.ResourceClassInUse(resource_class=name)
+2542 
+2543         res = context.session.query(models.ResourceClass).filter(
+2544                 models.ResourceClass.id == _id).delete()
+2545         if not res:
+2546             raise exception.NotFound()
+2547 
+2548     def save(self):
+2549         if 'id' not in self:
+2550             raise exception.ObjectActionError(action='save',
+2551                                               reason='ID attribute not found')
+2552         updates = self.obj_get_changes()
+2553         # Never update any standard resource class, since the standard resource
+2554         # classes don't even exist in the database table anyway.
+2555         _ensure_rc_cache(self._context)
+2556         if self.id in (rc['id'] for rc in _RC_CACHE.STANDARDS):
+2557             raise exception.ResourceClassCannotUpdateStandard(
+2558                     resource_class=self.name)
+2559         self._save(self._context, self.id, self.name, updates)
+2560         _RC_CACHE.clear()
+2561 
+2562     @staticmethod
+2563     @db_api.api_context_manager.writer
+2564     def _save(context, id, name, updates):
+2565         db_rc = context.session.query(models.ResourceClass).filter_by(
+2566             id=id).first()
+2567         db_rc.update(updates)
+2568         try:
+2569             db_rc.save(context.session)
+2570         except db_exc.DBDuplicateEntry:
+2571             raise exception.ResourceClassExists(resource_class=name)
+2572 
+2573 
+2574 @base.VersionedObjectRegistry.register_if(False)
+2575 class ResourceClassList(base.ObjectListBase, base.VersionedObject):
+2576 
+2577     fields = {
+2578         'objects': fields.ListOfObjectsField('ResourceClass'),
+2579     }
+2580 
+2581     @staticmethod
+2582     @db_api.api_context_manager.reader
+2583     def _get_all(context):
+2584         _ensure_rc_cache(context)
+2585         customs = list(context.session.query(models.ResourceClass).all())
+2586         return _RC_CACHE.STANDARDS + customs
+2587 
+2588     @classmethod
+2589     def get_all(cls, context):
+2590         resource_classes = cls._get_all(context)
+2591         return base.obj_make_list(context, cls(context),
+2592                                   ResourceClass, resource_classes)
+2593 
+2594     def __repr__(self):
+2595         strings = [repr(x) for x in self.objects]
+2596         return "ResourceClassList[" + ", ".join(strings) + "]"
+2597 
+2598 
+2599 @base.VersionedObjectRegistry.register_if(False)
+2600 class Trait(base.VersionedObject, base.TimestampedObject):
+2601 
+2602     # All the user-defined traits must begin with this prefix.
+2603     CUSTOM_NAMESPACE = 'CUSTOM_'
+2604 
+2605     fields = {
+2606         'id': fields.IntegerField(read_only=True),
+2607         'name': fields.StringField(nullable=False)
+2608     }
+2609 
+2610     @staticmethod
+2611     def _from_db_object(context, trait, db_trait):
+2612         for key in trait.fields:
+2613             setattr(trait, key, db_trait[key])
+2614         trait.obj_reset_changes()
+2615         trait._context = context
+2616         return trait
+2617 
+2618     @staticmethod
+2619     @db_api.api_context_manager.writer
+2620     def _create_in_db(context, updates):
+2621         trait = models.Trait()
+2622         trait.update(updates)
+2623         context.session.add(trait)
+2624         return trait
+2625 
+2626     def create(self):
+2627         if 'id' in self:
+2628             raise exception.ObjectActionError(action='create',
+2629                                               reason='already created')
+2630         if 'name' not in self:
+2631             raise exception.ObjectActionError(action='create',
+2632                                               reason='name is required')
+2633 
+2634         updates = self.obj_get_changes()
+2635 
+2636         try:
+2637             db_trait = self._create_in_db(self._context, updates)
+2638         except db_exc.DBDuplicateEntry:
+2639             raise exception.TraitExists(name=self.name)
+2640 
+2641         self._from_db_object(self._context, self, db_trait)
+2642 
+2643     @staticmethod
+2644     @db_api.api_context_manager.writer  # trait sync can cause a write
+2645     def _get_by_name_from_db(context, name):
+2646         _ensure_trait_sync(context)
+2647         result = context.session.query(models.Trait).filter_by(
+2648             name=name).first()
+2649         if not result:
+2650             raise exception.TraitNotFound(names=name)
+2651         return result
+2652 
+2653     @classmethod
+2654     def get_by_name(cls, context, name):
+2655         db_trait = cls._get_by_name_from_db(context, six.text_type(name))
+2656         return cls._from_db_object(context, cls(), db_trait)
+2657 
+2658     @staticmethod
+2659     @db_api.api_context_manager.writer
+2660     def _destroy_in_db(context, _id, name):
+2661         num = context.session.query(models.ResourceProviderTrait).filter(
+2662             models.ResourceProviderTrait.trait_id == _id).count()
+2663         if num:
+2664             raise exception.TraitInUse(name=name)
+2665 
+2666         res = context.session.query(models.Trait).filter_by(
+2667             name=name).delete()
+2668         if not res:
+2669             raise exception.TraitNotFound(names=name)
+2670 
+2671     def destroy(self):
+2672         if 'name' not in self:
+2673             raise exception.ObjectActionError(action='destroy',
+2674                                               reason='name is required')
+2675 
+2676         if not self.name.startswith(self.CUSTOM_NAMESPACE):
+2677             raise exception.TraitCannotDeleteStandard(name=self.name)
+2678 
+2679         if 'id' not in self:
+2680             raise exception.ObjectActionError(action='destroy',
+2681                                               reason='ID attribute not found')
+2682 
+2683         self._destroy_in_db(self._context, self.id, self.name)
+2684 
+2685 
+2686 @base.VersionedObjectRegistry.register_if(False)
+2687 class TraitList(base.ObjectListBase, base.VersionedObject):
+2688 
+2689     fields = {
+2690         'objects': fields.ListOfObjectsField('Trait')
+2691     }
+2692 
+2693     @staticmethod
+2694     @db_api.api_context_manager.writer  # trait sync can cause a write
+2695     def _get_all_from_db(context, filters):
+2696         _ensure_trait_sync(context)
+2697         if not filters:
+2698             filters = {}
+2699 
+2700         query = context.session.query(models.Trait)
+2701         if 'name_in' in filters:
+2702             query = query.filter(models.Trait.name.in_(
+2703                 [six.text_type(n) for n in filters['name_in']]
+2704             ))
+2705         if 'prefix' in filters:
+2706             query = query.filter(
+2707                 models.Trait.name.like(six.text_type(filters['prefix'] + '%')))
+2708         if 'associated' in filters:
+2709             if filters['associated']:
+2710                 query = query.join(models.ResourceProviderTrait,
+2711                     models.Trait.id == models.ResourceProviderTrait.trait_id
+2712                 ).distinct()
+2713             else:
+2714                 query = query.outerjoin(models.ResourceProviderTrait,
+2715                     models.Trait.id == models.ResourceProviderTrait.trait_id
+2716                 ).filter(models.ResourceProviderTrait.trait_id == null())
+2717 
+2718         return query.all()
+2719 
+2720     @base.remotable_classmethod
+2721     def get_all(cls, context, filters=None):
+2722         db_traits = cls._get_all_from_db(context, filters)
+2723         return base.obj_make_list(context, cls(context), Trait, db_traits)
+2724 
+2725     @classmethod
+2726     def get_all_by_resource_provider(cls, context, rp):
+2727         """Returns a TraitList containing Trait objects for any trait
+2728         associated with the supplied resource provider.
+2729         """
+2730         db_traits = _get_traits_by_provider_id(context, rp.id)
+2731         return base.obj_make_list(context, cls(context), Trait, db_traits)
+2732 
+2733 
+2734 @base.VersionedObjectRegistry.register_if(False)
+2735 class AllocationRequestResource(base.VersionedObject):
+2736 
+2737     fields = {
+2738         'resource_provider': fields.ObjectField('ResourceProvider'),
+2739         'resource_class': rc_fields.ResourceClassField(read_only=True),
+2740         'amount': fields.NonNegativeIntegerField(),
+2741     }
+2742 
+2743 
+2744 @base.VersionedObjectRegistry.register_if(False)
+2745 class AllocationRequest(base.VersionedObject):
+2746 
+2747     fields = {
+2748         'resource_requests': fields.ListOfObjectsField(
+2749             'AllocationRequestResource'
+2750         ),
+2751     }
+2752 
+2753 
+2754 @base.VersionedObjectRegistry.register_if(False)
+2755 class ProviderSummaryResource(base.VersionedObject):
+2756 
+2757     fields = {
+2758         'resource_class': rc_fields.ResourceClassField(read_only=True),
+2759         'capacity': fields.NonNegativeIntegerField(),
+2760         'used': fields.NonNegativeIntegerField(),
+2761     }
+2762 
+2763 
+2764 @base.VersionedObjectRegistry.register_if(False)
+2765 class ProviderSummary(base.VersionedObject):
+2766 
+2767     fields = {
+2768         'resource_provider': fields.ObjectField('ResourceProvider'),
+2769         'resources': fields.ListOfObjectsField('ProviderSummaryResource'),
+2770         'traits': fields.ListOfObjectsField('Trait'),
+2771     }
+2772 
+2773     @property
+2774     def resource_class_names(self):
+2775         """Helper property that returns a set() of resource class string names
+2776         that are included in the provider summary.
+2777         """
+2778         return set(res.resource_class for res in self.resources)
+2779 
+2780 
+2781 @db_api.api_context_manager.reader
+2782 def _get_usages_by_provider_and_rc(ctx, rp_ids, rc_ids):
+2783     """Returns a row iterator of usage records grouped by resource provider ID
+2784     and resource class ID for all resource providers and resource classes
+2785     involved in our request
+2786     """
+2787     # We build up a SQL expression that looks like this:
+2788     # SELECT
+2789     #   rp.id as resource_provider_id
+2790     # , rp.uuid as resource_provider_uuid
+2791     # , inv.resource_class_id
+2792     # , inv.total
+2793     # , inv.reserved
+2794     # , inv.allocation_ratio
+2795     # , usage.used
+2796     # FROM resource_providers AS rp
+2797     # JOIN inventories AS inv
+2798     #  ON rp.id = inv.resource_provider_id
+2799     # LEFT JOIN (
+2800     #   SELECT resource_provider_id, resource_class_id, SUM(used) as used
+2801     #   FROM allocations
+2802     #   WHERE resource_provider_id IN ($rp_ids)
+2803     #   AND resource_class_id IN ($rc_ids)
+2804     #   GROUP BY resource_provider_id, resource_class_id
+2805     # )
+2806     # AS usages
+2807     #   ON inv.resource_provider_id = usage.resource_provider_id
+2808     #   AND inv.resource_class_id = usage.resource_class_id
+2809     # WHERE rp.id IN ($rp_ids)
+2810     # AND inv.resource_class_id IN ($rc_ids)
+2811     rpt = sa.alias(_RP_TBL, name="rp")
+2812     inv = sa.alias(_INV_TBL, name="inv")
+2813     # Build our derived table (subquery in the FROM clause) that sums used
+2814     # amounts for resource provider and resource class
+2815     usage = sa.alias(
+2816         sa.select([
+2817             _ALLOC_TBL.c.resource_provider_id,
+2818             _ALLOC_TBL.c.resource_class_id,
+2819             sql.func.sum(_ALLOC_TBL.c.used).label('used'),
+2820         ]).where(
+2821             sa.and_(
+2822                 _ALLOC_TBL.c.resource_provider_id.in_(rp_ids),
+2823                 _ALLOC_TBL.c.resource_class_id.in_(rc_ids),
+2824             ),
+2825         ).group_by(
+2826             _ALLOC_TBL.c.resource_provider_id,
+2827             _ALLOC_TBL.c.resource_class_id
+2828         ),
+2829         name='usage',
+2830     )
+2831     # Build a join between the resource providers and inventories table
+2832     rpt_inv_join = sa.join(rpt, inv, rpt.c.id == inv.c.resource_provider_id)
+2833     # And then join to the derived table of usages
+2834     usage_join = sa.outerjoin(
+2835         rpt_inv_join,
+2836         usage,
+2837         sa.and_(
+2838             usage.c.resource_provider_id == inv.c.resource_provider_id,
+2839             usage.c.resource_class_id == inv.c.resource_class_id,
+2840         ),
+2841     )
+2842     query = sa.select([
+2843         rpt.c.id.label("resource_provider_id"),
+2844         rpt.c.uuid.label("resource_provider_uuid"),
+2845         inv.c.resource_class_id,
+2846         inv.c.total,
+2847         inv.c.reserved,
+2848         inv.c.allocation_ratio,
+2849         usage.c.used,
+2850     ]).select_from(usage_join).where(
+2851         sa.and_(rpt.c.id.in_(rp_ids),
+2852                 inv.c.resource_class_id.in_(rc_ids)))
+2853     return ctx.session.execute(query).fetchall()
+2854 
+2855 
+2856 @db_api.api_context_manager.reader
+2857 def _get_provider_ids_having_any_trait(ctx, traits):
+2858     """Returns a list of resource provider internal IDs that have ANY of the
+2859     supplied traits.
+2860 
+2861     :param ctx: Session context to use
+2862     :param traits: A map, keyed by trait string name, of trait internal IDs, at
+2863                    least one of which each provider must have associated with
+2864                    it.
+2865     :raise ValueError: If traits is empty or None.
+2866     """
+2867     if not traits:
+2868         raise ValueError(_('traits must not be empty'))
+2869 
+2870     rptt = sa.alias(_RP_TRAIT_TBL, name="rpt")
+2871     sel = sa.select([rptt.c.resource_provider_id])
+2872     sel = sel.where(rptt.c.trait_id.in_(traits.values()))
+2873     sel = sel.group_by(rptt.c.resource_provider_id)
+2874     return [r[0] for r in ctx.session.execute(sel)]
+2875 
+2876 
+2877 @db_api.api_context_manager.reader
+2878 def _get_provider_ids_having_all_traits(ctx, required_traits):
+2879     """Returns a list of resource provider internal IDs that have ALL of the
+2880     required traits.
+2881 
+2882     NOTE: Don't call this method with no required_traits.
+2883 
+2884     :param ctx: Session context to use
+2885     :param required_traits: A map, keyed by trait string name, of required
+2886                             trait internal IDs that each provider must have
+2887                             associated with it
+2888     :raise ValueError: If required_traits is empty or None.
+2889     """
+2890     if not required_traits:
+2891         raise ValueError(_('required_traits must not be empty'))
+2892 
+2893     rptt = sa.alias(_RP_TRAIT_TBL, name="rpt")
+2894     sel = sa.select([rptt.c.resource_provider_id])
+2895     sel = sel.where(rptt.c.trait_id.in_(required_traits.values()))
+2896     sel = sel.group_by(rptt.c.resource_provider_id)
+2897     # Only get the resource providers that have ALL the required traits, so we
+2898     # need to GROUP BY the resource provider and ensure that the
+2899     # COUNT(trait_id) is equal to the number of traits we are requiring
+2900     num_traits = len(required_traits)
+2901     cond = sa.func.count(rptt.c.trait_id) == num_traits
+2902     sel = sel.having(cond)
+2903     return [r[0] for r in ctx.session.execute(sel)]
+2904 
+2905 
+2906 @db_api.api_context_manager.reader
+2907 def _has_provider_trees(ctx):
+2908     """Simple method that returns whether provider trees (i.e. nested resource
+2909     providers) are in use in the deployment at all. This information is used to
+2910     switch code paths when attempting to retrieve allocation candidate
+2911     information. The code paths are eminently easier to execute and follow for
+2912     non-nested scenarios...
+2913 
+2914     NOTE(jaypipes): The result of this function can be cached extensively.
+2915     """
+2916     sel = sa.select([_RP_TBL.c.id])
+2917     sel = sel.where(_RP_TBL.c.parent_provider_id.isnot(None))
+2918     sel = sel.limit(1)
+2919     res = ctx.session.execute(sel).fetchall()
+2920     return len(res) > 0
+2921 
+2922 
+2923 @db_api.api_context_manager.reader
+2924 def _get_provider_ids_matching_all(ctx, resources, required_traits,
+2925         member_of=None):
+2926     """Returns a list of resource provider internal IDs that have available
+2927     inventory to satisfy all the supplied requests for resources.
+2928 
+2929     :note: This function is used for scenarios that do NOT involve sharing
+2930     providers. It also only looks at individual resource providers, not
+2931     provider trees.
+2932 
+2933     :param ctx: Session context to use
+2934     :param resources: A dict, keyed by resource class ID, of the amount
+2935                       requested of that resource class.
+2936     :param required_traits: A map, keyed by trait string name, of required
+2937                             trait internal IDs that each provider must have
+2938                             associated with it
+2939     :param member_of: An optional list of aggregate UUIDs. If provided, the
+2940                       allocation_candidates returned will only be for resource
+2941                       providers that are members of one or more of the supplied
+2942                       aggregates.
+2943     """
+2944     trait_rps = None
+2945     if required_traits:
+2946         trait_rps = _get_provider_ids_having_all_traits(ctx, required_traits)
+2947         if not trait_rps:
+2948             return []
+2949 
+2950     rpt = sa.alias(_RP_TBL, name="rp")
+2951 
+2952     rc_name_map = {
+2953         rc_id: _RC_CACHE.string_from_id(rc_id).lower() for rc_id in resources
+2954     }
+2955 
+2956     # Dict, keyed by resource class ID, of an aliased table object for the
+2957     # inventories table winnowed to only that resource class.
+2958     inv_tables = {
+2959         rc_id: sa.alias(_INV_TBL, name='inv_%s' % rc_name_map[rc_id])
+2960         for rc_id in resources
+2961     }
+2962 
+2963     # Dict, keyed by resource class ID, of a derived table (subquery in the
+2964     # FROM clause or JOIN) against the allocations table winnowed to only that
+2965     # resource class, grouped by resource provider.
+2966     usage_tables = {
+2967         rc_id: sa.alias(
+2968             sa.select([
+2969                 _ALLOC_TBL.c.resource_provider_id,
+2970                 sql.func.sum(_ALLOC_TBL.c.used).label('used'),
+2971             ]).where(
+2972                 _ALLOC_TBL.c.resource_class_id == rc_id
+2973             ).group_by(
+2974                 _ALLOC_TBL.c.resource_provider_id
+2975             ),
+2976             name='usage_%s' % rc_name_map[rc_id],
+2977         )
+2978         for rc_id in resources
+2979     }
+2980 
+2981     sel = sa.select([rpt.c.id])
+2982 
+2983     # List of the WHERE conditions we build up by iterating over the requested
+2984     # resources
+2985     where_conds = []
+2986 
+2987     # First filter by the resource providers that had all the required traits
+2988     if trait_rps:
+2989         where_conds.append(rpt.c.id.in_(trait_rps))
+2990 
+2991     # The chain of joins that we eventually pass to select_from()
+2992     join_chain = rpt
+2993 
+2994     for rc_id, amount in resources.items():
+2995         inv_by_rc = inv_tables[rc_id]
+2996         usage_by_rc = usage_tables[rc_id]
+2997 
+2998         # We can do a more efficient INNER JOIN because we don't have shared
+2999         # resource providers to deal with
+3000         rp_inv_join = sa.join(
+3001             join_chain, inv_by_rc,
+3002             sa.and_(
+3003                 inv_by_rc.c.resource_provider_id == rpt.c.id,
+3004                 # Add a join condition winnowing this copy of inventories table
+3005                 # to only the resource class being analyzed in this loop...
+3006                 inv_by_rc.c.resource_class_id == rc_id,
+3007             ),
+3008         )
+3009         rp_inv_usage_join = sa.outerjoin(
+3010             rp_inv_join, usage_by_rc,
+3011             inv_by_rc.c.resource_provider_id ==
+3012                 usage_by_rc.c.resource_provider_id,
+3013         )
+3014         join_chain = rp_inv_usage_join
+3015 
+3016         usage_cond = sa.and_(
+3017             (
+3018             (sql.func.coalesce(usage_by_rc.c.used, 0) + amount) <=
+3019             (inv_by_rc.c.total - inv_by_rc.c.reserved) *
+3020                 inv_by_rc.c.allocation_ratio
+3021             ),
+3022             inv_by_rc.c.min_unit <= amount,
+3023             inv_by_rc.c.max_unit >= amount,
+3024             amount % inv_by_rc.c.step_size == 0,
+3025         )
+3026         where_conds.append(usage_cond)
+3027 
+3028     # If 'member_of' has values join with the PlacementAggregates to
+3029     # get those resource providers that are associated with any of the
+3030     # list of aggregate uuids provided with 'member_of'.
+3031     if member_of:
+3032         member_join = sa.join(join_chain, _RP_AGG_TBL,
+3033                 _RP_AGG_TBL.c.resource_provider_id == rpt.c.id)
+3034         agg_join = sa.join(member_join, _AGG_TBL, sa.and_(
+3035                 _AGG_TBL.c.id == _RP_AGG_TBL.c.aggregate_id,
+3036                 _AGG_TBL.c.uuid.in_(member_of)))
+3037         join_chain = agg_join
+3038 
+3039     sel = sel.select_from(join_chain)
+3040     sel = sel.where(sa.and_(*where_conds))
+3041 
+3042     return [r[0] for r in ctx.session.execute(sel)]
+3043 
+3044 
+3045 @db_api.api_context_manager.reader
+3046 def _provider_aggregates(ctx, rp_ids):
+3047     """Given a list of resource provider internal IDs, returns a dict,
+3048     keyed by those provider IDs, of sets of aggregate ids associated
+3049     with that provider.
+3050 
+3051     :raises: ValueError when rp_ids is empty.
+3052 
+3053     :param ctx: nova.context.RequestContext object
+3054     :param rp_ids: list of resource provider IDs
+3055     """
+3056     if not rp_ids:
+3057         raise ValueError(_("Expected rp_ids to be a list of resource provider "
+3058                            "internal IDs, but got an empty list."))
+3059 
+3060     rpat = sa.alias(_RP_AGG_TBL, name='rpat')
+3061     sel = sa.select([rpat.c.resource_provider_id,
+3062                      rpat.c.aggregate_id])
+3063     sel = sel.where(rpat.c.resource_provider_id.in_(rp_ids))
+3064     res = collections.defaultdict(set)
+3065     for r in ctx.session.execute(sel):
+3066         res[r[0]].add(r[1])
+3067     return res
+3068 
+3069 
+3070 @db_api.api_context_manager.reader
+3071 def _get_trees_matching_all_resources(ctx, resources):
+3072     """Returns a list of root provider internal IDs for provider trees where
+3073     the nodes in the tree collectively have available inventory to satisfy all
+3074     the supplied requests for resources.
+3075 
+3076     :note: This function is used for scenarios that do NOT involve sharing
+3077     providers AND where there are nested providers present in the deployment.
+3078 
+3079     :param ctx: Session context to use
+3080     :param resources: A dict, keyed by resource class ID, of the amount
+3081                       requested of that resource class.
+3082     """
+3083     # Imagine a request group that contains a request for the following
+3084     # resources:
+3085     #
+3086     # * VCPU: 2
+3087     # * MEMORY_MB: 2048
+3088     # * SRIOV_NET_VF: 1
+3089     #
+3090     # The SQL we want to produce looks like this:
+3091     #
+3092     # SELECT rp.root_provider_id
+3093     # FROM resource_providers AS rp
+3094     # JOIN inventories AS inv
+3095     #  ON rp.id = inv.resource_provider_id
+3096     # LEFT JOIN (
+3097     #     SELECT resource_provider_id, resource_class_id, SUM(used) AS used
+3098     #     FROM allocations
+3099     #     WHERE resource_class_id IN ($RESOURCES)
+3100     #     GROUP BY resource_provider_id, resource_class_id
+3101     # ) AS usages
+3102     #  ON inv.resource_provider_id = usages.resource_provider_id
+3103     #  AND inv.resource_class_id = usages.resource_class_id
+3104     #  WHERE inv.resource_class_id IN ($RESOURCES) AND
+3105     #  (
+3106     #     inv.resource_class_id = $VCPU
+3107     #     AND (((inv.total - inv.reserved) * inv.allocation_ratio) <
+3108     #          (COALESCE(usage.used, 0) + $VCPU_REQUESTED))
+3109     #     AND inv.min_unit >= $VCPU_REQUESTED
+3110     #     AND inv.max_unit <= $VCPU_REQUESTED
+3111     #     AND inv.step_size % $VCPU_REQUESTED = 0
+3112     #  ) OR (
+3113     #     inv.resource_class_id = $RAM
+3114     #     AND (((inv.total - inv.reserved) * inv.allocation_ratio) <
+3115     #          (COALESCE(usage.used, 0) + $RAM_REQUESTED))
+3116     #     AND inv.min_unit >= $RAM_REQUESTED
+3117     #     AND inv.max_unit <= $RAM_REQUESTED
+3118     #     AND inv.step_size % $RAM_REQUESTED = 0
+3119     #  ) OR (
+3120     #     inv.resource_class_id = $SRIOV_NET_VF
+3121     #     AND (((inv.total - inv.reserved) * inv.allocation_ratio) <
+3122     #          (COALESCE(usage.used, 0) + $VF_REQUESTED))
+3123     #     AND inv.min_unit >= $VF_REQUESTED
+3124     #     AND inv.max_unit <= $VF_REQUESTED
+3125     #     AND inv.step_size % $VF_REQUESTED = 0
+3126     #  )
+3127     #  GROUP BY rp.root_provider_id
+3128     #  HAVING COUNT(DISTINCT inv.resource_class_id) = 3;
+3129     rpt = sa.alias(_RP_TBL, name="rp")
+3130     inv = sa.alias(_INV_TBL, name="inv")
+3131 
+3132     # Derived table containing usage numbers for all resource providers for
+3133     # each resource class involved in the request
+3134     usages = sa.alias(
+3135         sa.select([
+3136             _ALLOC_TBL.c.resource_provider_id,
+3137             _ALLOC_TBL.c.resource_class_id,
+3138             sql.func.sum(_ALLOC_TBL.c.used).label('used'),
+3139         ]).where(
+3140             _ALLOC_TBL.c.resource_class_id.in_(resources),
+3141         ).group_by(
+3142             _ALLOC_TBL.c.resource_provider_id,
+3143             _ALLOC_TBL.c.resource_class_id
+3144         ),
+3145         name='usage',
+3146     )
+3147 
+3148     sel = sa.select([rpt.c.root_provider_id])
+3149 
+3150     rp_inv_join = sa.join(rpt, inv, rpt.c.id == inv.c.resource_provider_id)
+3151     rp_inv_usage_join = sa.outerjoin(
+3152         rp_inv_join, usages,
+3153         sa.and_(
+3154             inv.c.resource_provider_id ==
+3155                 usages.c.resource_provider_id,
+3156             inv.c.resource_class_id ==
+3157                 usages.c.resource_class_id,
+3158         ))
+3159 
+3160     usage_conds = []
+3161     for rc_id, amount in resources.items():
+3162         usage_cond = sa.and_(
+3163             inv.c.resource_class_id == rc_id,
+3164             (
+3165                 (sql.func.coalesce(usages.c.used, 0) + amount) <=
+3166                 (inv.c.total - inv.c.reserved) * inv.c.allocation_ratio
+3167             ),
+3168             inv.c.min_unit <= amount,
+3169             inv.c.max_unit >= amount,
+3170             amount % inv.c.step_size == 0,
+3171         )
+3172         usage_conds.append(usage_cond)
+3173 
+3174     sel = sel.select_from(rp_inv_usage_join)
+3175     sel = sel.where(
+3176         sa.and_(inv.c.resource_class_id.in_(resources),
+3177                 sa.or_(*usage_conds)))
+3178     sel = sel.group_by(rpt.c.root_provider_id)
+3179     sel = sel.having(
+3180         sql.func.count(
+3181             sql.func.distinct(inv.c.resource_class_id)) == len(resources))
+3182 
+3183     return [r[0] for r in ctx.session.execute(sel)]
+3184 
+3185 
+3186 def _build_provider_summaries(context, usages, prov_traits):
+3187     """Given a list of dicts of usage information and a map of providers to
+3188     their associated string traits, returns a dict, keyed by resource provider
+3189     ID, of ProviderSummary objects.
+3190 
+3191     :param context: nova.context.RequestContext object
+3192     :param usages: A list of dicts with the following format:
+3193 
+3194         {
+3195             'resource_provider_id': <internal resource provider ID>,
+3196             'resource_provider_uuid': <UUID>,
+3197             'resource_class_id': <internal resource class ID>,
+3198             'total': integer,
+3199             'reserved': integer,
+3200             'allocation_ratio': float,
+3201         }
+3202     :param prov_traits: A dict, keyed by internal resource provider ID, of
+3203                         string trait names associated with that provider
+3204     """
+3205     # Build up a dict, keyed by internal resource provider ID, of
+3206     # ProviderSummary objects containing one or more ProviderSummaryResource
+3207     # objects representing the resources the provider has inventory for.
+3208     summaries = {}
+3209     for usage in usages:
+3210         rp_id = usage['resource_provider_id']
+3211         rp_uuid = usage['resource_provider_uuid']
+3212         rc_id = usage['resource_class_id']
+3213         # NOTE(jaypipes): usage['used'] may be None due to the LEFT JOIN of
+3214         # the usages subquery, so we coerce NULL values to 0 here.
+3215         used = usage['used'] or 0
+3216         allocation_ratio = usage['allocation_ratio']
+3217         cap = int((usage['total'] - usage['reserved']) * allocation_ratio)
+3218         traits = prov_traits.get(rp_id) or []
+3219 
+3220         summary = summaries.get(rp_id)
+3221         if not summary:
+3222             summary = ProviderSummary(
+3223                 context,
+3224                 resource_provider=ResourceProvider(
+3225                     context,
+3226                     uuid=rp_uuid,
+3227                 ),
+3228                 resources=[],
+3229             )
+3230             summaries[rp_id] = summary
+3231 
+3232         rc_name = _RC_CACHE.string_from_id(rc_id)
+3233         rpsr = ProviderSummaryResource(
+3234             context,
+3235             resource_class=rc_name,
+3236             capacity=cap,
+3237             used=used,
+3238         )
+3239         summary.resources.append(rpsr)
+3240         summary.traits = [Trait(context, name=tname) for tname in traits]
+3241     return summaries
+3242 
+3243 
+3244 def _aggregates_associated_with_providers(a, b, prov_aggs):
+3245     """quickly check if the two rps are in the same aggregates
+3246 
+3247     :param a: resource provider ID for first provider
+3248     :param b: resource provider ID for second provider
+3249     :param prov_aggs: a dict keyed by resource provider IDs, of sets
+3250                       of aggregate ids associated with that provider
+3251     """
+3252     a_aggs = prov_aggs[a]
+3253     b_aggs = prov_aggs[b]
+3254     return a_aggs & b_aggs
+3255 
+3256 
+3257 def _shared_allocation_request_resources(ctx, ns_rp_id, requested_resources,
+3258                                          sharing, summaries, prov_aggs):
+3259     """Returns a dict, keyed by resource class ID, of lists of
+3260     AllocationRequestResource objects that represent resources that are
+3261     provided by a sharing provider.
+3262 
+3263     :param ctx: nova.context.RequestContext object
+3264     :param ns_rp_id: an internal ID of a non-sharing resource provider
+3265     :param requested_resources: dict, keyed by resource class ID, of amounts
+3266                                 being requested for that resource class
+3267     :param sharing: dict, keyed by resource class ID, of lists of resource
+3268                     provider IDs that share that resource class and can
+3269                     contribute to the overall allocation request
+3270     :param summaries: dict, keyed by resource provider ID, of ProviderSummary
+3271                       objects containing usage and trait information for
+3272                       resource providers involved in the overall request
+3273     :param prov_aggs: dict, keyed by resource provider ID, of sets of
+3274                       aggregate ids associated with that provider.
+3275     """
+3276     res_requests = collections.defaultdict(list)
+3277     for rc_id in sharing:
+3278         for rp_id in sharing[rc_id]:
+3279             aggs_in_both = _aggregates_associated_with_providers(
+3280                 ns_rp_id, rp_id, prov_aggs)
+3281             if not aggs_in_both:
+3282                 continue
+3283             summary = summaries[rp_id]
+3284             rp_uuid = summary.resource_provider.uuid
+3285             res_req = AllocationRequestResource(
+3286                 ctx,
+3287                 resource_provider=ResourceProvider(ctx, uuid=rp_uuid),
+3288                 resource_class=_RC_CACHE.string_from_id(rc_id),
+3289                 amount=requested_resources[rc_id],
+3290             )
+3291             res_requests[rc_id].append(res_req)
+3292     return res_requests
+3293 
+3294 
+3295 def _allocation_request_for_provider(ctx, requested_resources, rp_uuid):
+3296     """Returns an AllocationRequest object containing AllocationRequestResource
+3297     objects for each resource class in the supplied requested resources dict.
+3298 
+3299     :param ctx: nova.context.RequestContext object
+3300     :param requested_resources: dict, keyed by resource class ID, of amounts
+3301                                 being requested for that resource class
+3302     :param rp_uuid: UUID of the resource provider supplying the resources
+3303     """
+3304     resource_requests = [
+3305         AllocationRequestResource(
+3306             ctx, resource_provider=ResourceProvider(ctx, uuid=rp_uuid),
+3307             resource_class=_RC_CACHE.string_from_id(rc_id),
+3308             amount=amount,
+3309         ) for rc_id, amount in requested_resources.items()
+3310     ]
+3311     return AllocationRequest(ctx, resource_requests=resource_requests)
+3312 
+3313 
+3314 def _alloc_candidates_no_shared(ctx, requested_resources, rp_ids):
+3315     """Returns a tuple of (allocation requests, provider summaries) for a
+3316     supplied set of requested resource amounts and resource providers. The
+3317     supplied resource providers have capacity to satisfy ALL of the resources
+3318     in the requested resources as well as ALL required traits that were
+3319     requested by the user.
+3320 
+3321     This is an optimized code path for the common scenario when no sharing
+3322     providers exist in the system for any requested resource. In this scenario,
+3323     we can more efficiently build the list of AllocationRequest and
+3324     ProviderSummary objects due to not having to determine requests for some
+3325     shared and some non-shared resources.
+3326 
+3327     :param ctx: nova.context.RequestContext object
+3328     :param requested_resources: dict, keyed by resource class ID, of amounts
+3329                                 being requested for that resource class
+3330     :param rp_ids: List of resource provider IDs for providers that matched the
+3331                    requested resources
+3332     """
+3333     if not rp_ids:
+3334         return [], []
+3335     # Grab usage summaries for each provider and resource class requested
+3336     requested_rc_ids = list(requested_resources)
+3337     usages = _get_usages_by_provider_and_rc(ctx, rp_ids, requested_rc_ids)
+3338 
+3339     # Get a dict, keyed by resource provider internal ID, of trait string names
+3340     # that provider has associated with it
+3341     prov_traits = _provider_traits(ctx, rp_ids)
+3342 
+3343     # Get a dict, keyed by resource provider internal ID, of ProviderSummary
+3344     # objects for all providers
+3345     summaries = _build_provider_summaries(ctx, usages, prov_traits)
+3346 
+3347     # Next, build up a list of allocation requests. These allocation requests
+3348     # are AllocationRequest objects, containing resource provider UUIDs,
+3349     # resource class names and amounts to consume from that resource provider
+3350     alloc_requests = []
+3351     for rp_id in rp_ids:
+3352         rp_summary = summaries[rp_id]
+3353         rp_uuid = rp_summary.resource_provider.uuid
+3354         req_obj = _allocation_request_for_provider(ctx, requested_resources,
+3355                                                    rp_uuid)
+3356         alloc_requests.append(req_obj)
+3357     return alloc_requests, list(summaries.values())
+3358 
+3359 
+3360 def _alloc_candidates_with_shared(ctx, requested_resources, required_traits,
+3361                                   ns_rp_ids, sharing):
+3362     """Returns a tuple of (allocation requests, provider summaries) for a
+3363     supplied set of requested resource amounts and resource providers.
+3364 
+3365     The allocation requests will contain BOTH resource providers that locally
+3366     have all the resources to satisfy each requested resource amount AND
+3367     combinations of resource providers and shared providers in same aggregate
+3368     that can collectively satisfy requested resource.
+3369 
+3370     :param ctx: nova.context.RequestContext object
+3371     :param requested_resources: dict, keyed by resource class ID, of amounts
+3372                                 being requested for that resource class
+3373     :param required_traits: A map, keyed by trait string name, of required
+3374                             trait internal IDs that each *allocation request's
+3375                             set of providers* must *collectively* have
+3376                             associated with them
+3377     :param ns_rp_ids: List of resource provider IDs for providers that EITHER
+3378                       match all of the requested resources or are associated
+3379                       with sharing providers that can satisfy missing requested
+3380                       resources. In other words, this is the list of resource
+3381                       provider IDs for all providers that are NOT sharing a
+3382                       resource.
+3383     :param sharing: dict, keyed by resource class ID, of a list of resource
+3384                     provider IDs that share that resource class
+3385     """
+3386     # We need to grab usage information for all the providers identified as
+3387     # potentially fulfilling part of the resource request. This includes
+3388     # non-sharing providers returned from the call to _get_all_with_shared() as
+3389     # well as all the providers of shared resources. Here, we simply grab a
+3390     # unique set of all those resource provider internal IDs by set union'ing
+3391     # them together
+3392     all_rp_ids = set(ns_rp_ids)
+3393     for rps in sharing.values():
+3394         all_rp_ids |= set(rps)
+3395 
+3396     # Short out if no providers have been found at this point.
+3397     if not all_rp_ids:
+3398         return [], []
+3399 
+3400     # Grab usage summaries for each provider (local or sharing) and resource
+3401     # class requested
+3402     requested_rc_ids = list(requested_resources)
+3403     usages = _get_usages_by_provider_and_rc(ctx, all_rp_ids, requested_rc_ids)
+3404 
+3405     # Get a dict, keyed by resource provider internal ID, of trait string names
+3406     # that provider has associated with it
+3407     prov_traits = _provider_traits(ctx, all_rp_ids)
+3408 
+3409     # Get a dict, keyed by resource provider internal ID, of ProviderSummary
+3410     # objects for all providers involved in the request
+3411     summaries = _build_provider_summaries(ctx, usages, prov_traits)
+3412 
+3413     # Next, build up a list of allocation requests. These allocation requests
+3414     # are AllocationRequest objects, containing resource provider UUIDs,
+3415     # resource class names and amounts to consume from that resource provider
+3416     alloc_requests = []
+3417 
+3418     # Build a list of the sets of provider internal IDs that end up in
+3419     # allocation request objects. This is used to ensure we don't end up
+3420     # having allocation requests with duplicate sets of resource providers.
+3421     alloc_prov_ids = []
+3422 
+3423     # Get a dict, keyed by resource provider internal ID, of sets of aggregate
+3424     # ids that provider has associated with it
+3425     prov_aggregates = _provider_aggregates(ctx, all_rp_ids)
+3426 
+3427     for ns_rp_id in ns_rp_ids:
+3428         # Build a dict, keyed by resource class ID, of lists of
+3429         # AllocationRequestResource objects
+3430         res_req_dict = collections.defaultdict(list)
+3431 
+3432         if ns_rp_id not in summaries:
+3433             # This resource provider is not providing any resources that have
+3434             # been requested. This means that this resource provider has some
+3435             # requested resources shared *with* it but the allocation of the
+3436             # requested resource will not be made against it. Since this
+3437             # provider won't actually have an allocation request written for
+3438             # it, we just ignore it and continue
+3439             continue
+3440         # NOTE(jaypipes): The "ns_" prefix for variables in this code block
+3441         # indicates the variable is something related to the non-sharing
+3442         # provider involved in the request
+3443         ns_rp_summary = summaries[ns_rp_id]
+3444         ns_rp_uuid = ns_rp_summary.resource_provider.uuid
+3445         ns_resource_class_names = ns_rp_summary.resource_class_names
+3446         ns_resources = set(
+3447             rc_id for rc_id in requested_resources
+3448             if _RC_CACHE.string_from_id(rc_id) in ns_resource_class_names
+3449         )
+3450 
+3451         has_none = len(ns_resources) == 0
+3452         if has_none:
+3453             # This resource provider doesn't actually provide any requested
+3454             # resource. It only has requested resources shared *with* it.
+3455             # We do not list this provider in allocation_requests but do
+3456             # list it in provider_summaries.
+3457             continue
+3458 
+3459         # Get AllocationRequestResource(s) from the non-sharing provider
+3460         for rc_id, amount in requested_resources.items():
+3461             if rc_id not in ns_resources:
+3462                 continue
+3463             res_req_dict[rc_id].append(
+3464                 AllocationRequestResource(
+3465                     ctx, resource_provider=ResourceProvider(ctx,
+3466                                                             uuid=ns_rp_uuid),
+3467                     resource_class=_RC_CACHE.string_from_id(rc_id),
+3468                     amount=amount))
+3469 
+3470         # Build a dict, keyed by resource class ID, of lists of
+3471         # AllocationRequestResource objects that represent each
+3472         # resource provider for a shared resource
+3473         sharing_resource_requests = _shared_allocation_request_resources(
+3474                                     ctx, ns_rp_id, requested_resources,
+3475                                     sharing, summaries, prov_aggregates)
+3476 
+3477         # Get AllocationRequestResource(s) from sharing provider(s)
+3478         for rc_id in sharing_resource_requests:
+3479             sharing_res_reqs = sharing_resource_requests[rc_id]
+3480             res_req_dict[rc_id].extend(sharing_res_reqs)
+3481 
+3482         # Get request_groups, lists of lists of AllocationRequestResource
+3483         # for each resource class, which makes no distinction between
+3484         # non-sharing resource providers and sharing resource providers.
+3485         request_groups = res_req_dict.values()
+3486 
+3487         # Add an AllocationRequest that includes resources from the
+3488         # non-sharing provider AND shared resources from each sharing
+3489         # provider of that resource class. This is where we construct all the
+3490         # possible permutations of non-shared resources and shared resources.
+3491         for res_requests in itertools.product(*request_groups):
+3492             # Before we add the allocation request to our list, we first need
+3493             # to ensure that the resource providers involved in this allocation
+3494             # request have all of the traits
+3495             all_prov_ids = set()
+3496             all_traits = set()
+3497             for res_req in res_requests:
+3498                 rp_uuid = res_req.resource_provider.uuid
+3499                 rp_id = None
+3500                 for id, summary in summaries.items():
+3501                     if summary.resource_provider.uuid == rp_uuid:
+3502                         rp_id = id
+3503                         break
+3504                 all_prov_ids.add(rp_id)
+3505                 all_traits |= set(prov_traits.get(rp_id, []))
+3506 
+3507             # Check if there are missing traits
+3508             missing_traits = set(required_traits) - all_traits
+3509             if missing_traits:
+3510                 LOG.debug('Excluding a set of allocation candidate %s : '
+3511                           'missing traits %s are not satisfied.',
+3512                           all_prov_ids, ','.join(missing_traits))
+3513                 continue
+3514 
+3515             # Check if we already have this combination in alloc_requests
+3516             if all_prov_ids in alloc_prov_ids:
+3517                 continue
+3518 
+3519             alloc_prov_ids.append(all_prov_ids)
+3520             req = AllocationRequest(ctx, resource_requests=list(res_requests))
+3521             alloc_requests.append(req)
+3522 
+3523     # The process above may have removed some previously-identified resource
+3524     # providers from being included in the allocation requests due to the
+3525     # sharing providers not satisfying trait requirements that were missing
+3526     # from "local providers". So, here, we need to remove any provider
+3527     # summaries for resource providers that do not appear in any allocation
+3528     # requests.
+3529     alloc_req_rp_uuids = set()
+3530     for ar in alloc_requests:
+3531         for rr in ar.resource_requests:
+3532             alloc_req_rp_uuids.add(rr.resource_provider.uuid)
+3533 
+3534     # Look up the internal ID for each identified rp UUID
+3535     alloc_req_rp_ids = set()
+3536     for rp_uuid in alloc_req_rp_uuids:
+3537         for rp_id, summary in summaries.items():
+3538             if summary.resource_provider.uuid == rp_uuid:
+3539                 alloc_req_rp_ids.add(rp_id)
+3540 
+3541     p_sums_ids = set(summaries)
+3542     eliminated_rp_ids = p_sums_ids - alloc_req_rp_ids
+3543     for elim_id in eliminated_rp_ids:
+3544         del summaries[elim_id]
+3545 
+3546     return alloc_requests, list(summaries.values())
+3547 
+3548 
+3549 @db_api.api_context_manager.reader
+3550 def _provider_traits(ctx, rp_ids):
+3551     """Given a list of resource provider internal IDs, returns a dict, keyed by
+3552     those provider IDs, of string trait names associated with that provider.
+3553 
+3554     :raises: ValueError when rp_ids is empty.
+3555 
+3556     :param ctx: nova.context.RequestContext object
+3557     :param rp_ids: list of resource provider IDs
+3558     """
+3559     if not rp_ids:
+3560         raise ValueError(_("Expected rp_ids to be a list of resource provider "
+3561                            "internal IDs, but got an empty list."))
+3562 
+3563     rptt = sa.alias(_RP_TRAIT_TBL, name='rptt')
+3564     tt = sa.alias(_TRAIT_TBL, name='t')
+3565     j = sa.join(rptt, tt, rptt.c.trait_id == tt.c.id)
+3566     sel = sa.select([rptt.c.resource_provider_id, tt.c.name]).select_from(j)
+3567     sel = sel.where(rptt.c.resource_provider_id.in_(rp_ids))
+3568     res = collections.defaultdict(list)
+3569     for r in ctx.session.execute(sel):
+3570         res[r[0]].append(r[1])
+3571     return res
+3572 
+3573 
+3574 @db_api.api_context_manager.reader
+3575 def _trait_ids_from_names(ctx, names):
+3576     """Given a list of string trait names, returns a dict, keyed by those
+3577     string names, of the corresponding internal integer trait ID.
+3578 
+3579     :raises: ValueError when names is empty.
+3580 
+3581     :param ctx: nova.context.RequestContext object
+3582     :param names: list of string trait names
+3583     """
+3584     if not names:
+3585         raise ValueError(_("Expected names to be a list of string trait "
+3586                            "names, but got an empty list."))
+3587 
+3588     # Avoid SAWarnings about unicode types...
+3589     unames = map(six.text_type, names)
+3590     tt = sa.alias(_TRAIT_TBL, name='t')
+3591     sel = sa.select([tt.c.name, tt.c.id]).where(tt.c.name.in_(unames))
+3592     return {r[0]: r[1] for r in ctx.session.execute(sel)}
+3593 
+3594 
+3595 @base.VersionedObjectRegistry.register_if(False)
+3596 class AllocationCandidates(base.VersionedObject):
+3597     """The AllocationCandidates object is a collection of possible allocations
+3598     that match some request for resources, along with some summary information
+3599     about the resource providers involved in these allocation candidates.
+3600     """
+3601 
+3602     fields = {
+3603         # A collection of allocation possibilities that can be attempted by the
+3604         # caller that would, at the time of calling, meet the requested
+3605         # resource constraints
+3606         'allocation_requests': fields.ListOfObjectsField('AllocationRequest'),
+3607         # Information about usage and inventory that relate to any provider
+3608         # contained in any of the AllocationRequest objects in the
+3609         # allocation_requests field
+3610         'provider_summaries': fields.ListOfObjectsField('ProviderSummary'),
+3611     }
+3612 
+3613     @classmethod
+3614     def get_by_requests(cls, context, requests, limit=None):
+3615         """Returns an AllocationCandidates object containing all resource
+3616         providers matching a set of supplied resource constraints, with a set
+3617         of allocation requests constructed from that list of resource
+3618         providers. If CONF.placement.randomize_allocation_candidates is True
+3619         (default is False) then the order of the allocation requests will
+3620         be randomized.
+3621 
+3622         :param requests: List of nova.api.openstack.placement.util.RequestGroup
+3623         :param limit: An integer, N, representing the maximum number of
+3624                       allocation candidates to return. If
+3625                       CONF.placement.randomize_allocation_candidates is True
+3626                       this will be a random sampling of N of the available
+3627                       results. If False then the first N results, in whatever
+3628                       order the database picked them, will be returned. In
+3629                       either case if there are fewer than N total results,
+3630                       all the results will be returned.
+3631         """
+3632         _ensure_rc_cache(context)
+3633         _ensure_trait_sync(context)
+3634         alloc_reqs, provider_summaries = cls._get_by_requests(context,
+3635                                                               requests,
+3636                                                               limit)
+3637         return cls(
+3638             context,
+3639             allocation_requests=alloc_reqs,
+3640             provider_summaries=provider_summaries,
+3641         )
+3642 
+3643     @staticmethod
+3644     @db_api.api_context_manager.reader
+3645     def _get_by_requests(context, requests, limit=None):
+3646         # We first get the list of "root providers" that either have the
+3647         # requested resources or are associated with the providers that
+3648         # share one or more of the requested resource(s)
+3649         # TODO(efried): Handle non-sharing groups.
+3650         # For now, this extracts just the sharing group's resources & traits.
+3651         sharing_groups = [request_group for request_group in requests
+3652                           if not request_group.use_same_provider]
+3653         if len(sharing_groups) != 1 or not sharing_groups[0].resources:
+3654             raise ValueError(_("The requests parameter must contain one "
+3655                                "RequestGroup with use_same_provider=False and "
+3656                                "nonempty resources."))
+3657 
+3658         # Transform resource string names to internal integer IDs
+3659         resources = {
+3660             _RC_CACHE.id_from_string(key): value
+3661             for key, value in sharing_groups[0].resources.items()
+3662         }
+3663 
+3664         traits = sharing_groups[0].required_traits
+3665         # maps the trait name to the trait internal ID
+3666         trait_map = {}
+3667         if traits:
+3668             trait_map = _trait_ids_from_names(context, traits)
+3669             # Double-check that we found a trait ID for each requested name
+3670             if len(trait_map) != len(traits):
+3671                 missing = traits - set(trait_map)
+3672                 raise exception.TraitNotFound(names=', '.join(missing))
+3673 
+3674         # Microversions prior to 1.21 will not have 'member_of' in the groups.
+3675         # This allows earlier microversions to continue to work.
+3676         member_of = ""
+3677         if hasattr(sharing_groups[0], "member_of"):
+3678             member_of = sharing_groups[0].member_of
+3679 
+3680         # Contains a set of resource provider IDs that share some inventory for
+3681         # each resource class requested. We do this here as an optimization. If
+3682         # we have no sharing providers, the SQL to find matching providers for
+3683         # the requested resources is much simpler.
+3684         # TODO(jaypipes): Consider caching this for some amount of time since
+3685         # sharing providers generally don't change often and here we aren't
+3686         # concerned with how *much* inventory/capacity the sharing provider
+3687         # has, only that it is sharing *some* inventory of a particular
+3688         # resource class.
+3689         sharing_providers = {
+3690             rc_id: _get_providers_with_shared_capacity(context, rc_id, amount)
+3691             for rc_id, amount in resources.items()
+3692         }
+3693         have_sharing = any(sharing_providers.values())
+3694         if not have_sharing:
+3695             # We know there's no sharing providers, so we can more efficiently
+3696             # get a list of resource provider IDs that have ALL the requested
+3697             # resources and more efficiently construct the allocation requests
+3698             # NOTE(jaypipes): When we start handling nested providers, we may
+3699             # add new code paths or modify this code path to return root
+3700             # provider IDs of provider trees instead of the resource provider
+3701             # IDs.
+3702             rp_ids = _get_provider_ids_matching_all(context, resources,
+3703                                                     trait_map, member_of)
+3704             alloc_request_objs, summary_objs = _alloc_candidates_no_shared(
+3705                 context, resources, rp_ids)
+3706         else:
+3707             if trait_map:
+3708                 trait_rps = _get_provider_ids_having_any_trait(context,
+3709                                                                trait_map)
+3710                 if not trait_rps:
+3711                     # If there aren't any providers that have any of the
+3712                     # required traits, just exit early...
+3713                     return [], []
+3714 
+3715             # rp_ids contains a list of resource provider IDs that EITHER have
+3716             # all the requested resources themselves OR have some resources
+3717             # and are related to a provider that is sharing some resources
+3718             # with it. In other words, this is the list of resource provider
+3719             # IDs that are NOT sharing resources.
+3720             rps = _get_all_with_shared(context, resources, member_of)
+3721             rp_ids = set([r[0] for r in rps])
+3722             alloc_request_objs, summary_objs = _alloc_candidates_with_shared(
+3723                 context, resources, trait_map, rp_ids, sharing_providers)
+3724 
+3725         # Limit the number of allocation request objects. We do this after
+3726         # creating all of them so that we can do a random slice without
+3727         # needing to mess with the complex sql above or add additional
+3728         # columns to the DB.
+3729 
+3730         if limit and limit <= len(alloc_request_objs):
+3731             if CONF.placement.randomize_allocation_candidates:
+3732                 alloc_request_objs = random.sample(alloc_request_objs, limit)
+3733             else:
+3734                 alloc_request_objs = alloc_request_objs[:limit]
+3735         elif CONF.placement.randomize_allocation_candidates:
+3736             random.shuffle(alloc_request_objs)
+3737 
+3738         # Limit summaries to only those mentioned in the allocation requests.
+3739         if limit and limit <= len(alloc_request_objs):
+3740             kept_summary_objs = []
+3741             alloc_req_rp_uuids = set()
+3742             # Extract resource provider uuids from the resource requests.
+3743             for aro in alloc_request_objs:
+3744                 for arr in aro.resource_requests:
+3745                     alloc_req_rp_uuids.add(arr.resource_provider.uuid)
+3746             for summary in summary_objs:
+3747                 rp_uuid = summary.resource_provider.uuid
+3748                 # Skip a summary if we are limiting and haven't selected an
+3749                 # allocation request that uses the resource provider.
+3750                 if rp_uuid not in alloc_req_rp_uuids:
+3751                     continue
+3752                 kept_summary_objs.append(summary)
+3753         else:
+3754             kept_summary_objs = summary_objs
+3755 
+3756         return alloc_request_objs, kept_summary_objs

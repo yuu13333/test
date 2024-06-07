@@ -1,0 +1,1301 @@
+Please review the code below for security defects using the CWE (Common Weakness Enumeration) as a reference standard. If any are found, please describe the security defect in detail and indicate the corresponding line number of code and solution. If none are detected, state: 'No security defects are detected in the code'.
+
+1 # Copyright 2012 Grid Dynamics
+2 # All Rights Reserved.
+3 #
+4 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
+5 #    not use this file except in compliance with the License. You may obtain
+6 #    a copy of the License at
+7 #
+8 #         http://www.apache.org/licenses/LICENSE-2.0
+9 #
+10 #    Unless required by applicable law or agreed to in writing, software
+11 #    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+12 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+13 #    License for the specific language governing permissions and limitations
+14 #    under the License.
+15 
+16 import abc
+17 import base64
+18 import contextlib
+19 import functools
+20 import os
+21 import shutil
+22 
+23 from oslo_log import log as logging
+24 from oslo_serialization import jsonutils
+25 from oslo_utils import excutils
+26 from oslo_utils import fileutils
+27 from oslo_utils import strutils
+28 from oslo_utils import units
+29 import six
+30 
+31 from nova.compute import task_states
+32 import nova.conf
+33 from nova import exception
+34 from nova.i18n import _
+35 from nova.i18n import _LE, _LI, _LW
+36 from nova import image
+37 from nova import keymgr
+38 from nova import utils
+39 from nova.virt.disk import api as disk
+40 from nova.virt.image import model as imgmodel
+41 from nova.virt import images
+42 from nova.virt.libvirt import config as vconfig
+43 from nova.virt.libvirt.storage import dmcrypt
+44 from nova.virt.libvirt.storage import lvm
+45 from nova.virt.libvirt.storage import rbd_utils
+46 from nova.virt.libvirt.storage import sio_utils
+47 from nova.virt.libvirt import utils as libvirt_utils
+48 
+49 CONF = nova.conf.CONF
+50 
+51 LOG = logging.getLogger(__name__)
+52 IMAGE_API = image.API()
+53 
+54 
+55 @six.add_metaclass(abc.ABCMeta)
+56 class Image(object):
+57 
+58     SUPPORTS_CLONE = False
+59 
+60     def __init__(self, path, source_type, driver_format, is_block_dev=False):
+61         """Image initialization.
+62 
+63         :param path: libvirt's representation of the path of this disk.
+64         :param source_type: block or file
+65         :param driver_format: raw or qcow2
+66         :param is_block_dev:
+67         """
+68         if (CONF.ephemeral_storage_encryption.enabled and
+69                 not self._supports_encryption()):
+70             raise exception.NovaException(_('Incompatible settings: '
+71                                   'ephemeral storage encryption is supported '
+72                                   'only for LVM images.'))
+73 
+74         self.path = path
+75 
+76         self.source_type = source_type
+77         self.driver_format = driver_format
+78         self.driver_io = None
+79         self.discard_mode = CONF.libvirt.hw_disk_discard
+80         self.is_block_dev = is_block_dev
+81         self.preallocate = False
+82 
+83         # NOTE(dripton): We store lines of json (path, disk_format) in this
+84         # file, for some image types, to prevent attacks based on changing the
+85         # disk_format.
+86         self.disk_info_path = None
+87 
+88         # NOTE(mikal): We need a lock directory which is shared along with
+89         # instance files, to cover the scenario where multiple compute nodes
+90         # are trying to create a base file at the same time
+91         self.lock_path = os.path.join(CONF.instances_path, 'locks')
+92 
+93     def _supports_encryption(self):
+94         """Used to test that the backend supports encryption.
+95         Override in the subclass if backend supports encryption.
+96         """
+97         return False
+98 
+99     @abc.abstractmethod
+100     def create_image(self, prepare_template, base, size, *args, **kwargs):
+101         """Create image from template.
+102 
+103         Contains specific behavior for each image type.
+104 
+105         :prepare_template: function, that creates template.
+106                            Should accept `target` argument.
+107         :base: Template name
+108         :size: Size of created image in bytes
+109 
+110         """
+111         pass
+112 
+113     @abc.abstractmethod
+114     def resize_image(self, size):
+115         """Resize image to size (in bytes).
+116 
+117         :size: Desired size of image in bytes
+118 
+119         """
+120         pass
+121 
+122     def libvirt_info(self, disk_bus, disk_dev, device_type, cache_mode,
+123                      extra_specs, hypervisor_version, boot_order=None):
+124         """Get `LibvirtConfigGuestDisk` filled for this image.
+125 
+126         :disk_dev: Disk bus device name
+127         :disk_bus: Disk bus type
+128         :device_type: Device type for this image.
+129         :cache_mode: Caching mode for this image
+130         :extra_specs: Instance type extra specs dict.
+131         :hypervisor_version: the hypervisor version
+132         :boot_order: Disk device boot order
+133         """
+134         info = vconfig.LibvirtConfigGuestDisk()
+135         info.source_type = self.source_type
+136         info.source_device = device_type
+137         info.target_bus = disk_bus
+138         info.target_dev = disk_dev
+139         info.driver_cache = cache_mode
+140         info.driver_discard = self.discard_mode
+141         info.driver_io = self.driver_io
+142         info.driver_format = self.driver_format
+143         driver_name = libvirt_utils.pick_disk_driver_name(hypervisor_version,
+144                                                           self.is_block_dev)
+145         info.driver_name = driver_name
+146         info.source_path = self.path
+147         info.boot_order = boot_order
+148 
+149         self.disk_qos(info, extra_specs)
+150 
+151         return info
+152 
+153     def disk_qos(self, info, extra_specs):
+154         tune_items = ['disk_read_bytes_sec', 'disk_read_iops_sec',
+155             'disk_write_bytes_sec', 'disk_write_iops_sec',
+156             'disk_total_bytes_sec', 'disk_total_iops_sec']
+157         for key, value in six.iteritems(extra_specs):
+158             scope = key.split(':')
+159             if len(scope) > 1 and scope[0] == 'quota':
+160                 if scope[1] in tune_items:
+161                     setattr(info, scope[1], value)
+162 
+163     def libvirt_fs_info(self, target, driver_type=None):
+164         """Get `LibvirtConfigGuestFilesys` filled for this image.
+165 
+166         :target: target directory inside a container.
+167         :driver_type: filesystem driver type, can be loop
+168                       nbd or ploop.
+169         """
+170         info = vconfig.LibvirtConfigGuestFilesys()
+171         info.target_dir = target
+172 
+173         if self.is_block_dev:
+174             info.source_type = "block"
+175             info.source_dev = self.path
+176         else:
+177             info.source_type = "file"
+178             info.source_file = self.path
+179             info.driver_format = self.driver_format
+180             if driver_type:
+181                 info.driver_type = driver_type
+182             else:
+183                 if self.driver_format == "raw":
+184                     info.driver_type = "loop"
+185                 else:
+186                     info.driver_type = "nbd"
+187 
+188         return info
+189 
+190     def exists(self):
+191         return os.path.exists(self.path)
+192 
+193     def cache(self, fetch_func, filename, size=None, *args, **kwargs):
+194         """Creates image from template.
+195 
+196         Ensures that template and image not already exists.
+197         Ensures that base directory exists.
+198         Synchronizes on template fetching.
+199 
+200         :fetch_func: Function that creates the base image
+201                      Should accept `target` argument.
+202         :filename: Name of the file in the image directory
+203         :size: Size of created image in bytes (optional)
+204         """
+205         base_dir = os.path.join(CONF.instances_path,
+206                                 CONF.image_cache_subdirectory_name)
+207         if not os.path.exists(base_dir):
+208             fileutils.ensure_tree(base_dir)
+209         base = os.path.join(base_dir, filename)
+210 
+211         @utils.synchronized(filename, external=True, lock_path=self.lock_path)
+212         def fetch_func_sync(target, *args, **kwargs):
+213             # The image may have been fetched while a subsequent
+214             # call was waiting to obtain the lock.
+215             if target != base or not os.path.exists(target):
+216                 fetch_func(target=target, *args, **kwargs)
+217 
+218         if not self.exists() or not os.path.exists(base):
+219             self.create_image(fetch_func_sync, base, size,
+220                               *args, **kwargs)
+221         else:
+222             self.connect_disk()
+223 
+224         if size:
+225             if size > self.get_disk_size(self.path):
+226                 self.resize_image(size)
+227 
+228             if (self.preallocate and self._can_fallocate() and
+229                     os.access(self.path, os.W_OK)):
+230                 utils.execute('fallocate', '-n', '-l', size, self.path)
+231 
+232     def _can_fallocate(self):
+233         """Check once per class, whether fallocate(1) is available,
+234            and that the instances directory supports fallocate(2).
+235         """
+236         can_fallocate = getattr(self.__class__, 'can_fallocate', None)
+237         if can_fallocate is None:
+238             test_path = self.path + '.fallocate_test'
+239             _out, err = utils.trycmd('fallocate', '-l', '1', test_path)
+240             fileutils.delete_if_exists(test_path)
+241             can_fallocate = not err
+242             self.__class__.can_fallocate = can_fallocate
+243             if not can_fallocate:
+244                 LOG.warning(_LW('Unable to preallocate image at path: '
+245                                 '%(path)s'), {'path': self.path})
+246         return can_fallocate
+247 
+248     def verify_base_size(self, base, size, base_size=0):
+249         """Check that the base image is not larger than size.
+250            Since images can't be generally shrunk, enforce this
+251            constraint taking account of virtual image size.
+252         """
+253 
+254         # Note(pbrady): The size and min_disk parameters of a glance
+255         #  image are checked against the instance size before the image
+256         #  is even downloaded from glance, but currently min_disk is
+257         #  adjustable and doesn't currently account for virtual disk size,
+258         #  so we need this extra check here.
+259         # NOTE(cfb): Having a flavor that sets the root size to 0 and having
+260         #  nova effectively ignore that size and use the size of the
+261         #  image is considered a feature at this time, not a bug.
+262 
+263         if size is None:
+264             return
+265 
+266         if size and not base_size:
+267             base_size = self.get_disk_size(base)
+268 
+269         if size < base_size:
+270             msg = _LE('%(base)s virtual size %(base_size)s '
+271                       'larger than flavor root disk size %(size)s')
+272             LOG.error(msg, {'base': base,
+273                             'base_size': base_size,
+274                             'size': size})
+275             raise exception.FlavorDiskSmallerThanImage(
+276                 flavor_size=size, image_size=base_size)
+277 
+278     def get_disk_size(self, name):
+279         return disk.get_disk_size(name)
+280 
+281     def snapshot_extract(self, target, out_format):
+282         raise NotImplementedError()
+283 
+284     def _get_driver_format(self):
+285         return self.driver_format
+286 
+287     def resolve_driver_format(self):
+288         """Return the driver format for self.path.
+289 
+290         First checks self.disk_info_path for an entry.
+291         If it's not there, calls self._get_driver_format(), and then
+292         stores the result in self.disk_info_path
+293 
+294         See https://bugs.launchpad.net/nova/+bug/1221190
+295         """
+296         def _dict_from_line(line):
+297             if not line:
+298                 return {}
+299             try:
+300                 return jsonutils.loads(line)
+301             except (TypeError, ValueError) as e:
+302                 msg = (_("Could not load line %(line)s, got error "
+303                         "%(error)s") %
+304                         {'line': line, 'error': e})
+305                 raise exception.InvalidDiskInfo(reason=msg)
+306 
+307         @utils.synchronized(self.disk_info_path, external=False,
+308                             lock_path=self.lock_path)
+309         def write_to_disk_info_file():
+310             # Use os.open to create it without group or world write permission.
+311             fd = os.open(self.disk_info_path, os.O_RDONLY | os.O_CREAT, 0o644)
+312             with os.fdopen(fd, "r") as disk_info_file:
+313                 line = disk_info_file.read().rstrip()
+314                 dct = _dict_from_line(line)
+315 
+316             if self.path in dct:
+317                 msg = _("Attempted overwrite of an existing value.")
+318                 raise exception.InvalidDiskInfo(reason=msg)
+319             dct.update({self.path: driver_format})
+320 
+321             tmp_path = self.disk_info_path + ".tmp"
+322             fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT, 0o644)
+323             with os.fdopen(fd, "w") as tmp_file:
+324                 tmp_file.write('%s\n' % jsonutils.dumps(dct))
+325             os.rename(tmp_path, self.disk_info_path)
+326 
+327         try:
+328             if (self.disk_info_path is not None and
+329                         os.path.exists(self.disk_info_path)):
+330                 with open(self.disk_info_path) as disk_info_file:
+331                     line = disk_info_file.read().rstrip()
+332                     dct = _dict_from_line(line)
+333                     for path, driver_format in six.iteritems(dct):
+334                         if path == self.path:
+335                             return driver_format
+336             driver_format = self._get_driver_format()
+337             if self.disk_info_path is not None:
+338                 fileutils.ensure_tree(os.path.dirname(self.disk_info_path))
+339                 write_to_disk_info_file()
+340         except OSError as e:
+341             raise exception.DiskInfoReadWriteFail(reason=six.text_type(e))
+342         return driver_format
+343 
+344     @staticmethod
+345     def is_shared_block_storage():
+346         """True if the backend puts images on a shared block storage."""
+347         return False
+348 
+349     @staticmethod
+350     def is_file_in_instance_path():
+351         """True if the backend stores images in files under instance path."""
+352         return False
+353 
+354     def clone(self, context, image_id_or_uri):
+355         """Clone an image.
+356 
+357         Note that clone operation is backend-dependent. The backend may ask
+358         the image API for a list of image "locations" and select one or more
+359         of those locations to clone an image from.
+360 
+361         :param image_id_or_uri: The ID or URI of an image to clone.
+362 
+363         :raises: exception.ImageUnacceptable if it cannot be cloned
+364         """
+365         reason = _('clone() is not implemented')
+366         raise exception.ImageUnacceptable(image_id=image_id_or_uri,
+367                                           reason=reason)
+368 
+369     def direct_snapshot(self, context, snapshot_name, image_format, image_id,
+370                         base_image_id):
+371         """Prepare a snapshot for direct reference from glance
+372 
+373         :raises: exception.ImageUnacceptable if it cannot be
+374                  referenced directly in the specified image format
+375         :returns: URL to be given to glance
+376         """
+377         raise NotImplementedError(_('direct_snapshot() is not implemented'))
+378 
+379     def cleanup_direct_snapshot(self, location, also_destroy_volume=False,
+380                                 ignore_errors=False):
+381         """Performs any cleanup actions required after calling
+382         direct_snapshot(), for graceful exception handling and the like.
+383 
+384         This should be a no-op on any backend where it is not implemented.
+385         """
+386         pass
+387 
+388     def _get_lock_name(self, base):
+389         """Get an image's name of a base file."""
+390         return os.path.split(base)[-1]
+391 
+392     def get_model(self, connection):
+393         """Get the image information model
+394 
+395         :returns: an instance of nova.virt.image.model.Image
+396         """
+397         raise NotImplementedError()
+398 
+399     def import_file(self, instance, local_file, remote_name):
+400         """Import an image from local storage into this backend.
+401 
+402         Import a local file into the store used by this image type. Note that
+403         this is a noop for stores using local disk (the local file is
+404         considered "in the store").
+405 
+406         If the image already exists it will be overridden by the new file
+407 
+408         :param local_file: path to the file to import
+409         :param remote_name: the name for the file in the store
+410         """
+411 
+412         # NOTE(mikal): this is a noop for now for all stores except RBD, but
+413         # we should talk about if we want this functionality for everything.
+414         pass
+415 
+416     def create_snap(self, name):
+417         """Create a snapshot on the image.  A noop on backends that don't
+418         support snapshots.
+419 
+420         :param name: name of the snapshot
+421         """
+422         pass
+423 
+424     def remove_snap(self, name, ignore_errors=False):
+425         """Remove a snapshot on the image.  A noop on backends that don't
+426         support snapshots.
+427 
+428         :param name: name of the snapshot
+429         :param ignore_errors: don't log errors if the snapshot does not exist
+430         """
+431         pass
+432 
+433     def rollback_to_snap(self, name):
+434         """Rollback the image to the named snapshot. A noop on backends that
+435         don't support snapshots.
+436 
+437         :param name: name of the snapshot
+438         """
+439         pass
+440 
+441     def connect_disk(self):
+442         """Connect existing disk to the compute host.
+443 
+444         Makes existing instance disk available to use with libvirt.
+445         """
+446         pass
+447 
+448     @staticmethod
+449     def connect_disks(instance, with_no_wait=False):
+450         """Connect existing instance disks to the compute host.
+451 
+452         Makes existing instance disks available to use with libvirt.
+453 
+454         :param instance: instance object
+455         :param with_no_wait: do not wait until disks are available on the host
+456         """
+457         pass
+458 
+459     @staticmethod
+460     def disconnect_disks(instance):
+461         """Disconnect instance disks from the compute host.
+462 
+463         :param instance: instance object
+464         """
+465         pass
+466 
+467 
+468 class Flat(Image):
+469     """The Flat backend uses either raw or qcow2 storage. It never uses
+470     a backing store, so when using qcow2 it copies an image rather than
+471     creating an overlay. By default it creates raw files, but will use qcow2
+472     when creating a disk from a qcow2 if force_raw_images is not set in config.
+473     """
+474     def __init__(self, instance=None, disk_name=None, path=None):
+475         self.disk_name = disk_name
+476         path = (path or os.path.join(libvirt_utils.get_instance_path(instance),
+477                                      disk_name))
+478         super(Flat, self).__init__(path, "file", "raw", is_block_dev=False)
+479 
+480         self.preallocate = (
+481             strutils.to_slug(CONF.preallocate_images) == 'space')
+482         if self.preallocate:
+483             self.driver_io = "native"
+484         self.disk_info_path = os.path.join(os.path.dirname(path), 'disk.info')
+485         self.correct_format()
+486 
+487     def _get_driver_format(self):
+488         try:
+489             data = images.qemu_img_info(self.path)
+490             return data.file_format
+491         except exception.InvalidDiskInfo as e:
+492             LOG.info(_LI('Failed to get image info from path %(path)s; '
+493                          'error: %(error)s'),
+494                       {'path': self.path,
+495                        'error': e})
+496             return 'raw'
+497 
+498     def _supports_encryption(self):
+499         # NOTE(dgenin): Kernel, ramdisk and disk.config are fetched using
+500         # the Flat backend regardless of which backend is configured for
+501         # ephemeral storage. Encryption for the Flat backend is not yet
+502         # implemented so this loophole is necessary to allow other
+503         # backends already supporting encryption to function. This can
+504         # be removed once encryption for Flat is implemented.
+505         if self.disk_name not in ['kernel', 'ramdisk', 'disk.config']:
+506             return False
+507         else:
+508             return True
+509 
+510     def correct_format(self):
+511         if os.path.exists(self.path):
+512             self.driver_format = self.resolve_driver_format()
+513 
+514     def create_image(self, prepare_template, base, size, *args, **kwargs):
+515         filename = self._get_lock_name(base)
+516 
+517         @utils.synchronized(filename, external=True, lock_path=self.lock_path)
+518         def copy_raw_image(base, target, size):
+519             libvirt_utils.copy_image(base, target)
+520             if size:
+521                 image = imgmodel.LocalFileImage(target,
+522                                                 self.driver_format)
+523                 disk.extend(image, size)
+524 
+525         generating = 'image_id' not in kwargs
+526         if generating:
+527             if not self.exists():
+528                 # Generating image in place
+529                 prepare_template(target=self.path, *args, **kwargs)
+530         else:
+531             if not os.path.exists(base):
+532                 prepare_template(target=base, *args, **kwargs)
+533 
+534             # NOTE(mikal): Update the mtime of the base file so the image
+535             # cache manager knows it is in use.
+536             libvirt_utils.update_mtime(base)
+537             self.verify_base_size(base, size)
+538             if not os.path.exists(self.path):
+539                 with fileutils.remove_path_on_error(self.path):
+540                     copy_raw_image(base, self.path, size)
+541 
+542         self.correct_format()
+543 
+544     def resize_image(self, size):
+545         image = imgmodel.LocalFileImage(self.path, self.driver_format)
+546         disk.extend(image, size)
+547 
+548     def snapshot_extract(self, target, out_format):
+549         images.convert_image(self.path, target, self.driver_format, out_format)
+550 
+551     @staticmethod
+552     def is_file_in_instance_path():
+553         return True
+554 
+555     def get_model(self, connection):
+556         return imgmodel.LocalFileImage(self.path,
+557                                        imgmodel.FORMAT_RAW)
+558 
+559 
+560 class Qcow2(Image):
+561     def __init__(self, instance=None, disk_name=None, path=None):
+562         path = (path or os.path.join(libvirt_utils.get_instance_path(instance),
+563                                      disk_name))
+564         super(Qcow2, self).__init__(path, "file", "qcow2", is_block_dev=False)
+565 
+566         self.preallocate = (
+567             strutils.to_slug(CONF.preallocate_images) == 'space')
+568         if self.preallocate:
+569             self.driver_io = "native"
+570         self.disk_info_path = os.path.join(os.path.dirname(path), 'disk.info')
+571         self.resolve_driver_format()
+572 
+573     def create_image(self, prepare_template, base, size, *args, **kwargs):
+574         filename = self._get_lock_name(base)
+575 
+576         @utils.synchronized(filename, external=True, lock_path=self.lock_path)
+577         def copy_qcow2_image(base, target, size):
+578             # TODO(pbrady): Consider copying the cow image here
+579             # with preallocation=metadata set for performance reasons.
+580             # This would be keyed on a 'preallocate_images' setting.
+581             libvirt_utils.create_cow_image(base, target)
+582             if size:
+583                 image = imgmodel.LocalFileImage(target, imgmodel.FORMAT_QCOW2)
+584                 disk.extend(image, size)
+585 
+586         # Download the unmodified base image unless we already have a copy.
+587         if not os.path.exists(base):
+588             prepare_template(target=base, *args, **kwargs)
+589 
+590         # NOTE(ankit): Update the mtime of the base file so the image
+591         # cache manager knows it is in use.
+592         libvirt_utils.update_mtime(base)
+593         self.verify_base_size(base, size)
+594 
+595         legacy_backing_size = None
+596         legacy_base = base
+597 
+598         # Determine whether an existing qcow2 disk uses a legacy backing by
+599         # actually looking at the image itself and parsing the output of the
+600         # backing file it expects to be using.
+601         if os.path.exists(self.path):
+602             backing_path = libvirt_utils.get_disk_backing_file(self.path)
+603             if backing_path is not None:
+604                 backing_file = os.path.basename(backing_path)
+605                 backing_parts = backing_file.rpartition('_')
+606                 if backing_file != backing_parts[-1] and \
+607                         backing_parts[-1].isdigit():
+608                     legacy_backing_size = int(backing_parts[-1])
+609                     legacy_base += '_%d' % legacy_backing_size
+610                     legacy_backing_size *= units.Gi
+611 
+612         # Create the legacy backing file if necessary.
+613         if legacy_backing_size:
+614             if not os.path.exists(legacy_base):
+615                 with fileutils.remove_path_on_error(legacy_base):
+616                     libvirt_utils.copy_image(base, legacy_base)
+617                     image = imgmodel.LocalFileImage(legacy_base,
+618                                                     imgmodel.FORMAT_QCOW2)
+619                     disk.extend(image, legacy_backing_size)
+620 
+621         if not os.path.exists(self.path):
+622             with fileutils.remove_path_on_error(self.path):
+623                 copy_qcow2_image(base, self.path, size)
+624 
+625     def resize_image(self, size):
+626         image = imgmodel.LocalFileImage(self.path, imgmodel.FORMAT_QCOW2)
+627         disk.extend(image, size)
+628 
+629     def snapshot_extract(self, target, out_format):
+630         libvirt_utils.extract_snapshot(self.path, 'qcow2',
+631                                        target,
+632                                        out_format)
+633 
+634     @staticmethod
+635     def is_file_in_instance_path():
+636         return True
+637 
+638     def get_model(self, connection):
+639         return imgmodel.LocalFileImage(self.path,
+640                                        imgmodel.FORMAT_QCOW2)
+641 
+642 
+643 class Lvm(Image):
+644     @staticmethod
+645     def escape(filename):
+646         return filename.replace('_', '__')
+647 
+648     def __init__(self, instance=None, disk_name=None, path=None):
+649         self.ephemeral_key_uuid = instance.get('ephemeral_key_uuid')
+650 
+651         if self.ephemeral_key_uuid is not None:
+652             self.key_manager = keymgr.API(CONF)
+653         else:
+654             self.key_manager = None
+655 
+656         if path:
+657             if self.ephemeral_key_uuid is None:
+658                 info = lvm.volume_info(path)
+659                 self.vg = info['VG']
+660                 self.lv = info['LV']
+661             else:
+662                 self.vg = CONF.libvirt.images_volume_group
+663         else:
+664             if not CONF.libvirt.images_volume_group:
+665                 raise RuntimeError(_('You should specify'
+666                                      ' images_volume_group'
+667                                      ' flag to use LVM images.'))
+668             self.vg = CONF.libvirt.images_volume_group
+669             self.lv = '%s_%s' % (instance.uuid,
+670                                  self.escape(disk_name))
+671             if self.ephemeral_key_uuid is None:
+672                 path = os.path.join('/dev', self.vg, self.lv)
+673             else:
+674                 self.lv_path = os.path.join('/dev', self.vg, self.lv)
+675                 path = '/dev/mapper/' + dmcrypt.volume_name(self.lv)
+676 
+677         super(Lvm, self).__init__(path, "block", "raw", is_block_dev=True)
+678 
+679         # TODO(pbrady): possibly deprecate libvirt.sparse_logical_volumes
+680         # for the more general preallocate_images
+681         self.sparse = CONF.libvirt.sparse_logical_volumes
+682         self.preallocate = not self.sparse
+683 
+684         if not self.sparse:
+685             self.driver_io = "native"
+686 
+687     def _supports_encryption(self):
+688         return True
+689 
+690     def _can_fallocate(self):
+691         return False
+692 
+693     def create_image(self, prepare_template, base, size, *args, **kwargs):
+694         def encrypt_lvm_image():
+695             dmcrypt.create_volume(self.path.rpartition('/')[2],
+696                                   self.lv_path,
+697                                   CONF.ephemeral_storage_encryption.cipher,
+698                                   CONF.ephemeral_storage_encryption.key_size,
+699                                   key)
+700 
+701         filename = self._get_lock_name(base)
+702 
+703         @utils.synchronized(filename, external=True, lock_path=self.lock_path)
+704         def create_lvm_image(base, size):
+705             base_size = disk.get_disk_size(base)
+706             self.verify_base_size(base, size, base_size=base_size)
+707             resize = size > base_size
+708             size = size if resize else base_size
+709             lvm.create_volume(self.vg, self.lv,
+710                                          size, sparse=self.sparse)
+711             if self.ephemeral_key_uuid is not None:
+712                 encrypt_lvm_image()
+713             # NOTE: by calling convert_image_unsafe here we're
+714             # telling qemu-img convert to do format detection on the input,
+715             # because we don't know what the format is. For example,
+716             # we might have downloaded a qcow2 image, or created an
+717             # ephemeral filesystem locally, we just don't know here. Having
+718             # audited this, all current sources have been sanity checked,
+719             # either because they're locally generated, or because they have
+720             # come from images.fetch_to_raw. However, this is major code smell.
+721             images.convert_image_unsafe(base, self.path, self.driver_format,
+722                                         run_as_root=True)
+723             if resize:
+724                 disk.resize2fs(self.path, run_as_root=True)
+725 
+726         generated = 'ephemeral_size' in kwargs
+727         if self.ephemeral_key_uuid is not None:
+728             if 'context' in kwargs:
+729                 try:
+730                     # NOTE(dgenin): Key manager corresponding to the
+731                     # specific backend catches and reraises an
+732                     # an exception if key retrieval fails.
+733                     key = self.key_manager.get(kwargs['context'],
+734                             self.ephemeral_key_uuid).get_encoded()
+735                 except Exception:
+736                     with excutils.save_and_reraise_exception():
+737                         LOG.error(_LE("Failed to retrieve ephemeral encryption"
+738                                       " key"))
+739             else:
+740                 raise exception.NovaException(
+741                     _("Instance disk to be encrypted but no context provided"))
+742         # Generate images with specified size right on volume
+743         if generated and size:
+744             lvm.create_volume(self.vg, self.lv,
+745                                          size, sparse=self.sparse)
+746             with self.remove_volume_on_error(self.path):
+747                 if self.ephemeral_key_uuid is not None:
+748                     encrypt_lvm_image()
+749                 prepare_template(target=self.path, *args, **kwargs)
+750         else:
+751             if not os.path.exists(base):
+752                 prepare_template(target=base, *args, **kwargs)
+753             with self.remove_volume_on_error(self.path):
+754                 create_lvm_image(base, size)
+755 
+756     # NOTE(nic): Resizing the image is already handled in create_image(),
+757     # and migrate/resize is not supported with LVM yet, so this is a no-op
+758     def resize_image(self, size):
+759         pass
+760 
+761     @contextlib.contextmanager
+762     def remove_volume_on_error(self, path):
+763         try:
+764             yield
+765         except Exception:
+766             with excutils.save_and_reraise_exception():
+767                 if self.ephemeral_key_uuid is None:
+768                     lvm.remove_volumes([path])
+769                 else:
+770                     dmcrypt.delete_volume(path.rpartition('/')[2])
+771                     lvm.remove_volumes([self.lv_path])
+772 
+773     def snapshot_extract(self, target, out_format):
+774         images.convert_image(self.path, target, self.driver_format,
+775                              out_format, run_as_root=True)
+776 
+777     def get_model(self, connection):
+778         return imgmodel.LocalBlockImage(self.path)
+779 
+780 
+781 class Rbd(Image):
+782 
+783     SUPPORTS_CLONE = True
+784 
+785     def __init__(self, instance=None, disk_name=None, path=None, **kwargs):
+786         if not CONF.libvirt.images_rbd_pool:
+787             raise RuntimeError(_('You should specify'
+788                                  ' images_rbd_pool'
+789                                  ' flag to use rbd images.'))
+790 
+791         if path:
+792             try:
+793                 self.rbd_name = path.split('/')[1]
+794             except IndexError:
+795                 raise exception.InvalidDevicePath(path=path)
+796         else:
+797             self.rbd_name = '%s_%s' % (instance.uuid, disk_name)
+798 
+799         self.pool = CONF.libvirt.images_rbd_pool
+800         self.rbd_user = CONF.libvirt.rbd_user
+801         self.ceph_conf = CONF.libvirt.images_rbd_ceph_conf
+802 
+803         path = 'rbd:%s/%s' % (self.pool, self.rbd_name)
+804         if self.rbd_user:
+805             path += ':id=' + self.rbd_user
+806         if self.ceph_conf:
+807             path += ':conf=' + self.ceph_conf
+808 
+809         super(Rbd, self).__init__(path, "block", "rbd", is_block_dev=False)
+810 
+811         self.driver = rbd_utils.RBDDriver(
+812             pool=self.pool,
+813             ceph_conf=self.ceph_conf,
+814             rbd_user=self.rbd_user)
+815 
+816         self.discard_mode = CONF.libvirt.hw_disk_discard
+817 
+818     def libvirt_info(self, disk_bus, disk_dev, device_type, cache_mode,
+819             extra_specs, hypervisor_version, boot_order=None):
+820         """Get `LibvirtConfigGuestDisk` filled for this image.
+821 
+822         :disk_dev: Disk bus device name
+823         :disk_bus: Disk bus type
+824         :device_type: Device type for this image.
+825         :cache_mode: Caching mode for this image
+826         :extra_specs: Instance type extra specs dict.
+827         :hypervisor_version: the hypervisor version
+828         :boot_order: Disk device boot order
+829         """
+830         info = vconfig.LibvirtConfigGuestDisk()
+831 
+832         hosts, ports = self.driver.get_mon_addrs()
+833         info.source_device = device_type
+834         info.driver_format = 'raw'
+835         info.driver_cache = cache_mode
+836         info.driver_discard = self.discard_mode
+837         info.target_bus = disk_bus
+838         info.target_dev = disk_dev
+839         info.source_type = 'network'
+840         info.source_protocol = 'rbd'
+841         info.source_name = '%s/%s' % (self.pool, self.rbd_name)
+842         info.source_hosts = hosts
+843         info.source_ports = ports
+844         info.boot_order = boot_order
+845         auth_enabled = (CONF.libvirt.rbd_user is not None)
+846         if CONF.libvirt.rbd_secret_uuid:
+847             info.auth_secret_uuid = CONF.libvirt.rbd_secret_uuid
+848             auth_enabled = True  # Force authentication locally
+849             if CONF.libvirt.rbd_user:
+850                 info.auth_username = CONF.libvirt.rbd_user
+851         if auth_enabled:
+852             info.auth_secret_type = 'ceph'
+853             info.auth_secret_uuid = CONF.libvirt.rbd_secret_uuid
+854 
+855         self.disk_qos(info, extra_specs)
+856 
+857         return info
+858 
+859     def _can_fallocate(self):
+860         return False
+861 
+862     def exists(self):
+863         return self.driver.exists(self.rbd_name)
+864 
+865     def get_disk_size(self, name):
+866         """Returns the size of the virtual disk in bytes.
+867 
+868         The name argument is ignored since this backend already knows
+869         its name, and callers may pass a non-existent local file path.
+870         """
+871         return self.driver.size(self.rbd_name)
+872 
+873     def create_image(self, prepare_template, base, size, *args, **kwargs):
+874 
+875         if not self.exists():
+876             prepare_template(target=base, *args, **kwargs)
+877 
+878         # prepare_template() may have cloned the image into a new rbd
+879         # image already instead of downloading it locally
+880         if not self.exists():
+881             self.driver.import_image(base, self.rbd_name)
+882         self.verify_base_size(base, size)
+883 
+884         if size and size > self.get_disk_size(self.rbd_name):
+885             self.driver.resize(self.rbd_name, size)
+886 
+887     def resize_image(self, size):
+888         self.driver.resize(self.rbd_name, size)
+889 
+890     def snapshot_extract(self, target, out_format):
+891         images.convert_image(self.path, target, 'raw', out_format)
+892 
+893     @staticmethod
+894     def is_shared_block_storage():
+895         return True
+896 
+897     def clone(self, context, image_id_or_uri):
+898         image_meta = IMAGE_API.get(context, image_id_or_uri,
+899                                    include_locations=True)
+900         locations = image_meta['locations']
+901 
+902         LOG.debug('Image locations are: %(locs)s', {'locs': locations})
+903 
+904         if image_meta.get('disk_format') not in ['raw', 'iso']:
+905             reason = _('Image is not raw format')
+906             raise exception.ImageUnacceptable(image_id=image_id_or_uri,
+907                                               reason=reason)
+908 
+909         for location in locations:
+910             if self.driver.is_cloneable(location, image_meta):
+911                 LOG.debug('Selected location: %(loc)s', {'loc': location})
+912                 return self.driver.clone(location, self.rbd_name)
+913 
+914         reason = _('No image locations are accessible')
+915         raise exception.ImageUnacceptable(image_id=image_id_or_uri,
+916                                           reason=reason)
+917 
+918     def get_model(self, connection):
+919         secret = None
+920         if CONF.libvirt.rbd_secret_uuid:
+921             secretobj = connection.secretLookupByUUIDString(
+922                 CONF.libvirt.rbd_secret_uuid)
+923             secret = base64.b64encode(secretobj.value())
+924 
+925         hosts, ports = self.driver.get_mon_addrs()
+926         servers = [str(':'.join(k)) for k in zip(hosts, ports)]
+927 
+928         return imgmodel.RBDImage(self.rbd_name,
+929                                  self.pool,
+930                                  self.rbd_user,
+931                                  secret,
+932                                  servers)
+933 
+934     def import_file(self, instance, local_file, remote_name):
+935         name = '%s_%s' % (instance.uuid, remote_name)
+936         if self.exists():
+937             self.driver.remove_image(name)
+938         self.driver.import_image(local_file, name)
+939 
+940     def create_snap(self, name):
+941         return self.driver.create_snap(self.rbd_name, name)
+942 
+943     def remove_snap(self, name, ignore_errors=False):
+944         return self.driver.remove_snap(self.rbd_name, name, ignore_errors)
+945 
+946     def rollback_to_snap(self, name):
+947         return self.driver.rollback_to_snap(self.rbd_name, name)
+948 
+949     def _get_parent_pool(self, context, base_image_id, fsid):
+950         parent_pool = None
+951         try:
+952             # The easy way -- the image is an RBD clone, so use the parent
+953             # images' storage pool
+954             parent_pool, _im, _snap = self.driver.parent_info(self.rbd_name)
+955         except exception.ImageUnacceptable:
+956             # The hard way -- the image is itself a parent, so ask Glance
+957             # where it came from
+958             LOG.debug('No parent info for %s; asking the Image API where its '
+959                       'store is', base_image_id)
+960             try:
+961                 image_meta = IMAGE_API.get(context, base_image_id,
+962                                            include_locations=True)
+963             except Exception as e:
+964                 LOG.debug('Unable to get image %(image_id)s; error: %(error)s',
+965                           {'image_id': base_image_id, 'error': e})
+966                 image_meta = {}
+967 
+968             # Find the first location that is in the same RBD cluster
+969             for location in image_meta.get('locations', []):
+970                 try:
+971                     parent_fsid, parent_pool, _im, _snap = \
+972                         self.driver.parse_url(location['url'])
+973                     if parent_fsid == fsid:
+974                         break
+975                     else:
+976                         parent_pool = None
+977                 except exception.ImageUnacceptable:
+978                     continue
+979 
+980         if not parent_pool:
+981             raise exception.ImageUnacceptable(
+982                     _('Cannot determine the parent storage pool for %s; '
+983                       'cannot determine where to store images') %
+984                     base_image_id)
+985 
+986         return parent_pool
+987 
+988     def direct_snapshot(self, context, snapshot_name, image_format,
+989                         image_id, base_image_id):
+990         """Creates an RBD snapshot directly.
+991         """
+992         fsid = self.driver.get_fsid()
+993         # NOTE(nic): Nova has zero comprehension of how Glance's image store
+994         # is configured, but we can infer what storage pool Glance is using
+995         # by looking at the parent image.  If using authx, write access should
+996         # be enabled on that pool for the Nova user
+997         parent_pool = self._get_parent_pool(context, base_image_id, fsid)
+998 
+999         # Snapshot the disk and clone it into Glance's storage pool.  librbd
+1000         # requires that snapshots be set to "protected" in order to clone them
+1001         self.driver.create_snap(self.rbd_name, snapshot_name, protect=True)
+1002         location = {'url': 'rbd://%(fsid)s/%(pool)s/%(image)s/%(snap)s' %
+1003                            dict(fsid=fsid,
+1004                                 pool=self.pool,
+1005                                 image=self.rbd_name,
+1006                                 snap=snapshot_name)}
+1007         try:
+1008             self.driver.clone(location, image_id, dest_pool=parent_pool)
+1009             # Flatten the image, which detaches it from the source snapshot
+1010             self.driver.flatten(image_id, pool=parent_pool)
+1011         finally:
+1012             # all done with the source snapshot, clean it up
+1013             self.cleanup_direct_snapshot(location)
+1014 
+1015         # Glance makes a protected snapshot called 'snap' on uploaded
+1016         # images and hands it out, so we'll do that too.  The name of
+1017         # the snapshot doesn't really matter, this just uses what the
+1018         # glance-store rbd backend sets (which is not configurable).
+1019         self.driver.create_snap(image_id, 'snap', pool=parent_pool,
+1020                                 protect=True)
+1021         return ('rbd://%(fsid)s/%(pool)s/%(image)s/snap' %
+1022                 dict(fsid=fsid, pool=parent_pool, image=image_id))
+1023 
+1024     def cleanup_direct_snapshot(self, location, also_destroy_volume=False,
+1025                                 ignore_errors=False):
+1026         """Unprotects and destroys the name snapshot.
+1027 
+1028         With also_destroy_volume=True, it will also cleanup/destroy the parent
+1029         volume.  This is useful for cleaning up when the target volume fails
+1030         to snapshot properly.
+1031         """
+1032         if location:
+1033             _fsid, _pool, _im, _snap = self.driver.parse_url(location['url'])
+1034             self.driver.remove_snap(_im, _snap, pool=_pool, force=True,
+1035                                     ignore_errors=ignore_errors)
+1036             if also_destroy_volume:
+1037                 self.driver.destroy_volume(_im, pool=_pool)
+1038 
+1039 
+1040 class Ploop(Image):
+1041     def __init__(self, instance=None, disk_name=None, path=None):
+1042         path = (path or os.path.join(libvirt_utils.get_instance_path(instance),
+1043                                      disk_name))
+1044         super(Ploop, self).__init__(path, "file", "ploop", is_block_dev=False)
+1045 
+1046         self.resolve_driver_format()
+1047 
+1048     def create_image(self, prepare_template, base, size, *args, **kwargs):
+1049         filename = os.path.split(base)[-1]
+1050 
+1051         @utils.synchronized(filename, external=True, lock_path=self.lock_path)
+1052         def create_ploop_image(base, target, size):
+1053             image_path = os.path.join(target, "root.hds")
+1054             libvirt_utils.copy_image(base, image_path)
+1055             utils.execute('ploop', 'restore-descriptor', '-f', self.pcs_format,
+1056                           target, image_path)
+1057             if size:
+1058                 self.resize_image(size)
+1059 
+1060         if not os.path.exists(self.path):
+1061             if CONF.force_raw_images:
+1062                 self.pcs_format = "raw"
+1063             else:
+1064                 image_meta = IMAGE_API.get(kwargs["context"],
+1065                                            kwargs["image_id"])
+1066                 format = image_meta.get("disk_format")
+1067                 if format == "ploop":
+1068                     self.pcs_format = "expanded"
+1069                 elif format == "raw":
+1070                     self.pcs_format = "raw"
+1071                 else:
+1072                     reason = _("PCS doesn't support images in %s format."
+1073                                 " You should either set force_raw_images=True"
+1074                                 " in config or upload an image in ploop"
+1075                                 " or raw format.") % format
+1076                     raise exception.ImageUnacceptable(
+1077                                         image_id=kwargs["image_id"],
+1078                                         reason=reason)
+1079 
+1080         if not os.path.exists(base):
+1081             prepare_template(target=base, *args, **kwargs)
+1082         self.verify_base_size(base, size)
+1083 
+1084         if os.path.exists(self.path):
+1085             return
+1086 
+1087         fileutils.ensure_tree(self.path)
+1088 
+1089         remove_func = functools.partial(fileutils.delete_if_exists,
+1090                                         remove=shutil.rmtree)
+1091         with fileutils.remove_path_on_error(self.path, remove=remove_func):
+1092             create_ploop_image(base, self.path, size)
+1093 
+1094     def resize_image(self, size):
+1095         image = imgmodel.LocalFileImage(self.path, imgmodel.FORMAT_PLOOP)
+1096         disk.extend(image, size)
+1097 
+1098     def snapshot_extract(self, target, out_format):
+1099         img_path = os.path.join(self.path, "root.hds")
+1100         libvirt_utils.extract_snapshot(img_path,
+1101                                        'parallels',
+1102                                        target,
+1103                                        out_format)
+1104 
+1105 
+1106 class Sio(Image):
+1107 
+1108     _sio_id = None
+1109     _sio_name = None
+1110     _exists = None
+1111 
+1112     def __init__(self, instance=None, disk_name=None, path=None):
+1113 
+1114         self.extra_specs = instance.flavor.extra_specs
+1115         if (instance.task_state == task_states.RESIZE_FINISH):
+1116             self.orig_extra_specs = instance.get_flavor('old').extra_specs
+1117         else:
+1118             self.orig_extra_specs = None
+1119         self.driver = sio_utils.SIODriver()
+1120 
+1121         if path:
+1122             self.sio_id = path.split('-')[-1]
+1123             self.sio_name = None
+1124         else:
+1125             self.sio_id = None
+1126             self.sio_name = sio_utils.get_sio_volume_name(instance, disk_name)
+1127 
+1128         super(Sio, self).__init__(path, "block", "raw", is_block_dev=True)
+1129 
+1130     @staticmethod
+1131     def is_shared_block_storage():
+1132         return True
+1133 
+1134     @staticmethod
+1135     def connect_disks(instance, with_no_wait=False):
+1136         sio_utils.SIODriver().map_volumes(instance, with_no_wait=with_no_wait)
+1137 
+1138     @staticmethod
+1139     def disconnect_disks(instance):
+1140         sio_utils.SIODriver().cleanup_volumes(instance, unmap_only=True)
+1141 
+1142     @property
+1143     def sio_id(self):
+1144         if not self._sio_id:
+1145             self._sio_id = self.driver.get_volume_id(self._sio_name)
+1146         return self._sio_id
+1147 
+1148     @sio_id.setter
+1149     def sio_id(self, value):
+1150         self._sio_id = value
+1151 
+1152     @property
+1153     def sio_name(self):
+1154         if not self._sio_name:
+1155             self._sio_name = self.driver.get_volume_name(self._sio_id)
+1156         return self._sio_name
+1157 
+1158     @sio_name.setter
+1159     def sio_name(self, value):
+1160         self._sio_name = value
+1161 
+1162     def exists(self):
+1163         if self._exists is None:
+1164             if not self._sio_id:
+1165                 self._sio_id = self.driver.get_volume_id(
+1166                     self._sio_name, none_if_not_found=True)
+1167             self._exists = bool(self._sio_id)
+1168         return self._exists
+1169 
+1170     def ensure_path(self):
+1171         if self.path is None:
+1172             try:
+1173                 self.path = self.driver.get_volume_path(self.sio_id)
+1174             except Exception:
+1175                 with excutils.save_and_reraise_exception():
+1176                     LOG.error(_LE('Disk volume %s is not connected'),
+1177                               self.sio_name)
+1178 
+1179     def create_image(self, prepare_template, base, size, *args, **kwargs):
+1180         if self.exists():
+1181             self.connect_disk()
+1182             return
+1183 
+1184         generating = 'image_id' not in kwargs
+1185         # NOTE(ft): We assume that only root disk is recreated in rescue mode.
+1186         # With this assumption the code becomes more simple and fast.
+1187         if generating:
+1188             sio_utils.verify_volume_size(size)
+1189             self.sio_id = self.driver.create_volume(self.sio_name, size,
+1190                                                     self.extra_specs)
+1191             self.path = self.driver.map_volume(self.sio_id)
+1192             prepare_template(target=self.path, is_block_dev=True,
+1193                              *args, **kwargs)
+1194         else:
+1195             if not os.path.exists(base):
+1196                 prepare_template(target=base, *args, **kwargs)
+1197 
+1198             base_size = disk.get_disk_size(base)
+1199             if (size is None and
+1200                     sio_utils.is_sio_volume_rescuer(self.sio_name)):
+1201                 size = sio_utils.choose_volume_size(base_size)
+1202                 self.extra_specs = dict(self.extra_specs)
+1203                 self.extra_specs[sio_utils.PROVISIONING_TYPE_KEY] = 'thin'
+1204             else:
+1205                 sio_utils.verify_volume_size(size)
+1206                 self.verify_base_size(base, size, base_size=base_size)
+1207 
+1208             self.sio_id = self.driver.create_volume(self.sio_name, size,
+1209                                                     self.extra_specs)
+1210             self.path = self.driver.map_volume(self.sio_id)
+1211             self.driver.import_image(base, self.path)
+1212 
+1213     def connect_disk(self):
+1214         self.driver.map_volume(self.sio_id, with_no_wait=True)
+1215         if self.orig_extra_specs is not None:
+1216             self.driver.move_volume(
+1217                 self.sio_id, self.sio_name, self.extra_specs,
+1218                 self.orig_extra_specs, is_mapped=True)
+1219 
+1220     def get_disk_size(self, name):
+1221         return self.driver.get_volume_size(self.sio_id)
+1222 
+1223     def get_model(self, connection):
+1224         return imgmodel.SIOImage()
+1225 
+1226     def libvirt_info(self, disk_bus, disk_dev, device_type, cache_mode,
+1227                      extra_specs, hypervisor_version, boot_order=None):
+1228         self.ensure_path()
+1229         return super(Sio, self).libvirt_info(
+1230             disk_bus, disk_dev, device_type, cache_mode,
+1231             extra_specs, hypervisor_version, boot_order)
+1232 
+1233     def snapshot_extract(self, target, out_format):
+1234         self.ensure_path()
+1235         self.driver.export_image(self.path, target, out_format)
+1236 
+1237     def resize_image(self, size):
+1238         sio_utils.verify_volume_size(size)
+1239         self.driver.extend_volume(self.sio_id, size)
+1240 
+1241     def create_snap(self, name):
+1242         snap_name = sio_utils.get_sio_snapshot_name(self.sio_name, name)
+1243         self.driver.snapshot_volume(self.sio_id, snap_name)
+1244 
+1245     def remove_snap(self, name, ignore_errors=False):
+1246         snap_name = sio_utils.get_sio_snapshot_name(self.sio_name, name)
+1247         self.driver.remove_volume_by_name(snap_name)
+1248 
+1249     def rollback_to_snap(self, name):
+1250         snap_name = sio_utils.get_sio_snapshot_name(self.sio_name, name)
+1251         self.driver.rollback_to_snapshot(self.sio_id, self.sio_name, snap_name)
+1252 
+1253 
+1254 class Backend(object):
+1255     def __init__(self, use_cow):
+1256         self.BACKEND = {
+1257             'raw': Flat,
+1258             'flat': Flat,
+1259             'qcow2': Qcow2,
+1260             'lvm': Lvm,
+1261             'rbd': Rbd,
+1262             'ploop': Ploop,
+1263             'sio': Sio,
+1264             'default': Qcow2 if use_cow else Flat
+1265         }
+1266 
+1267     def backend(self, image_type=None):
+1268         if not image_type:
+1269             image_type = CONF.libvirt.images_type
+1270         image = self.BACKEND.get(image_type)
+1271         if not image:
+1272             raise RuntimeError(_('Unknown image_type=%s') % image_type)
+1273         return image
+1274 
+1275     def by_name(self, instance, name, image_type=None):
+1276         """Return an Image object for a disk with the given name.
+1277 
+1278         :param instance: the instance which owns this disk
+1279         :param name: The name of the disk
+1280         :param image_type: (Optional) Image type.
+1281                            Default is CONF.libvirt.images_type.
+1282         :return: An Image object for the disk with given name and instance.
+1283         :rtype: Image
+1284         """
+1285         backend = self.backend(image_type)
+1286         return backend(instance=instance, disk_name=name)
+1287 
+1288     def by_libvirt_path(self, instance, path, image_type=None):
+1289         """Return an Image object for a disk with the given libvirt path.
+1290 
+1291         :param instance: The instance which owns this disk.
+1292         :param path: The libvirt representation of the image's path.
+1293         :param image_type: (Optional) Image type.
+1294                            Default is CONF.libvirt.images_type.
+1295         :return: An Image object for the given libvirt path.
+1296         :rtype: Image
+1297         """
+1298         backend = self.backend(image_type)
+1299         return backend(instance=instance, path=path)

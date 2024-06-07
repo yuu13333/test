@@ -1,0 +1,554 @@
+Based on the given code from a commit, please generate supplementary code files according to the commit message.
+####commit message
+update subport status when trunk/subport create/delete is triggerred
+
+When trunk or subport is created or deleted, notifications are sent. In
+the meanwhile, subport status is not updated accordingly.
+
+device_id device_owner and binding:host_id should be updated when
+notifications are received.
+
+In this patch, notifications are listened and subport status should be
+updated when trunk/subport is crated amd subport is already added to
+trunk:
+
+    device_id: <trunk_id>
+    device_owner: trunk:subport
+    binding:host_id: <parent port host_id>
+
+When trunk/subport is deleted or subport is removed from trunk, subport
+status should be updated:
+
+    device_id: None
+    device_owner: None
+    binding:host_id: None
+
+Close-Bug: 1942413
+Change-Id: I0bdc5aabae0125926253b530fd0c6e79ba7bcbb9
+
+####code 
+1 # All Rights Reserved.
+2 #
+3 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
+4 #    not use this file except in compliance with the License. You may obtain
+5 #    a copy of the License at
+6 #
+7 #         http://www.apache.org/licenses/LICENSE-2.0
+8 #
+9 #    Unless required by applicable law or agreed to in writing, software
+10 #    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+11 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+12 #    License for the specific language governing permissions and limitations
+13 #    under the License.
+14 
+15 import copy
+16 
+17 import eventlet
+18 
+19 from neutron_lib.api.definitions import port as port_def
+20 from neutron_lib.api.definitions import portbindings
+21 from neutron_lib.api.definitions import trunk as trunk_apidef
+22 from neutron_lib.api.definitions import trunk_details
+23 from neutron_lib.callbacks import events
+24 from neutron_lib.callbacks import registry
+25 from neutron_lib.callbacks import resources
+26 from neutron_lib import context
+27 from neutron_lib.db import api as db_api
+28 from neutron_lib.db import resource_extend
+29 from neutron_lib.plugins import directory
+30 from neutron_lib.services import base as service_base
+31 from neutron_lib.services.trunk import constants
+32 from oslo_log import log as logging
+33 from oslo_utils import excutils
+34 from oslo_utils import uuidutils
+35 
+36 from neutron.db import db_base_plugin_common
+37 from neutron.objects import base as objects_base
+38 from neutron.objects import trunk as trunk_objects
+39 from neutron.services.trunk import drivers
+40 from neutron.services.trunk import exceptions as trunk_exc
+41 from neutron.services.trunk import rules
+42 from neutron.services.trunk.seg_types import validators
+43 
+44 LOG = logging.getLogger(__name__)
+45 
+46 
+47 @resource_extend.has_resource_extenders
+48 @registry.has_registry_receivers
+49 class TrunkPlugin(service_base.ServicePluginBase):
+50 
+51     supported_extension_aliases = [trunk_apidef.ALIAS,
+52                                    trunk_details.ALIAS]
+53 
+54     __native_pagination_support = True
+55     __native_sorting_support = True
+56     __filter_validation_support = True
+57 
+58     def __init__(self):
+59         self._rpc_backend = None
+60         self._drivers = []
+61         self._segmentation_types = {}
+62         self._interfaces = set()
+63         self._agent_types = set()
+64         drivers.register()
+65         registry.subscribe(rules.enforce_port_deletion_rules,
+66                            resources.PORT, events.BEFORE_DELETE)
+67         registry.publish(resources.TRUNK_PLUGIN, events.AFTER_INIT, self)
+68         for driver in self._drivers:
+69             LOG.debug('Trunk plugin loaded with driver %s', driver.name)
+70         self.check_compatibility()
+71 
+72     @staticmethod
+73     @resource_extend.extends([port_def.COLLECTION_NAME])
+74     def _extend_port_trunk_details(port_res, port_db):
+75         """Add trunk details to a port."""
+76         if port_db.trunk_port:
+77             subports = {
+78                 x.port_id: {'segmentation_id': x.segmentation_id,
+79                             'segmentation_type': x.segmentation_type,
+80                             'port_id': x.port_id}
+81                 for x in port_db.trunk_port.sub_ports
+82             }
+83             if not port_res.get('bulk'):
+84                 core_plugin = directory.get_plugin()
+85                 ports = core_plugin.get_ports(
+86                     context.get_admin_context(), filters={'id': subports})
+87                 for port in ports:
+88                     subports[port['id']]['mac_address'] = port['mac_address']
+89             trunk_details = {'trunk_id': port_db.trunk_port.id,
+90                              'sub_ports': list(subports.values())}
+91             port_res['trunk_details'] = trunk_details
+92 
+93         return port_res
+94 
+95     @staticmethod
+96     @resource_extend.extends([port_def.COLLECTION_NAME_BULK])
+97     def _extend_port_trunk_details_bulk(ports_res, noop):
+98         """Add trunk subport details to a list of ports."""
+99         subport_ids = []
+100         trunk_ports = []
+101         for p in ports_res:
+102             if 'trunk_details' in p and 'subports' in p['trunk_details']:
+103                 trunk_ports.append(p)
+104                 for subp in p['trunk_details']['subports']:
+105                     subport_ids.append(subp['port_id'])
+106         if not subport_ids:
+107             return ports_res
+108 
+109         core_plugin = directory.get_plugin()
+110         subports = core_plugin.get_ports(
+111             context.get_admin_context(), filters={'id': subport_ids})
+112         subport_macs = {p['id']: p['mac_address'] for p in subports}
+113 
+114         for tp in trunk_ports:
+115             for subp in tp['trunk_details']['subports']:
+116                 subp['mac_address'] = subport_macs[subp['port_id']]
+117 
+118         return ports_res
+119 
+120     def check_compatibility(self):
+121         """Verify the plugin can load correctly and fail otherwise."""
+122         self.check_driver_compatibility()
+123         self.check_segmentation_compatibility()
+124 
+125     def check_driver_compatibility(self):
+126         """Fail to load if no compatible driver is found."""
+127         if not any([driver.is_loaded for driver in self._drivers]):
+128             raise trunk_exc.IncompatibleTrunkPluginConfiguration()
+129 
+130     def check_segmentation_compatibility(self):
+131         """Fail to load if segmentation type conflicts are found.
+132 
+133         In multi-driver deployments each loaded driver must support the same
+134         set of segmentation types consistently.
+135         """
+136         # Get list of segmentation types for the loaded drivers.
+137         list_of_driver_seg_types = [
+138             set(driver.segmentation_types) for driver in self._drivers
+139             if driver.is_loaded
+140         ]
+141 
+142         # If not empty, check that there is at least one we can use.
+143         compat_segmentation_types = set()
+144         if list_of_driver_seg_types:
+145             compat_segmentation_types = (
+146                 set.intersection(*list_of_driver_seg_types))
+147         if not compat_segmentation_types:
+148             raise trunk_exc.IncompatibleDriverSegmentationTypes()
+149 
+150         # If there is at least one, make sure the validator is defined.
+151         try:
+152             for seg_type in compat_segmentation_types:
+153                 self.add_segmentation_type(
+154                     seg_type, validators.get_validator(seg_type))
+155         except KeyError:
+156             raise trunk_exc.SegmentationTypeValidatorNotFound(
+157                 seg_type=seg_type)
+158 
+159     def set_rpc_backend(self, backend):
+160         self._rpc_backend = backend
+161 
+162     def is_rpc_enabled(self):
+163         return self._rpc_backend is not None
+164 
+165     def register_driver(self, driver):
+166         """Register driver with trunk plugin."""
+167         if driver.agent_type:
+168             self._agent_types.add(driver.agent_type)
+169         self._interfaces = self._interfaces | set(driver.interfaces)
+170         self._drivers.append(driver)
+171 
+172     @property
+173     def registered_drivers(self):
+174         """The registered drivers."""
+175         return self._drivers
+176 
+177     @property
+178     def supported_interfaces(self):
+179         """A set of supported interfaces."""
+180         return self._interfaces
+181 
+182     @property
+183     def supported_agent_types(self):
+184         """A set of supported agent types."""
+185         return self._agent_types
+186 
+187     def add_segmentation_type(self, segmentation_type, id_validator):
+188         self._segmentation_types[segmentation_type] = id_validator
+189         LOG.debug('Added support for segmentation type %s', segmentation_type)
+190 
+191     def validate(self, context, trunk):
+192         """Return a valid trunk or raises an error if unable to do so."""
+193         trunk_details = trunk
+194 
+195         trunk_validator = rules.TrunkPortValidator(trunk['port_id'])
+196         trunk_details['port_id'] = trunk_validator.validate(context)
+197 
+198         subports_validator = rules.SubPortsValidator(
+199             self._segmentation_types, trunk['sub_ports'], trunk['port_id'])
+200         trunk_details['sub_ports'] = subports_validator.validate(context)
+201         return trunk_details
+202 
+203     def get_plugin_description(self):
+204         return "Trunk port service plugin"
+205 
+206     @classmethod
+207     def get_plugin_type(cls):
+208         return "trunk"
+209 
+210     @db_base_plugin_common.filter_fields
+211     @db_base_plugin_common.convert_result_to_dict
+212     def get_trunk(self, context, trunk_id, fields=None):
+213         """Return information for the specified trunk."""
+214         return self._get_trunk(context, trunk_id)
+215 
+216     @db_base_plugin_common.filter_fields
+217     @db_base_plugin_common.convert_result_to_dict
+218     def get_trunks(self, context, filters=None, fields=None,
+219                    sorts=None, limit=None, marker=None, page_reverse=False):
+220         """Return information for available trunks."""
+221         filters = filters or {}
+222         pager = objects_base.Pager(sorts=sorts, limit=limit,
+223                                    page_reverse=page_reverse, marker=marker)
+224         return trunk_objects.Trunk.get_objects(context, _pager=pager,
+225                                                **filters)
+226 
+227     @db_base_plugin_common.convert_result_to_dict
+228     def create_trunk(self, context, trunk):
+229         """Create a trunk."""
+230         trunk = self.validate(context, trunk['trunk'])
+231         sub_ports = [trunk_objects.SubPort(
+232                          context=context,
+233                          port_id=p['port_id'],
+234                          segmentation_id=p['segmentation_id'],
+235                          segmentation_type=p['segmentation_type'])
+236                      for p in trunk['sub_ports']]
+237         admin_state_up = trunk.get('admin_state_up', True)
+238         # NOTE(status_police): a trunk is created in DOWN status. Depending
+239         # on the nature of the create request, a driver may set the status
+240         # immediately to ACTIVE if no physical provisioning is required.
+241         # Otherwise a transition to BUILD (or ERROR) should be expected
+242         # depending on how the driver reacts. PRECOMMIT failures prevent the
+243         # trunk from being created altogether.
+244         trunk_description = trunk.get('description', "")
+245         trunk_obj = trunk_objects.Trunk(context=context,
+246                                         admin_state_up=admin_state_up,
+247                                         id=uuidutils.generate_uuid(),
+248                                         name=trunk.get('name', ""),
+249                                         description=trunk_description,
+250                                         project_id=trunk['tenant_id'],
+251                                         port_id=trunk['port_id'],
+252                                         status=constants.TRUNK_DOWN_STATUS,
+253                                         sub_ports=sub_ports)
+254         with db_api.CONTEXT_WRITER.using(context):
+255             trunk_obj.create()
+256             payload = events.DBEventPayload(
+257                 context, resource_id=trunk_obj.id, desired_state=trunk_obj)
+258             registry.publish(
+259                 resources.TRUNK, events.PRECOMMIT_CREATE, self,
+260                 payload=payload)
+261         payload = events.DBEventPayload(
+262             context, resource_id=trunk_obj.id, states=(trunk_obj,))
+263         registry.publish(
+264             resources.TRUNK, events.AFTER_CREATE, self, payload=payload)
+265         return trunk_obj
+266 
+267     @db_base_plugin_common.convert_result_to_dict
+268     def update_trunk(self, context, trunk_id, trunk):
+269         """Update information for the specified trunk."""
+270         trunk_data = trunk['trunk']
+271         with db_api.CONTEXT_WRITER.using(context):
+272             trunk_obj = self._get_trunk(context, trunk_id)
+273             original_trunk = copy.deepcopy(trunk_obj)
+274             # NOTE(status_police): a trunk status should not change during an
+275             # update_trunk(), even in face of PRECOMMIT failures. This is
+276             # because only name and admin_state_up are being affected, and
+277             # these are DB properties only.
+278             trunk_obj.update_fields(trunk_data, reset_changes=True)
+279             trunk_obj.update()
+280             payload = events.DBEventPayload(
+281                 context, resource_id=trunk_id, states=(original_trunk,),
+282                 desired_state=trunk_obj, request_body=trunk_data)
+283             registry.publish(resources.TRUNK, events.PRECOMMIT_UPDATE, self,
+284                              payload=payload)
+285         payload = events.DBEventPayload(
+286             context, resource_id=trunk_id, states=(original_trunk, trunk_obj,),
+287             request_body=trunk_data)
+288         registry.publish(resources.TRUNK, events.AFTER_UPDATE, self,
+289                          payload=payload)
+290         return trunk_obj
+291 
+292     def delete_trunk(self, context, trunk_id):
+293         """Delete the specified trunk."""
+294         with db_api.CONTEXT_WRITER.using(context):
+295             trunk = self._get_trunk(context, trunk_id)
+296             rules.trunk_can_be_managed(context, trunk)
+297             trunk_port_validator = rules.TrunkPortValidator(trunk.port_id)
+298             if trunk_port_validator.can_be_trunked_or_untrunked(context):
+299                 # NOTE(status_police): when a trunk is deleted, the logical
+300                 # object disappears from the datastore, therefore there is no
+301                 # status transition involved. If PRECOMMIT failures occur,
+302                 # the trunk remains in the status where it was.
+303                 try:
+304                     trunk.delete()
+305                 except Exception as e:
+306                     with excutils.save_and_reraise_exception():
+307                         LOG.warning('Trunk driver raised exception when '
+308                                     'deleting trunk port %s: %s', trunk_id,
+309                                     str(e))
+310                 payload = events.DBEventPayload(context, resource_id=trunk_id,
+311                                                 states=(trunk,))
+312                 registry.publish(resources.TRUNK, events.PRECOMMIT_DELETE,
+313                                  self, payload=payload)
+314             else:
+315                 LOG.info('Trunk driver does not consider trunk %s '
+316                          'untrunkable', trunk_id)
+317                 raise trunk_exc.TrunkInUse(trunk_id=trunk_id)
+318         registry.publish(resources.TRUNK, events.AFTER_DELETE, self,
+319                          payload=events.DBEventPayload(
+320                              context, resource_id=trunk_id,
+321                              states=(trunk,)))
+322 
+323     @db_base_plugin_common.convert_result_to_dict
+324     def add_subports(self, context, trunk_id, subports):
+325         """Add one or more subports to trunk."""
+326         with db_api.CONTEXT_WRITER.using(context):
+327             trunk = self._get_trunk(context, trunk_id)
+328 
+329             # Check for basic validation since the request body here is not
+330             # automatically validated by the API layer.
+331             subports = subports['sub_ports']
+332             subports_validator = rules.SubPortsValidator(
+333                 self._segmentation_types, subports, trunk['port_id'])
+334             subports = subports_validator.validate(
+335                 context, basic_validation=True)
+336             added_subports = []
+337 
+338             rules.trunk_can_be_managed(context, trunk)
+339             original_trunk = copy.deepcopy(trunk)
+340             # NOTE(status_police): the trunk status should transition to
+341             # DOWN (and finally in ACTIVE or ERROR), only if it is not in
+342             # ERROR status already. A user should attempt to resolve the ERROR
+343             # condition before adding more subports to the trunk. Should a
+344             # trunk be in DOWN or BUILD state (e.g. when dealing with
+345             # multiple concurrent requests), the status is still forced to
+346             # DOWN and thus can potentially overwrite an interleaving state
+347             # change to ACTIVE. Eventually the driver should bring the status
+348             # back to ACTIVE or ERROR.
+349             if trunk.status == constants.TRUNK_ERROR_STATUS:
+350                 raise trunk_exc.TrunkInErrorState(trunk_id=trunk_id)
+351             trunk.update(status=constants.TRUNK_DOWN_STATUS)
+352 
+353             for subport in subports:
+354                 obj = trunk_objects.SubPort(
+355                                context=context,
+356                                trunk_id=trunk_id,
+357                                port_id=subport['port_id'],
+358                                segmentation_type=subport['segmentation_type'],
+359                                segmentation_id=subport['segmentation_id'])
+360                 obj.create()
+361                 trunk['sub_ports'].append(obj)
+362                 added_subports.append(obj)
+363             payload = events.DBEventPayload(context, resource_id=trunk_id,
+364                                             states=(original_trunk, trunk,),
+365                                             metadata={
+366                                                 'subports': added_subports
+367                                             })
+368             if added_subports:
+369                 registry.publish(resources.SUBPORTS, events.PRECOMMIT_CREATE,
+370                                  self, payload=payload)
+371         if added_subports:
+372             payload = events.DBEventPayload(context, resource_id=trunk_id,
+373                                             states=(original_trunk, trunk,),
+374                                             metadata={
+375                                                 'subports': added_subports
+376                                             })
+377             registry.publish(
+378                 resources.SUBPORTS, events.AFTER_CREATE, self, payload=payload)
+379         return trunk
+380 
+381     @db_base_plugin_common.convert_result_to_dict
+382     def remove_subports(self, context, trunk_id, subports):
+383         """Remove one or more subports from trunk."""
+384         subports = subports['sub_ports']
+385         with db_api.CONTEXT_WRITER.using(context):
+386             trunk = self._get_trunk(context, trunk_id)
+387             original_trunk = copy.deepcopy(trunk)
+388             rules.trunk_can_be_managed(context, trunk)
+389 
+390             subports_validator = rules.SubPortsValidator(
+391                 self._segmentation_types, subports)
+392             # the subports are being removed, therefore we do not need to
+393             # enforce any specific trunk rules, other than basic validation
+394             # of the request body.
+395             subports = subports_validator.validate(
+396                 context, basic_validation=True,
+397                 trunk_validation=False)
+398 
+399             current_subports = {p.port_id: p for p in trunk.sub_ports}
+400             removed_subports = []
+401 
+402             for subport in subports:
+403                 subport_obj = current_subports.pop(subport['port_id'], None)
+404 
+405                 if not subport_obj:
+406                     raise trunk_exc.SubPortNotFound(trunk_id=trunk_id,
+407                                                     port_id=subport['port_id'])
+408                 subport_obj.delete()
+409                 removed_subports.append(subport_obj)
+410 
+411             del trunk.sub_ports[:]
+412             trunk.sub_ports.extend(current_subports.values())
+413             # NOTE(status_police): the trunk status should transition to
+414             # DOWN irrespective of the status in which it is in to allow
+415             # the user to resolve potential conflicts due to prior add_subports
+416             # operations.
+417             # Should a trunk be in DOWN or BUILD state (e.g. when dealing
+418             # with multiple concurrent requests), the status is still forced
+419             # to DOWN. See add_subports() for more details.
+420             trunk.update(status=constants.TRUNK_DOWN_STATUS)
+421             payload = events.DBEventPayload(context, resource_id=trunk_id,
+422                                             states=(original_trunk, trunk,),
+423                                             metadata={
+424                                                 'subports': removed_subports
+425                                             })
+426             if removed_subports:
+427                 registry.publish(resources.SUBPORTS, events.PRECOMMIT_DELETE,
+428                                  self, payload=payload)
+429         if removed_subports:
+430             payload = events.DBEventPayload(context, resource_id=trunk_id,
+431                                             states=(original_trunk, trunk,),
+432                                             metadata={
+433                                                 'subports': removed_subports
+434                                             })
+435             registry.publish(
+436                 resources.SUBPORTS, events.AFTER_DELETE, self, payload=payload)
+437         return trunk
+438 
+439     @db_base_plugin_common.filter_fields
+440     def get_subports(self, context, trunk_id, fields=None):
+441         """Return subports for the specified trunk."""
+442         trunk = self.get_trunk(context, trunk_id)
+443         return {'sub_ports': trunk['sub_ports']}
+444 
+445     def _get_trunk(self, context, trunk_id):
+446         """Return the trunk object or raise if not found."""
+447         obj = trunk_objects.Trunk.get_object(context, id=trunk_id)
+448         if obj is None:
+449             raise trunk_exc.TrunkNotFound(trunk_id=trunk_id)
+450 
+451         return obj
+452 
+453     # NOTE(tidwellr) Consider keying off of PRECOMMIT_UPDATE if we find
+454     # AFTER_UPDATE to be problematic for setting trunk status when a
+455     # a parent port becomes unbound.
+456     @registry.receives(resources.PORT, [events.AFTER_UPDATE])
+457     def _trigger_trunk_status_change(self, resource, event, trigger, payload):
+458         updated_port = payload.latest_state
+459         trunk_details = updated_port.get('trunk_details')
+460         # If no trunk_details, the port is not the parent of a trunk.
+461         if not trunk_details:
+462             return
+463 
+464         context = payload.context
+465         original_port = payload.states[0]
+466         orig_vif_type = original_port.get(portbindings.VIF_TYPE)
+467         new_vif_type = updated_port.get(portbindings.VIF_TYPE)
+468         vif_type_changed = orig_vif_type != new_vif_type
+469         if vif_type_changed and new_vif_type == portbindings.VIF_TYPE_UNBOUND:
+470             trunk_id = trunk_details['trunk_id']
+471             # NOTE(status_police) Trunk status goes to DOWN when the parent
+472             # port is unbound. This means there are no more physical resources
+473             # associated with the logical resource.
+474             self.update_trunk(
+475                 context, trunk_id,
+476                 {'trunk': {'status': constants.TRUNK_DOWN_STATUS}})
+477 
+478     @registry.receives(resources.SUBPORTS,
+479                        [events.AFTER_CREATE, events.AFTER_DELETE])
+480     @registry.receives(resources.TRUNK,
+481                        [events.AFTER_CREATE, events.AFTER_DELETE])
+482     def _update_device_attributes(self, resource, event, triggers, payload):
+483         device_id = ''
+484         device_owner = ''
+485         host_id = None
+486         if event == events.AFTER_CREATE:
+487             device_id = payload.resource_id
+488             device_owner = constants.TRUNK_SUBPORT_OWNER
+489             if resource == resources.TRUNK:
+490                 subports = payload.states[0].sub_ports
+491             elif resource == resources.SUBPORTS:
+492                 subports = payload.metadata['subports']
+493                 parent_port = directory.get_plugin().get_port(
+494                     context.get_admin_context(),
+495                     payload.states[1]['port_id'])
+496                 host_id = parent_port['binding:host_id']
+497         elif event == events.AFTER_DELETE:
+498             host_id = ''
+499             if resource == resources.TRUNK:
+500                 subports = payload.states[0].sub_ports
+501             elif resource == resources.SUBPORTS:
+502                 subports = payload.metadata['subports']
+503         eventlet.spawn_n(self._update_subports, context.get_admin_context(),
+504                          subports, device_id, device_owner, host_id)
+505 
+506     def _update_subports(self, context, subports, device_id, device_owner,
+507                          host_id):
+508         port_data = (
+509             {'port': {'device_id': device_id, 'device_owner': device_owner}})
+510         if host_id is not None:
+511             port_data['port']['binding:host_id'] = host_id
+512         core_plugin = directory.get_plugin()
+513         for subport in subports:
+514             try:
+515                 core_plugin.update_port(context, subport.port_id, port_data)
+516             except Exception as e:
+517                 LOG.error("Unable to update device_id = '%(device_id)s'"
+518                           "and device_owner='%(device_owner)s'"
+519                           "and host_id='%(host_id)'"
+520                           "for port=%(port_id)s: %(reason)s",
+521                           {'device_id': device_id,
+522                            'device_owner': device_owner,
+523                            'host_id': host_id,
+524                            'port_id': subport.port_id,
+525                            'reason': e})

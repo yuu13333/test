@@ -1,0 +1,347 @@
+Based on the given code from a commit, please generate supplementary code files according to the commit message.
+####commit message
+[OVN] security group logging support
+
+This is the OVN driver for handling security-group-logging
+
+Closes-Bug: 1914757
+Related-Bug: 1468366
+Partially-implements: https://review.opendev.org/c/openstack/neutron-specs/+/203509
+
+Change-Id: Ic86fa70eb34c9b178267b80de1f8883a3ef03e98
+
+####code 
+1 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
+2 #    not use this file except in compliance with the License. You may obtain
+3 #    a copy of the License at
+4 #
+5 #         http://www.apache.org/licenses/LICENSE-2.0
+6 #
+7 #    Unless required by applicable law or agreed to in writing, software
+8 #    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+9 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+10 #    License for the specific language governing permissions and limitations
+11 #    under the License.
+12 
+13 from neutron._i18n import _
+14 from neutron.conf.services import logging as log_cfg
+15 from neutron_lib.api.definitions import portbindings
+16 from neutron_lib.callbacks import resources
+17 from neutron_lib import exceptions as n_exceptions
+18 from neutron_lib.plugins import constants as plugin_constants
+19 from neutron_lib.plugins import directory
+20 from neutron_lib.services.logapi import constants as log_const
+21 from oslo_config import cfg
+22 from oslo_log import log as logging
+23 from oslo_utils import importutils
+24 from ovsdbapp.backend.ovs_idl import idlutils
+25 
+26 from neutron.common.ovn import constants as ovn_const
+27 from neutron.common.ovn import utils
+28 from neutron.services.logapi.common import db_api
+29 from neutron.services.logapi.common import sg_callback
+30 from neutron.services.logapi.drivers import base
+31 from neutron.services.logapi.drivers import manager
+32 
+33 LOG = logging.getLogger(__name__)
+34 
+35 DRIVER = None
+36 
+37 log_cfg.register_log_driver_opts()
+38 
+39 SUPPORTED_LOGGING_TYPES = [log_const.SECURITY_GROUP]
+40 
+41 
+42 class LoggingNotSupported(n_exceptions.NeutronException):
+43     message = _("The current OVN version does not offer support "
+44                 "for neutron network log functionality.")
+45 
+46 
+47 class OVNDriver(base.DriverBase):
+48 
+49     def __init__(self):
+50         super().__init__(
+51             name="ovn",
+52             vif_types=[portbindings.VIF_TYPE_OVS,
+53                        portbindings.VIF_TYPE_VHOST_USER],
+54             vnic_types=[portbindings.VNIC_NORMAL],
+55             supported_logging_types=SUPPORTED_LOGGING_TYPES,
+56             requires_rpc=False)
+57         self._log_plugin_property = None
+58         self.meter_name = (
+59                 cfg.CONF.network_log.local_output_log_base or "acl_log_meter")
+60 
+61     @classmethod
+62     def create(cls, plugin_driver):
+63         cls.plugin_driver = plugin_driver
+64         return OVNDriver()
+65 
+66     @property
+67     def _log_plugin(self):
+68         if self._log_plugin_property is None:
+69             self._log_plugin_property = directory.get_plugin(
+70                 plugin_constants.LOG_API)
+71         return self._log_plugin_property
+72 
+73     class _Log_dict_to_obj():
+74         def __init__(self, log_dict):
+75             self.__dict__ = log_dict
+76 
+77     def _get_logs(self, context):
+78         log_objs = self._log_plugin.get_logs(context)
+79         return [self._Log_dict_to_obj(lo) for lo in log_objs]
+80 
+81     @property
+82     def ovn_nb(self):
+83         return self.plugin_driver.nb_ovn
+84 
+85     def _create_ovn_fair_meter(self):
+86         meter = self.ovn_nb.db_find_rows(
+87             "Meter", ("name", "=", self.meter_name)).execute(check_error=True)
+88         if meter:
+89             meter = meter[0]
+90             try:
+91                 meter_band = self.ovn_nb.lookup("Meter_Band",
+92                                                 meter.bands[0].uuid)
+93                 if all((meter.unit == "pktps",
+94                         meter.fair[0] is True,
+95                         meter_band.rate == cfg.CONF.network_log.rate_limit,
+96                         meter_band.burst_size ==
+97                         cfg.CONF.network_log.burst_limit)):
+98                     return
+99             except idlutils.RowNotFound:
+100                 pass
+101             # Re-create meter (and its meter-band) with the required attributes
+102             self.ovn_nb.meter_del(meter.uuid).execute(check_error=True)
+103         # Create meter
+104         LOG.debug("Creating network log fair meter %s", self.meter_name)
+105         with self.ovn_nb.transaction(check_error=True) as ovn_txn:
+106             ovn_txn.add(self.ovn_nb.meter_add(
+107                 name=self.meter_name,
+108                 unit="pktps",
+109                 rate=cfg.CONF.network_log.rate_limit,
+110                 fair=True,
+111                 burst_size=cfg.CONF.network_log.burst_limit,
+112                 may_exist=False,
+113                 external_ids={ovn_const.OVN_DEVICE_OWNER_EXT_ID_KEY:
+114                               "neutron:network_log"}))
+115 
+116     @staticmethod
+117     def _acl_actions_enabled(log_obj):
+118         if not log_obj.enabled:
+119             return {}
+120         if log_obj.event == log_const.ACCEPT_EVENT:
+121             return {ovn_const.ACL_ACTION_ALLOW_RELATED,
+122                     ovn_const.ACL_ACTION_ALLOW}
+123         if log_obj.event == log_const.DROP_EVENT:
+124             return {ovn_const.ACL_ACTION_DROP,
+125                     ovn_const.ACL_ACTION_REJECT}
+126         # Fall through case: log_const.ALL_EVENT
+127         return {ovn_const.ACL_ACTION_DROP,
+128                 ovn_const.ACL_ACTION_REJECT,
+129                 ovn_const.ACL_ACTION_ALLOW_RELATED,
+130                 ovn_const.ACL_ACTION_ALLOW}
+131 
+132     def _remove_acls_log(self, pgs, ovn_txn, log_name=None):
+133         acl_changes, acl_visits = 0, 0
+134         for pg in pgs:
+135             for acl_uuid in pg["acls"]:
+136                 acl_visits += 1
+137                 # skip acls used by a different network log
+138                 if log_name:
+139                     acl = self.ovn_nb.lookup("ACL", acl_uuid)
+140                     if acl.name and acl.name[0] != log_name:
+141                         continue
+142                 ovn_txn.add(self.ovn_nb.db_set(
+143                     "ACL", acl_uuid,
+144                     ("log", False),
+145                     ("meter", []),
+146                     ("name", []),
+147                     ("severity", [])
+148                 ))
+149                 acl_changes += 1
+150         msg = "Cleared %d (out of %d visited) ACLs"
+151         if log_name:
+152             msg += " for network log {}".format(log_name)
+153         LOG.info(msg, acl_changes, acl_visits)
+154 
+155     def _set_acls_log(self, pgs, ovn_txn, actions_enabled, log_name):
+156         acl_changes, acl_visits = 0, 0
+157         for pg in pgs:
+158             for acl_uuid in pg["acls"]:
+159                 acl_visits += 1
+160                 acl = self.ovn_nb.lookup("ACL", acl_uuid)
+161                 # skip acls used by a different network log
+162                 if acl.name and acl.name[0] != log_name:
+163                     continue
+164                 ovn_txn.add(self.ovn_nb.db_set(
+165                     "ACL", acl_uuid,
+166                     ("log", acl.action in actions_enabled),
+167                     ("meter", self.meter_name),
+168                     ("name", log_name),
+169                     ("severity", "info")
+170                 ))
+171                 acl_changes += 1
+172         LOG.info("Set %d (out of %d visited) ACLs for network log %s",
+173                  acl_changes, acl_visits, log_name)
+174 
+175     def _update_log_objs(self, context, log_objs):
+176         for log_obj in log_objs:
+177             pgs = self._pgs_from_log_obj(context, log_obj)
+178             actions_enabled = self._acl_actions_enabled(log_obj)
+179             with self.ovn_nb.transaction(check_error=True) as ovn_txn:
+180                 self._set_acls_log(pgs, ovn_txn, actions_enabled,
+181                                    utils.ovn_name(log_obj.id))
+182 
+183     def _pgs_all(self):
+184         return self.ovn_nb.db_list(
+185             "Port_Group", columns=["name", "acls"]).execute(check_error=True)
+186 
+187     def _pgs_from_log_obj(self, context, log_obj):
+188         if not log_obj.resource_id and not log_obj.target_id:
+189             # No sg, no port: return all pgs
+190             return self._pgs_all()
+191 
+192         pgs = []
+193         # include special pg_drop to log DROP and ALL actions
+194         if not log_obj.event or log_obj.event in (log_const.DROP_EVENT,
+195                                                   log_const.ALL_EVENT):
+196             try:
+197                 pg = self.ovn_nb.lookup("Port_Group",
+198                                         ovn_const.OVN_DROP_PORT_GROUP_NAME)
+199                 pgs.append({"name": pg.name,
+200                             "acls": [r.uuid for r in pg.acls]})
+201             except idlutils.RowNotFound:
+202                 pass
+203 
+204         if log_obj.resource_id:
+205             try:
+206                 pg = self.ovn_nb.lookup("Port_Group",
+207                                         utils.ovn_port_group_name(
+208                                             log_obj.resource_id))
+209                 pgs.append({"name": pg.name,
+210                             "acls": [r.uuid for r in pg.acls]})
+211             except idlutils.RowNotFound:
+212                 pass
+213             # Note: when sg is provided, it is redundant to get sgs from port,
+214             # because model will ensure that sg is associated with neutron port
+215         elif log_obj.target_id:
+216             sg_ids = db_api._get_sgs_attached_to_port(context,
+217                                                       log_obj.target_id)
+218             for sg_id in sg_ids:
+219                 try:
+220                     pg = self.ovn_nb.lookup("Port_Group",
+221                                             utils.ovn_port_group_name(sg_id))
+222                     pgs.append({"name": pg.name,
+223                                 "acls": [r.uuid for r in pg.acls]})
+224                 except idlutils.RowNotFound:
+225                     pass
+226         return pgs
+227 
+228     def create_log(self, context, log_obj):
+229         """Create a log_obj invocation.
+230 
+231         :param context: current running context information
+232         :param log_obj: a log objects being created
+233         """
+234         LOG.debug("Create_log %s", log_obj)
+235 
+236         pgs = self._pgs_from_log_obj(context, log_obj)
+237         actions_enabled = self._acl_actions_enabled(log_obj)
+238         with self.ovn_nb.transaction(check_error=True) as ovn_txn:
+239             self._set_acls_log(pgs, ovn_txn, actions_enabled,
+240                                utils.ovn_name(log_obj.id))
+241 
+242     def create_log_precommit(self, context, log_obj):
+243         """Create a log_obj precommit.
+244 
+245         :param context: current running context information
+246         :param log_obj: a log object being created
+247         """
+248         LOG.debug("Create_log_precommit %s", log_obj)
+249 
+250         if not network_logging_supported(self.ovn_nb):
+251             raise LoggingNotSupported()
+252         self._create_ovn_fair_meter()
+253 
+254     def update_log(self, context, log_obj):
+255         """Update a log_obj invocation.
+256 
+257         :param context: current running context information
+258         :param log_obj: a log object being updated
+259 
+260         """
+261         LOG.debug("Update_log %s", log_obj)
+262 
+263         pgs = self._pgs_from_log_obj(context, log_obj)
+264         actions_enabled = self._acl_actions_enabled(log_obj)
+265         with self.ovn_nb.transaction(check_error=True) as ovn_txn:
+266             self._set_acls_log(pgs, ovn_txn, actions_enabled,
+267                                utils.ovn_name(log_obj.id))
+268 
+269     def delete_log(self, context, log_obj):
+270         """Delete a log_obj invocation.
+271 
+272         :param context: current running context information
+273         :param log_obj: a log_object being deleted
+274 
+275         """
+276         LOG.debug("Delete_log %s", log_obj)
+277 
+278         # If we are removing the last log_obj, let's clear log from all acls.
+279         # This is a simple way of ensuring that no acl logs are left behind!
+280         log_objs = self._get_logs(context)
+281         if not log_objs or (
+282                 len(log_objs) == 1 and log_objs[0].id == log_obj.id):
+283             pgs = self._pgs_all()
+284             with self.ovn_nb.transaction(check_error=True) as ovn_txn:
+285                 self._remove_acls_log(pgs, ovn_txn)
+286                 ovn_txn.add(self.ovn_nb.meter_del(self.meter_name,
+287                                                   if_exists=True))
+288             LOG.info("All ACL logs cleared after deletion of log_obj %s",
+289                      log_obj.id)
+290             return
+291 
+292         # Remove log_obj and revisit all remaining ones, since the acls that
+293         # were serving the removed log_obj may be usable by the remaining
+294         # log_objs.
+295         pgs = self._pgs_from_log_obj(context, log_obj)
+296         with self.ovn_nb.transaction(check_error=True) as ovn_txn:
+297             self._remove_acls_log(pgs, ovn_txn, utils.ovn_name(log_obj.id))
+298 
+299         self._update_log_objs(context, [lo for lo in log_objs
+300                                         if lo.id != log_obj.id])
+301 
+302     def resource_update(self, context, log_objs):
+303         """Tell the agent when resources related to log_objects are
+304         being updated
+305 
+306         :param context: current running context information
+307         :param log_objs: a list of log_objects, whose related resources are
+308                          being updated.
+309         """
+310         LOG.debug("Resource_update %s", log_objs)
+311 
+312         self._update_log_objs(context, log_objs)
+313 
+314 
+315 def register(plugin_driver):
+316     """Register the driver."""
+317     global DRIVER
+318     if not DRIVER:
+319         DRIVER = OVNDriver.create(plugin_driver)
+320 
+321     # Trigger decorator
+322     importutils.import_module(
+323         "neutron.services.logapi.common.sg_validate"
+324     )
+325     # Register resource callback handler
+326     manager.register(
+327         resources.SECURITY_GROUP_RULE, sg_callback.SecurityGroupRuleCallBack)
+328 
+329     LOG.info("OVN logging driver registered")
+330 
+331 
+332 def network_logging_supported(ovn_nb):
+333     columns = list(ovn_nb._tables["Meter"].columns)
+334     return ("fair" in columns)

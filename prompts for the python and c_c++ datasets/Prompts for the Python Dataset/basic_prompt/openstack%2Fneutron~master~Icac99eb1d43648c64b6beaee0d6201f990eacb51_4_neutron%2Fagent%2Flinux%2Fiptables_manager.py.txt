@@ -1,0 +1,833 @@
+Please review the code below to detect security defects. If any are found, please describe the security defect in detail and indicate the corresponding line number of code and solution. If none are found, please state '''No security defects are detected in the code'''.
+
+1 # Copyright 2012 Locaweb.
+2 # All Rights Reserved.
+3 #
+4 #    Licensed under the Apache License, Version 2.0 (the "License");
+5 #    you may not use this file except in compliance with the License.
+6 #    You may obtain a copy of the License at
+7 #
+8 #        http://www.apache.org/licenses/LICENSE-2.0
+9 #
+10 #    Unless required by applicable law or agreed to in writing, software
+11 #    distributed under the License is distributed on an "AS IS" BASIS,
+12 #    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+13 #    See the License for the specific language governing permissions and
+14 #    limitations under the License.
+15 #
+16 # based on
+17 # https://github.com/openstack/nova/blob/master/nova/network/linux_net.py
+18 
+19 """Implements iptables rules using linux utilities."""
+20 
+21 import collections
+22 import contextlib
+23 import difflib
+24 import os
+25 import re
+26 import sys
+27 
+28 from neutron_lib.utils import runtime
+29 from oslo_concurrency import lockutils
+30 from oslo_config import cfg
+31 from oslo_log import log as logging
+32 from oslo_utils import excutils
+33 
+34 from neutron._i18n import _
+35 from neutron.agent.linux import ip_lib
+36 from neutron.agent.linux import iptables_comments as ic
+37 from neutron.agent.linux import utils as linux_utils
+38 from neutron.common import exceptions as n_exc
+39 from neutron.conf.agent import common as config
+40 
+41 LOG = logging.getLogger(__name__)
+42 
+43 config.register_iptables_opts(cfg.CONF)
+44 
+45 
+46 # NOTE(vish): Iptables supports chain names of up to 28 characters,  and we
+47 #             add up to 12 characters to binary_name which is used as a prefix,
+48 #             so we limit it to 16 characters.
+49 #             (max_chain_name_length - len('-POSTROUTING') == 16)
+50 def get_binary_name():
+51     """Grab the name of the binary we're running in."""
+52     return os.path.basename(sys.argv[0])[:16].replace(' ', '_')
+53 
+54 binary_name = get_binary_name()
+55 
+56 # A length of a chain name must be less than or equal to 11 characters.
+57 # <max length of iptables chain name> - (<binary_name> + '-') = 28-(16+1) = 11
+58 MAX_CHAIN_LEN_WRAP = 11
+59 MAX_CHAIN_LEN_NOWRAP = 28
+60 
+61 # Number of iptables rules to print before and after a rule that causes a
+62 # a failure during iptables-restore
+63 IPTABLES_ERROR_LINES_OF_CONTEXT = 5
+64 
+65 
+66 # RESOURCE_PROBLEM in include/xtables.h
+67 XTABLES_RESOURCE_PROBLEM_CODE = 4
+68 
+69 
+70 def comment_rule(rule, comment):
+71     if not cfg.CONF.AGENT.comment_iptables_rules or not comment:
+72         return rule
+73     # iptables-save outputs the comment before the jump so we need to match
+74     # that order so _find_last_entry works
+75     comment = '-m comment --comment "%s"' % comment
+76     if rule.startswith('-j'):
+77         # this is a jump only rule so we just put the comment first
+78         return '%s %s' % (comment, rule)
+79     try:
+80         jpos = rule.index(' -j ')
+81         return ' '.join((rule[:jpos], comment, rule[jpos + 1:]))
+82     except ValueError:
+83         return '%s %s' % (rule, comment)
+84 
+85 
+86 def get_chain_name(chain_name, wrap=True):
+87     if wrap:
+88         return chain_name[:MAX_CHAIN_LEN_WRAP]
+89     else:
+90         return chain_name[:MAX_CHAIN_LEN_NOWRAP]
+91 
+92 
+93 class IptablesRule(object):
+94     """An iptables rule.
+95 
+96     You shouldn't need to use this class directly, it's only used by
+97     IptablesManager.
+98 
+99     """
+100 
+101     def __init__(self, chain, rule, wrap=True, top=False,
+102                  binary_name=binary_name, tag=None, comment=None):
+103         self.chain = get_chain_name(chain, wrap)
+104         self.rule = rule
+105         self.wrap = wrap
+106         self.top = top
+107         self.wrap_name = binary_name[:16]
+108         self.tag = tag
+109         self.comment = comment
+110 
+111     def __eq__(self, other):
+112         return ((self.chain == other.chain) and
+113                 (self.rule == other.rule) and
+114                 (self.top == other.top) and
+115                 (self.wrap == other.wrap))
+116 
+117     def __ne__(self, other):
+118         return not self == other
+119 
+120     def __str__(self):
+121         if self.wrap:
+122             chain = '%s-%s' % (self.wrap_name, self.chain)
+123         else:
+124             chain = self.chain
+125         rule = '-A %s %s' % (chain, self.rule)
+126         # If self.rule is '' the above will cause a trailing space, which
+127         # could cause us to not match on save/restore, so strip it now.
+128         return comment_rule(rule.strip(), self.comment)
+129 
+130 
+131 class IptablesTable(object):
+132     """An iptables table."""
+133 
+134     def __init__(self, binary_name=binary_name):
+135         self.rules = []
+136         self.remove_rules = []
+137         self.chains = set()
+138         self.unwrapped_chains = set()
+139         self.remove_chains = set()
+140         self.wrap_name = binary_name[:16]
+141 
+142     def add_chain(self, name, wrap=True):
+143         """Adds a named chain to the table.
+144 
+145         The chain name is wrapped to be unique for the component creating
+146         it, so different components of Nova can safely create identically
+147         named chains without interfering with one another.
+148 
+149         At the moment, its wrapped name is <binary name>-<chain name>,
+150         so if neutron-openvswitch-agent creates a chain named 'OUTPUT',
+151         it'll actually end up being named 'neutron-openvswi-OUTPUT'.
+152 
+153         """
+154         name = get_chain_name(name, wrap)
+155         if wrap:
+156             self.chains.add(name)
+157         else:
+158             self.unwrapped_chains.add(name)
+159 
+160     def _select_chain_set(self, wrap):
+161         if wrap:
+162             return self.chains
+163         else:
+164             return self.unwrapped_chains
+165 
+166     def remove_chain(self, name, wrap=True):
+167         """Remove named chain.
+168 
+169         This removal "cascades". All rule in the chain are removed, as are
+170         all rules in other chains that jump to it.
+171 
+172         If the chain is not found, this is merely logged.
+173 
+174         """
+175         name = get_chain_name(name, wrap)
+176         chain_set = self._select_chain_set(wrap)
+177 
+178         if name not in chain_set:
+179             LOG.debug('Attempted to remove chain %s which does not exist',
+180                       name)
+181             return
+182 
+183         chain_set.remove(name)
+184 
+185         if not wrap:
+186             # non-wrapped chains and rules need to be dealt with specially,
+187             # so we keep a list of them to be iterated over in apply()
+188             self.remove_chains.add(name)
+189 
+190             # Add rules to remove that have a matching chain name or
+191             # a matching jump chain
+192             jump_snippet = '-j %s' % name
+193             self.remove_rules += [str(r) for r in self.rules
+194                                   if r.chain == name or jump_snippet in r.rule]
+195         else:
+196             jump_snippet = '-j %s-%s' % (self.wrap_name, name)
+197 
+198         # Remove rules from list that have a matching chain name or
+199         # a matching jump chain
+200         self.rules = [r for r in self.rules
+201                       if r.chain != name and jump_snippet not in r.rule]
+202 
+203     def add_rule(self, chain, rule, wrap=True, top=False, tag=None,
+204                  comment=None):
+205         """Add a rule to the table.
+206 
+207         This is just like what you'd feed to iptables, just without
+208         the '-A <chain name>' bit at the start.
+209 
+210         However, if you need to jump to one of your wrapped chains,
+211         prepend its name with a '$' which will ensure the wrapping
+212         is applied correctly.
+213 
+214         """
+215         chain = get_chain_name(chain, wrap)
+216         if wrap and chain not in self.chains:
+217             raise LookupError(_('Unknown chain: %r') % chain)
+218 
+219         if '$' in rule:
+220             rule = ' '.join(
+221                 self._wrap_target_chain(e, wrap) for e in rule.split(' '))
+222 
+223         self.rules.append(IptablesRule(chain, rule, wrap, top, self.wrap_name,
+224                                        tag, comment))
+225 
+226     def _wrap_target_chain(self, s, wrap):
+227         if s.startswith('$'):
+228             s = ('%s-%s' % (self.wrap_name, get_chain_name(s[1:], wrap)))
+229 
+230         return s
+231 
+232     def remove_rule(self, chain, rule, wrap=True, top=False, comment=None):
+233         """Remove a rule from a chain.
+234 
+235         Note: The rule must be exactly identical to the one that was added.
+236         You cannot switch arguments around like you can with the iptables
+237         CLI tool.
+238 
+239         """
+240         chain = get_chain_name(chain, wrap)
+241         try:
+242             if '$' in rule:
+243                 rule = ' '.join(
+244                     self._wrap_target_chain(e, wrap) for e in rule.split(' '))
+245 
+246             self.rules.remove(IptablesRule(chain, rule, wrap, top,
+247                                            self.wrap_name,
+248                                            comment=comment))
+249             if not wrap:
+250                 self.remove_rules.append(str(IptablesRule(chain, rule, wrap,
+251                                                           top, self.wrap_name,
+252                                                           comment=comment)))
+253         except ValueError:
+254             LOG.warning('Tried to remove rule that was not there:'
+255                         ' %(chain)r %(rule)r %(wrap)r %(top)r',
+256                         {'chain': chain, 'rule': rule,
+257                          'top': top, 'wrap': wrap})
+258 
+259     def _get_chain_rules(self, chain, wrap):
+260         chain = get_chain_name(chain, wrap)
+261         return [rule for rule in self.rules
+262                 if rule.chain == chain and rule.wrap == wrap]
+263 
+264     def empty_chain(self, chain, wrap=True):
+265         """Remove all rules from a chain."""
+266         chained_rules = self._get_chain_rules(chain, wrap)
+267         for rule in chained_rules:
+268             self.rules.remove(rule)
+269 
+270     def clear_rules_by_tag(self, tag):
+271         if not tag:
+272             return
+273         rules = [rule for rule in self.rules if rule.tag == tag]
+274         for rule in rules:
+275             self.rules.remove(rule)
+276 
+277 
+278 class IptablesManager(object):
+279     """Wrapper for iptables.
+280 
+281     See IptablesTable for some usage docs
+282 
+283     A number of chains are set up to begin with.
+284 
+285     First, neutron-filter-top. It's added at the top of FORWARD and OUTPUT.
+286     Its name is not wrapped, so it's shared between the various neutron
+287     workers. It's intended for rules that need to live at the top of the
+288     FORWARD and OUTPUT chains. It's in both the ipv4 and ipv6 set of tables.
+289 
+290     For ipv4 and ipv6, the built-in INPUT, OUTPUT, and FORWARD filter chains
+291     are wrapped, meaning that the "real" INPUT chain has a rule that jumps to
+292     the wrapped INPUT chain, etc. Additionally, there's a wrapped chain named
+293     "local" which is jumped to from neutron-filter-top.
+294 
+295     For ipv4, the built-in PREROUTING, OUTPUT, and POSTROUTING nat chains are
+296     wrapped in the same was as the built-in filter chains. Additionally,
+297     there's a snat chain that is applied after the POSTROUTING chain.
+298 
+299     """
+300 
+301     def __init__(self, _execute=None, state_less=False, use_ipv6=False,
+302                  namespace=None, binary_name=binary_name):
+303         if _execute:
+304             self.execute = _execute
+305         else:
+306             self.execute = linux_utils.execute
+307 
+308         self.use_ipv6 = use_ipv6
+309         self.namespace = namespace
+310         self.iptables_apply_deferred = False
+311         self.wrap_name = binary_name[:16]
+312         self.use_xtables_lock = False
+313 
+314         self.ipv4 = {'filter': IptablesTable(binary_name=self.wrap_name)}
+315         self.ipv6 = {'filter': IptablesTable(binary_name=self.wrap_name)}
+316 
+317         # Add a neutron-filter-top chain. It's intended to be shared
+318         # among the various neutron components. It sits at the very top
+319         # of FORWARD and OUTPUT.
+320         for tables in [self.ipv4, self.ipv6]:
+321             tables['filter'].add_chain('neutron-filter-top', wrap=False)
+322             tables['filter'].add_rule('FORWARD', '-j neutron-filter-top',
+323                                       wrap=False, top=True)
+324             tables['filter'].add_rule('OUTPUT', '-j neutron-filter-top',
+325                                       wrap=False, top=True)
+326 
+327             tables['filter'].add_chain('local')
+328             tables['filter'].add_rule('neutron-filter-top', '-j $local',
+329                                       wrap=False)
+330 
+331         # Wrap the built-in chains
+332         builtin_chains = {4: {'filter': ['INPUT', 'OUTPUT', 'FORWARD']},
+333                           6: {'filter': ['INPUT', 'OUTPUT', 'FORWARD']}}
+334 
+335         if not state_less:
+336             self.ipv4.update(
+337                 {'mangle': IptablesTable(binary_name=self.wrap_name)})
+338             builtin_chains[4].update(
+339                 {'mangle': ['PREROUTING', 'INPUT', 'FORWARD', 'OUTPUT',
+340                             'POSTROUTING']})
+341             self.ipv6.update(
+342                 {'mangle': IptablesTable(binary_name=self.wrap_name)})
+343             builtin_chains[6].update(
+344                 {'mangle': ['PREROUTING', 'INPUT', 'FORWARD', 'OUTPUT',
+345                             'POSTROUTING']})
+346             self.ipv4.update(
+347                 {'nat': IptablesTable(binary_name=self.wrap_name)})
+348             builtin_chains[4].update({'nat': ['PREROUTING',
+349                                       'OUTPUT', 'POSTROUTING']})
+350 
+351         self.ipv4.update({'raw': IptablesTable(binary_name=self.wrap_name)})
+352         builtin_chains[4].update({'raw': ['PREROUTING', 'OUTPUT']})
+353         self.ipv6.update({'raw': IptablesTable(binary_name=self.wrap_name)})
+354         builtin_chains[6].update({'raw': ['PREROUTING', 'OUTPUT']})
+355 
+356         for ip_version in builtin_chains:
+357             if ip_version == 4:
+358                 tables = self.ipv4
+359             elif ip_version == 6:
+360                 tables = self.ipv6
+361 
+362             for table, chains in builtin_chains[ip_version].items():
+363                 for chain in chains:
+364                     tables[table].add_chain(chain)
+365                     tables[table].add_rule(chain, '-j $%s' %
+366                                            (chain), wrap=False)
+367 
+368         if not state_less:
+369             # Add a neutron-postrouting-bottom chain. It's intended to be
+370             # shared among the various neutron components. We set it as the
+371             # last chain of POSTROUTING chain.
+372             self.ipv4['nat'].add_chain('neutron-postrouting-bottom',
+373                                        wrap=False)
+374             self.ipv4['nat'].add_rule('POSTROUTING',
+375                                       '-j neutron-postrouting-bottom',
+376                                       wrap=False)
+377 
+378             # We add a snat chain to the shared neutron-postrouting-bottom
+379             # chain so that it's applied last.
+380             self.ipv4['nat'].add_chain('snat')
+381             self.ipv4['nat'].add_rule('neutron-postrouting-bottom',
+382                                       '-j $snat', wrap=False,
+383                                       comment=ic.SNAT_OUT)
+384 
+385             # And then we add a float-snat chain and jump to first thing in
+386             # the snat chain.
+387             self.ipv4['nat'].add_chain('float-snat')
+388             self.ipv4['nat'].add_rule('snat', '-j $float-snat')
+389 
+390             # Add a mark chain to mangle PREROUTING chain. It is used to
+391             # identify ingress packets from a certain interface.
+392             self.ipv4['mangle'].add_chain('mark')
+393             self.ipv4['mangle'].add_rule('PREROUTING', '-j $mark')
+394 
+395     def get_tables(self, ip_version):
+396         return {4: self.ipv4, 6: self.ipv6}[ip_version]
+397 
+398     def get_chain(self, table, chain, ip_version=4, wrap=True):
+399         try:
+400             requested_table = self.get_tables(ip_version)[table]
+401         except KeyError:
+402             return []
+403         return requested_table._get_chain_rules(chain, wrap)
+404 
+405     def is_chain_empty(self, table, chain, ip_version=4, wrap=True):
+406         return not self.get_chain(table, chain, ip_version, wrap)
+407 
+408     @contextlib.contextmanager
+409     def defer_apply(self):
+410         """Defer apply context."""
+411         self.defer_apply_on()
+412         try:
+413             yield
+414         finally:
+415             try:
+416                 self.defer_apply_off()
+417             except n_exc.IpTablesApplyException:
+418                 # already in the format we want, just reraise
+419                 raise
+420             except Exception:
+421                 msg = _('Failure applying iptables rules')
+422                 LOG.exception(msg)
+423                 raise n_exc.IpTablesApplyException(msg)
+424 
+425     def defer_apply_on(self):
+426         self.iptables_apply_deferred = True
+427 
+428     def defer_apply_off(self):
+429         self.iptables_apply_deferred = False
+430         self._apply()
+431 
+432     def apply(self):
+433         if self.iptables_apply_deferred:
+434             return
+435 
+436         return self._apply()
+437 
+438     def _apply(self):
+439         lock_name = 'iptables'
+440         if self.namespace:
+441             lock_name += '-' + self.namespace
+442 
+443         # NOTE(ihrachys) we may get rid of the lock once all supported
+444         # platforms get iptables with 999eaa241212d3952ddff39a99d0d55a74e3639e
+445         # ("iptables-restore: support acquiring the lock.")
+446         with lockutils.lock(lock_name, runtime.SYNCHRONIZED_PREFIX, True):
+447             first = self._apply_synchronized()
+448             if not cfg.CONF.AGENT.debug_iptables_rules:
+449                 return first
+450             second = self._apply_synchronized()
+451             if second:
+452                 msg = (_("IPTables Rules did not converge. Diff: %s") %
+453                        '\n'.join(second))
+454                 LOG.error(msg)
+455                 raise n_exc.IpTablesApplyException(msg)
+456             return first
+457 
+458     def get_rules_for_table(self, table):
+459         """Runs iptables-save on a table and returns the results."""
+460         args = ['iptables-save', '-t', table]
+461         if self.namespace:
+462             args = ['ip', 'netns', 'exec', self.namespace] + args
+463         return self.execute(args, run_as_root=True).split('\n')
+464 
+465     @property
+466     def xlock_wait_time(self):
+467         # give agent some time to report back to server
+468         return str(int(cfg.CONF.AGENT.report_interval / 3.0))
+469 
+470     def _run_restore_lock(self, args, commands, lock=False):
+471         args = args[:]
+472         if lock:
+473             args += ['-w', self.xlock_wait_time]
+474         try:
+475             self.execute(args, process_input='\n'.join(commands),
+476                          run_as_root=True)
+477         except RuntimeError as error:
+478             return error
+479 
+480     def _run_restore(self, args, commands):
+481         # If we've already tried and used -w successfully, don't
+482         # run iptables-restore without it.
+483         if self.use_xtables_lock:
+484             return self._run_restore_lock(args, commands, lock=True)
+485 
+486         err = self._run_restore_lock(args, commands)
+487         if (isinstance(err, linux_utils.ProcessExecutionError) and
+488             err.returncode == XTABLES_RESOURCE_PROBLEM_CODE):
+489             # maybe we run on a platform that includes iptables commit
+490             # 999eaa241212d3952ddff39a99d0d55a74e3639e (for example, latest
+491             # RHEL) and failed because of xlock acquired by another
+492             # iptables process running in parallel. Try to use -w to
+493             # acquire xlock.
+494             err = self._run_restore_lock(args, commands, lock=True)
+495             if not err:
+496                 self.use_xtables_lock = True
+497         return err
+498 
+499     def _log_restore_err(self, err, commands):
+500         try:
+501             line_no = int(re.search(
+502                 'iptables-restore: line ([0-9]+?) failed',
+503                 str(err)).group(1))
+504             context = IPTABLES_ERROR_LINES_OF_CONTEXT
+505             log_start = max(0, line_no - context)
+506             log_end = line_no + context
+507         except AttributeError:
+508             # line error wasn't found, print all lines instead
+509             log_start = 0
+510             log_end = len(commands)
+511         log_lines = ('%7d. %s' % (idx, l)
+512                      for idx, l in enumerate(
+513                          commands[log_start:log_end],
+514                          log_start + 1)
+515                      )
+516         LOG.error("IPTablesManager.apply failed to apply the "
+517                   "following set of iptables rules:\n%s",
+518                   '\n'.join(log_lines))
+519 
+520     def _apply_synchronized(self):
+521         """Apply the current in-memory set of iptables rules.
+522 
+523         This will create a diff between the rules from the previous runs
+524         and replace them with the current set of rules.
+525         This happens atomically, thanks to iptables-restore.
+526 
+527         Returns a list of the changes that were sent to iptables-save.
+528         """
+529         s = [('iptables', self.ipv4)]
+530         if self.use_ipv6:
+531             s += [('ip6tables', self.ipv6)]
+532         all_commands = []  # variable to keep track all commands for return val
+533         for cmd, tables in s:
+534             args = ['%s-save' % (cmd,)]
+535             if self.namespace:
+536                 args = ['ip', 'netns', 'exec', self.namespace] + args
+537             try:
+538                 save_output = self.execute(args, run_as_root=True)
+539             except RuntimeError:
+540                 # We could be racing with a cron job deleting namespaces.
+541                 # It is useless to try to apply iptables rules over and
+542                 # over again in a endless loop if the namespace does not
+543                 # exist.
+544                 with excutils.save_and_reraise_exception() as ctx:
+545                     if (self.namespace and not
+546                             ip_lib.IPWrapper().netns.exists(self.namespace)):
+547                         ctx.reraise = False
+548                         LOG.error("Namespace %s was deleted during IPTables "
+549                                   "operations.", self.namespace)
+550                         return []
+551             all_lines = save_output.split('\n')
+552             commands = []
+553             # Traverse tables in sorted order for predictable dump output
+554             for table_name in sorted(tables):
+555                 table = tables[table_name]
+556                 # isolate the lines of the table we are modifying
+557                 start, end = self._find_table(all_lines, table_name)
+558                 old_rules = all_lines[start:end]
+559                 # generate the new table state we want
+560                 new_rules = self._modify_rules(old_rules, table, table_name)
+561                 # generate the iptables commands to get between the old state
+562                 # and the new state
+563                 changes = _generate_path_between_rules(old_rules, new_rules)
+564                 if changes:
+565                     # if there are changes to the table, we put on the header
+566                     # and footer that iptables-save needs
+567                     commands += (['# Generated by iptables_manager'] +
+568                                  ['*%s' % table_name] + changes +
+569                                  ['COMMIT', '# Completed by iptables_manager'])
+570             if not commands:
+571                 continue
+572             all_commands += commands
+573 
+574             # always end with a new line
+575             commands.append('')
+576 
+577             args = ['%s-restore' % (cmd,), '-n']
+578             if self.namespace:
+579                 args = ['ip', 'netns', 'exec', self.namespace] + args
+580 
+581             err = self._run_restore(args, commands)
+582             if err:
+583                 self._log_restore_err(err, commands)
+584                 raise err
+585 
+586         LOG.debug("IPTablesManager.apply completed with success. %d iptables "
+587                   "commands were issued", len(all_commands))
+588         return all_commands
+589 
+590     def _find_table(self, lines, table_name):
+591         if len(lines) < 3:
+592             # length only <2 when fake iptables
+593             return (0, 0)
+594         try:
+595             start = lines.index('*%s' % table_name)
+596         except ValueError:
+597             # Couldn't find table_name
+598             LOG.debug('Unable to find table %s', table_name)
+599             return (0, 0)
+600         end = lines[start:].index('COMMIT') + start + 1
+601         return (start, end)
+602 
+603     def _find_rules_index(self, lines):
+604         seen_chains = False
+605         rules_index = 0
+606         for rules_index, rule in enumerate(lines):
+607             if not seen_chains:
+608                 if rule.startswith(':'):
+609                     seen_chains = True
+610             else:
+611                 if not rule.startswith(':'):
+612                     break
+613 
+614         if not seen_chains:
+615             rules_index = 2
+616 
+617         return rules_index
+618 
+619     def _modify_rules(self, current_lines, table, table_name):
+620         # Chains are stored as sets to avoid duplicates.
+621         # Sort the output chains here to make their order predictable.
+622         unwrapped_chains = sorted(table.unwrapped_chains)
+623         chains = sorted(table.chains)
+624         rules = set(map(str, table.rules))
+625 
+626         # we don't want to change any rules that don't belong to us so we start
+627         # the new_filter with these rules
+628         # there are some rules that belong to us but they don't have the wrap
+629         # name. we want to add them in the right location in case our new rules
+630         # changed the order
+631         # (e.g. '-A FORWARD -j neutron-filter-top')
+632         new_filter = [line.strip() for line in current_lines
+633                       if self.wrap_name not in line and
+634                       line.strip() not in rules]
+635 
+636         # generate our list of chain names
+637         our_chains = [':%s-%s' % (self.wrap_name, name) for name in chains]
+638 
+639         # the unwrapped chains (e.g. neutron-filter-top) may already exist in
+640         # the new_filter since they aren't marked by the wrap_name so we only
+641         # want to add them if they arent' already there
+642         our_chains += [':%s' % name for name in unwrapped_chains
+643                        if not any(':%s' % name in s for s in new_filter)]
+644 
+645         our_top_rules = []
+646         our_bottom_rules = []
+647         for rule in table.rules:
+648             rule_str = str(rule)
+649 
+650             if rule.top:
+651                 # rule.top == True means we want this rule to be at the top.
+652                 our_top_rules += [rule_str]
+653             else:
+654                 our_bottom_rules += [rule_str]
+655 
+656         our_chains_and_rules = our_chains + our_top_rules + our_bottom_rules
+657 
+658         # locate the position immediately after the existing chains to insert
+659         # our chains and rules
+660         rules_index = self._find_rules_index(new_filter)
+661         new_filter[rules_index:rules_index] = our_chains_and_rules
+662 
+663         def _weed_out_removes(line):
+664             # remove any rules or chains from the filter that were slated
+665             # for removal
+666             if line.startswith(':'):
+667                 chain = line[1:]
+668                 if chain in table.remove_chains:
+669                     table.remove_chains.remove(chain)
+670                     return False
+671             else:
+672                 if line in table.remove_rules:
+673                     table.remove_rules.remove(line)
+674                     return False
+675             # Leave it alone
+676             return True
+677 
+678         seen_lines = set()
+679 
+680         # TODO(kevinbenton): remove this function and the next one. They are
+681         # just oversized brooms to sweep bugs under the rug!!! We generate the
+682         # rules and we shouldn't be generating duplicates.
+683         def _weed_out_duplicates(line):
+684             if line in seen_lines:
+685                 thing = 'chain' if line.startswith(':') else 'rule'
+686                 LOG.warning("Duplicate iptables %(thing)s detected. This "
+687                             "may indicate a bug in the iptables "
+688                             "%(thing)s generation code. Line: %(line)s",
+689                             {'thing': thing, 'line': line})
+690                 return False
+691             seen_lines.add(line)
+692             # Leave it alone
+693             return True
+694 
+695         new_filter.reverse()
+696         new_filter = [line for line in new_filter
+697                       if _weed_out_duplicates(line) and
+698                       _weed_out_removes(line)]
+699         new_filter.reverse()
+700 
+701         # flush lists, just in case a rule or chain marked for removal
+702         # was already gone. (chains is a set, rules is a list)
+703         table.remove_chains.clear()
+704         table.remove_rules = []
+705 
+706         return new_filter
+707 
+708     def _get_traffic_counters_cmd_tables(self, chain, wrap=True):
+709         name = get_chain_name(chain, wrap)
+710 
+711         cmd_tables = [('iptables', key) for key, table in self.ipv4.items()
+712                       if name in table._select_chain_set(wrap)]
+713 
+714         if self.use_ipv6:
+715             cmd_tables += [('ip6tables', key)
+716                            for key, table in self.ipv6.items()
+717                            if name in table._select_chain_set(wrap)]
+718 
+719         return cmd_tables
+720 
+721     def get_traffic_counters(self, chain, wrap=True, zero=False):
+722         """Return the sum of the traffic counters of all rules of a chain."""
+723         cmd_tables = self._get_traffic_counters_cmd_tables(chain, wrap)
+724         if not cmd_tables:
+725             LOG.warning('Attempted to get traffic counters of chain %s '
+726                         'which does not exist', chain)
+727             return
+728 
+729         name = get_chain_name(chain, wrap)
+730         acc = {'pkts': 0, 'bytes': 0}
+731 
+732         for cmd, table in cmd_tables:
+733             args = [cmd, '-t', table, '-L', name, '-n', '-v', '-x',
+734                     '-w', self.xlock_wait_time]
+735             if zero:
+736                 args.append('-Z')
+737             if self.namespace:
+738                 args = ['ip', 'netns', 'exec', self.namespace] + args
+739             current_table = self.execute(args, run_as_root=True)
+740             current_lines = current_table.split('\n')
+741 
+742             for line in current_lines[2:]:
+743                 if not line:
+744                     break
+745                 data = line.split()
+746                 if (len(data) < 2 or
+747                         not data[0].isdigit() or
+748                         not data[1].isdigit()):
+749                     break
+750 
+751                 acc['pkts'] += int(data[0])
+752                 acc['bytes'] += int(data[1])
+753 
+754         return acc
+755 
+756 
+757 def _generate_path_between_rules(old_rules, new_rules):
+758     """Generates iptables commands to get from old_rules to new_rules.
+759 
+760     This function diffs the two rule sets and then calculates the iptables
+761     commands necessary to get from the old rules to the new rules using
+762     insert and delete commands.
+763     """
+764     old_by_chain = _get_rules_by_chain(old_rules)
+765     new_by_chain = _get_rules_by_chain(new_rules)
+766     old_chains, new_chains = set(old_by_chain.keys()), set(new_by_chain.keys())
+767     # all referenced chains should be declared at the top before rules.
+768 
+769     # NOTE(kevinbenton): sorting and grouping chains is for determinism in
+770     # tests. iptables doesn't care about the order here
+771     statements = [':%s - [0:0]' % c for c in sorted(new_chains - old_chains)]
+772     sg_chains = []
+773     other_chains = []
+774     for chain in sorted(old_chains | new_chains):
+775         if '-sg-' in chain:
+776             sg_chains.append(chain)
+777         else:
+778             other_chains.append(chain)
+779 
+780     for chain in other_chains + sg_chains:
+781         statements += _generate_chain_diff_iptables_commands(
+782             chain, old_by_chain[chain], new_by_chain[chain])
+783     # unreferenced chains get the axe
+784     for chain in sorted(old_chains - new_chains):
+785         statements += ['-X %s' % chain]
+786     return statements
+787 
+788 
+789 def _get_rules_by_chain(rules):
+790     by_chain = collections.defaultdict(list)
+791     for line in rules:
+792         if line.startswith(':'):
+793             chain = line[1:].split(' ', 1)[0]
+794             # even though this is a default dict, we need to manually add
+795             # chains to ensure that ones without rules are included because
+796             # they might be a jump reference
+797             if chain not in by_chain:
+798                 by_chain[chain] = []
+799         elif line.startswith('-A'):
+800             chain = line[3:].split(' ', 1)[0]
+801             by_chain[chain].append(line)
+802     return by_chain
+803 
+804 
+805 def _generate_chain_diff_iptables_commands(chain, old_chain_rules,
+806                                           new_chain_rules):
+807     # keep track of the old index because we have to insert rules
+808     # in the right position
+809     old_index = 1
+810     statements = []
+811     for line in difflib.ndiff(old_chain_rules, new_chain_rules):
+812         if line.startswith('?'):
+813             # skip ? because that's a guide string for intraline differences
+814             continue
+815         elif line.startswith('-'):  # line deleted
+816             statements.append('-D %s %d' % (chain, old_index))
+817             # since we are removing a line from the old rules, we
+818             # backup the index by 1
+819             old_index -= 1
+820         elif line.startswith('+'):  # line added
+821             # strip the chain name since we have to add it before the index
+822             rule = line[5:].split(' ', 1)[-1]
+823             # IptablesRule does not add trailing spaces for rules, so we
+824             # have to detect that here by making sure this chain isn't
+825             # referencing itself
+826             if rule == chain:
+827                 rule = ''
+828             # rule inserted at this position
+829             statements.append('-I %s %d %s' % (chain, old_index, rule))
+830         old_index += 1
+831     return statements

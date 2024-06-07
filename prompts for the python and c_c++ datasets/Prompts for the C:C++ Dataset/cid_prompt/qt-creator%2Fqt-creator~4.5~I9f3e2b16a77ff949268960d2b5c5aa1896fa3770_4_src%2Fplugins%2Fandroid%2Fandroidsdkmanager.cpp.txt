@@ -1,0 +1,881 @@
+Please review the code below for security defects. You can consider defect types in terms of:
+1.CWE-284 (Improper Access Control)
+2.CWE-435 (Improper Interaction Between Multiple Entities)
+3.CWE-664 (Improper Control of a Resource Through its Lifetime)
+4.CWE-682 (Incorrect Calculation)
+5.CWE-691 (Insufficient Control Flow Management)
+6.CWE-693 (Protection Mechanism Failure)
+7.CWE-697 (Incorrect Comparison)
+8.CWE-703 (Improper Check or Handling of Exceptional Conditions)
+9.CWE-707 (Improper Neutralization)
+10.CWE-710 (Improper Adherence to Coding Standards)
+If any are found, please describe the security defect in detail and indicate the corresponding line number of code and solution. If none are detected, states: 'No security defects are detected in the code'.
+
+1 /****************************************************************************
+2 **
+3 ** Copyright (C) 2016 The Qt Company Ltd.
+4 ** Contact: https://www.qt.io/licensing/
+5 **
+6 ** This file is part of Qt Creator.
+7 **
+8 ** Commercial License Usage
+9 ** Licensees holding valid commercial Qt licenses may use this file in
+10 ** accordance with the commercial license agreement provided with the
+11 ** Software or, alternatively, in accordance with the terms contained in
+12 ** a written agreement between you and The Qt Company. For licensing terms
+13 ** and conditions see https://www.qt.io/terms-conditions. For further
+14 ** information use the contact form at https://www.qt.io/contact-us.
+15 **
+16 ** GNU General Public License Usage
+17 ** Alternatively, this file may be used under the terms of the GNU
+18 ** General Public License version 3 as published by the Free Software
+19 ** Foundation with exceptions as appearing in the file LICENSE.GPL3-EXCEPT
+20 ** included in the packaging of this file. Please review the following
+21 ** information to ensure the GNU General Public License requirements will
+22 ** be met: https://www.gnu.org/licenses/gpl-3.0.html.
+23 **
+24 ****************************************************************************/
+25 #include "androidsdkmanager.h"
+26 
+27 #include "androidconstants.h"
+28 #include "androidmanager.h"
+29 #include "androidtoolmanager.h"
+30 
+31 #include "coreplugin/icore.h"
+32 #include "utils/algorithm.h"
+33 #include "utils/qtcassert.h"
+34 #include "utils/runextensions.h"
+35 #include "utils/synchronousprocess.h"
+36 #include "utils/environment.h"
+37 
+38 #include <QEventLoop>
+39 #include <QFutureWatcher>
+40 #include <QLoggingCategory>
+41 #include <QRegularExpression>
+42 #include <QSettings>
+43 #include <QTimer>
+44 
+45 namespace {
+46 Q_LOGGING_CATEGORY(sdkManagerLog, "qtc.android.sdkManager")
+47 }
+48 
+49 namespace Android {
+50 namespace Internal {
+51 
+52 // Though sdk manager is introduced in 25.2.3 but the verbose mode is avaialble in 25.3.0
+53 // and android tool is supported in 25.2.3
+54 const QVersionNumber sdkManagerIntroVersion(25, 3 ,0);
+55 
+56 const char sdkManagerArgsKey[] = "SdkManagerArguments";
+57 
+58 const char installLocationKey[] = "Installed Location:";
+59 const char revisionKey[] = "Version:";
+60 const char descriptionKey[] = "Description:";
+61 const char commonArgsKey[] = "Common Arguments:";
+62 
+63 const int sdkManagerCmdTimeoutS = 60;
+64 const int sdkManagerOperationTimeoutS = 600;
+65 
+66 using namespace Utils;
+67 using SdkCmdFutureInterface = QFutureInterface<AndroidSdkManager::OperationOutput>;
+68 
+69 int platformNameToApiLevel(const QString &platformName)
+70 {
+71     int apiLevel = -1;
+72     QRegularExpression re("(android-)(?<apiLevel>[0-9]{1,})",
+73                           QRegularExpression::CaseInsensitiveOption);
+74     QRegularExpressionMatch match = re.match(platformName);
+75     if (match.hasMatch()) {
+76         QString apiLevelStr = match.captured("apiLevel");
+77         apiLevel = apiLevelStr.toInt();
+78     }
+79     return apiLevel;
+80 }
+81 
+82 /*!
+83     Parses the \a line for a [spaces]key[spaces]value[spaces] pattern and returns
+84     \c true if \a key is found, false otherwise. Result is copied into \a value.
+85  */
+86 static bool valueForKey(QString key, const QString &line, QString *value = nullptr)
+87 {
+88     auto trimmedInput = line.trimmed();
+89     if (trimmedInput.startsWith(key)) {
+90         if (value)
+91             *value = trimmedInput.section(key, 1, 1).trimmed();
+92         return true;
+93     }
+94     return false;
+95 }
+96 
+97 /*!
+98     Runs the \c sdkmanger tool with arguments \a args. Returns \c true if the command is
+99     successfully executed. Output is copied into \a output. The function blocks the calling thread.
+100  */
+101 static bool sdkManagerCommand(const Utils::FileName &toolPath, const QStringList &args,
+102                               QString *output, int timeout = sdkManagerCmdTimeoutS)
+103 {
+104     SynchronousProcess proc;
+105     proc.setTimeoutS(timeout);
+106     proc.setTimeOutMessageBoxEnabled(true);
+107     SynchronousProcessResponse response = proc.run(toolPath.toString(), args);
+108     if (output)
+109         *output = response.allOutput();
+110     return response.result == SynchronousProcessResponse::Finished;
+111 }
+112 
+113 /*!
+114     Runs the \c sdkmanger tool with arguments \a args. The operation command progress is updated in
+115     to the future interface \a fi and \a output is populated with command output. The command listens
+116     to cancel signal emmitted by \a sdkManager and kill the commands. The command is also killed
+117     after the lapse of \a timeout seconds. The function blocks the calling thread.
+118  */
+119 static void sdkManagerCommand(const Utils::FileName &toolPath, const QStringList &args,
+120                               AndroidSdkManager &sdkManager,
+121                               SdkCmdFutureInterface &fi,
+122                               AndroidSdkManager::OperationOutput &output,
+123                               int timeout = sdkManagerOperationTimeoutS)
+124 {
+125     std::unique_ptr<QProcess> proc(new QProcess());
+126 
+127     // Parse the %age text returned by the SdkManager command output.
+128     QRegularExpression reg("(?<progress>\\d*)%");
+129     auto parseProgress = [&proc, reg, &fi]() {
+130         auto stdOut = QString::fromLatin1(proc->readAllStandardOutput());
+131         QStringList lines = stdOut.split(QRegularExpression("[\\n\\r]"), QString::SkipEmptyParts);
+132         for (const QString &line : lines) {
+133             QRegularExpressionMatch match = reg.match(line);
+134             if (match.hasMatch()) {
+135                 int progress = match.captured("progress").toInt();
+136                 if (progress > 0 && progress <= 100)
+137                     fi.setProgressValue(progress);
+138             }
+139         }
+140     };
+141     QEventLoop eventLoop;
+142     QObject::connect(proc.get(), &QProcess::readyReadStandardOutput, parseProgress);
+143     QObject::connect(proc.get(), static_cast<void(QProcess::*)(int)>(&QProcess::finished),
+144                      [&eventLoop, &proc, &output](int exitCode) {
+145         output.commandOutput = QString::fromLatin1(proc->readAllStandardOutput());
+146         output.success = exitCode == QProcess::NormalExit;
+147         eventLoop.quit();
+148     });
+149 
+150     // Listen to explicit cancel request.
+151     QObject::connect(&sdkManager, &AndroidSdkManager::cancelActiveOperations,
+152                      proc.get(), &QProcess::kill);
+153 
+154     // execute the sdkmanager command.
+155     proc->start(toolPath.toString(), args);
+156 
+157     // setup a timeout kill timer.
+158     QTimer cmdKillTimer;
+159     cmdKillTimer.setInterval(timeout * 1000);
+160     cmdKillTimer.setSingleShot(true);
+161     QObject::connect(&cmdKillTimer, &QTimer::timeout,
+162                      proc.get(), &QProcess::kill);
+163 
+164     // Wait untill QProcess finishes.
+165     eventLoop.exec();
+166 }
+167 
+168 
+169 class AndroidSdkManagerPrivate
+170 {
+171 public:
+172     AndroidSdkManagerPrivate(AndroidSdkManager &sdkManager, const AndroidConfig &config);
+173     ~AndroidSdkManagerPrivate();
+174 
+175     AndroidSdkPackageList filteredPackages(AndroidSdkPackage::PackageState state,
+176                                            AndroidSdkPackage::PackageType type,
+177                                            bool forceUpdate = false);
+178     const AndroidSdkPackageList &allPackages(bool forceUpdate = false);
+179     void refreshSdkPackages(bool forceReload = false);
+180 
+181     void parseCommonArguments(QFutureInterface<QString> &fi);
+182 
+183     void installPackage(SdkCmdFutureInterface &fi, const QString &sdkStylePath);
+184     void uninstallPackage(SdkCmdFutureInterface &fi, const QString &sdkStylePath);
+185     void updateInstalled(SdkCmdFutureInterface &fi);
+186 
+187     void addWatcher(const QFuture<AndroidSdkManager::OperationOutput> &future);
+188 
+189     QList<QFutureWatcher<void> *> m_activeOperations;
+190     QStringList m_sdkManagerArgs;
+191 
+192 private:
+193     void reloadSdkPackages();
+194     void clearPackages();
+195     void load();
+196     void save() const;
+197 
+198 private:
+199     AndroidSdkManager &m_sdkManager;
+200     const AndroidConfig &m_config;
+201     AndroidSdkPackageList m_allPackages;
+202     FileName lastSdkManagerPath;
+203 };
+204 
+205 /*!
+206     \class SdkManagerOutputParser
+207     \brief The SdkManagerOutputParser class is a helper class to parse the output of the \c sdkmanager
+208     commands.
+209  */
+210 class SdkManagerOutputParser
+211 {
+212     struct GenericPackageData
+213     {
+214         bool isValid() const { return !revision.isNull() && !description.isNull(); }
+215         QStringList headerParts;
+216         QVersionNumber revision;
+217         QString description;
+218         Utils::FileName installedLocation;
+219         QMap<QString, QString> extraData;
+220     };
+221 
+222 public:
+223     enum MarkerTag
+224     {
+225         None                        = 0x001,
+226         InstalledPackagesMarker     = 0x002,
+227         AvailablePackagesMarkers    = 0x004,
+228         AvailableUpdatesMarker      = 0x008,
+229         EmptyMarker                 = 0x010,
+230         PlatformMarker              = 0x020,
+231         SystemImageMarker           = 0x040,
+232         BuildToolsMarker            = 0x080,
+233         SdkToolsMarker              = 0x100,
+234         PlatformToolsMarker         = 0x200,
+235         SectionMarkers = InstalledPackagesMarker | AvailablePackagesMarkers | AvailableUpdatesMarker
+236     };
+237 
+238     SdkManagerOutputParser(AndroidSdkPackageList &container) : m_packages(container) {}
+239     void parsePackageListing(const QString &output);
+240 
+241     AndroidSdkPackageList &m_packages;
+242 
+243 private:
+244     void compilePackageAssociations();
+245     void parsePackageData(MarkerTag packageMarker, const QStringList &data);
+246     bool parseAbstractData(GenericPackageData &output, const QStringList &input, int minParts,
+247                            const QString &logStrTag, QStringList extraKeys = QStringList()) const;
+248     AndroidSdkPackage *parsePlatform(const QStringList &data) const;
+249     QPair<SystemImage *, int> parseSystemImage(const QStringList &data) const;
+250     BuildTools *parseBuildToolsPackage(const QStringList &data) const;
+251     SdkTools *parseSdkToolsPackage(const QStringList &data) const;
+252     PlatformTools *parsePlatformToolsPackage(const QStringList &data) const;
+253     MarkerTag parseMarkers(const QString &line);
+254 
+255     MarkerTag m_currentSection = MarkerTag::None;
+256     QHash<AndroidSdkPackage *, int> m_systemImages;
+257 };
+258 
+259 const std::map<SdkManagerOutputParser::MarkerTag, const char *> markerTags {
+260     {SdkManagerOutputParser::MarkerTag::InstalledPackagesMarker,    "Installed packages:"},
+261     {SdkManagerOutputParser::MarkerTag::AvailablePackagesMarkers,   "Available Packages:"},
+262     {SdkManagerOutputParser::MarkerTag::AvailablePackagesMarkers,   "Available Updates:"},
+263     {SdkManagerOutputParser::MarkerTag::PlatformMarker,             "platforms"},
+264     {SdkManagerOutputParser::MarkerTag::SystemImageMarker,          "system-images"},
+265     {SdkManagerOutputParser::MarkerTag::BuildToolsMarker,           "build-tools"},
+266     {SdkManagerOutputParser::MarkerTag::SdkToolsMarker,             "tools"},
+267     {SdkManagerOutputParser::MarkerTag::PlatformToolsMarker,        "platform-tools"}
+268 };
+269 
+270 AndroidSdkManager::AndroidSdkManager(const AndroidConfig &config, QObject *parent):
+271     QObject(parent),
+272     m_d(new AndroidSdkManagerPrivate(*this, config))
+273 {
+274 }
+275 
+276 AndroidSdkManager::~AndroidSdkManager()
+277 {
+278     cancelOperatons();
+279 }
+280 
+281 AndroidSdkManager::AndroidSdkManager(const AndroidSdkManager &other)
+282 {
+283     *this = other;
+284 }
+285 
+286 const AndroidSdkManager &AndroidSdkManager::operator=(const AndroidSdkManager &other)
+287 {
+288     m_d->m_sdkManagerArgs = other.m_d->m_sdkManagerArgs;
+289     return *this;
+290 }
+291 
+292 SdkPlatformList AndroidSdkManager::installedSdkPlatforms()
+293 {
+294     AndroidSdkPackageList list = m_d->filteredPackages(AndroidSdkPackage::Installed,
+295                                                        AndroidSdkPackage::SdkPlatformPackage);
+296     return Utils::transform(list, [](AndroidSdkPackage *p) {
+297        return static_cast<SdkPlatform *>(p);
+298     });
+299 }
+300 
+301 const AndroidSdkPackageList &AndroidSdkManager::allSdkPackages()
+302 {
+303     return m_d->allPackages();
+304 }
+305 
+306 AndroidSdkPackageList AndroidSdkManager::availableSdkPackages()
+307 {
+308     return m_d->filteredPackages(AndroidSdkPackage::Available, AndroidSdkPackage::AnyValidType);
+309 }
+310 
+311 AndroidSdkPackageList AndroidSdkManager::installedSdkPackages()
+312 {
+313     return m_d->filteredPackages(AndroidSdkPackage::Installed, AndroidSdkPackage::AnyValidType);
+314 }
+315 
+316 SdkPlatform *AndroidSdkManager::latestAndroidSdkPlatform(AndroidSdkPackage::PackageState state)
+317 {
+318     SdkPlatform *result = nullptr;
+319     AndroidSdkPackageList list = m_d->filteredPackages(state,
+320                                                        AndroidSdkPackage::SdkPlatformPackage);
+321     for (AndroidSdkPackage *p : list) {
+322         auto platform = static_cast<SdkPlatform *>(p);
+323         if (!result || result->apiLevel() < platform->apiLevel())
+324             result = platform;
+325     }
+326     return result;
+327 }
+328 
+329 SdkPlatformList AndroidSdkManager::filteredSdkPlatforms(int minApiLevel,
+330                                                         AndroidSdkPackage::PackageState state)
+331 {
+332     AndroidSdkPackageList list = m_d->filteredPackages(state,
+333                                                        AndroidSdkPackage::SdkPlatformPackage);
+334 
+335     SdkPlatformList result;
+336     for (AndroidSdkPackage *p : list) {
+337         auto platform = static_cast<SdkPlatform *>(p);
+338         if (platform && platform->apiLevel() >= minApiLevel)
+339             result << platform;
+340     }
+341     return result;
+342 }
+343 
+344 void AndroidSdkManager::forceReloadPackages()
+345 {
+346     m_d->refreshSdkPackages(true);
+347 }
+348 
+349 const QStringList &AndroidSdkManager::sdkManagerArguments() const
+350 {
+351     return m_d->m_sdkManagerArgs;
+352 }
+353 
+354 void AndroidSdkManager::setSdkManagerArguments(const QStringList &arguments)
+355 {
+356     m_d->m_sdkManagerArgs = arguments;
+357 }
+358 
+359 QFuture<QString> AndroidSdkManager::availableArguments() const
+360 {
+361     return Utils::runAsync(&AndroidSdkManagerPrivate::parseCommonArguments, m_d.get());
+362 }
+363 
+364 QFuture<AndroidSdkManager::OperationOutput>
+365 AndroidSdkManager::installPackage(const QString &sdkStylePath)
+366 {
+367     auto future = Utils::runAsync(&AndroidSdkManagerPrivate::installPackage, m_d.get(),
+368                                   sdkStylePath);
+369     m_d->addWatcher(future);
+370     return future;
+371 }
+372 
+373 QFuture<AndroidSdkManager::OperationOutput>
+374 AndroidSdkManager::uninstallPackage(const QString &sdkStylePath)
+375 {
+376     auto future = Utils::runAsync(&AndroidSdkManagerPrivate::uninstallPackage, m_d.get(),
+377                                   sdkStylePath);
+378     m_d->addWatcher(future);
+379     return future;
+380 }
+381 
+382 QFuture<AndroidSdkManager::OperationOutput> AndroidSdkManager::updateAll()
+383 {
+384     auto future = Utils::runAsync(&AndroidSdkManagerPrivate::updateInstalled, m_d.get());
+385     m_d->addWatcher(future);
+386     return future;
+387 }
+388 
+389 void AndroidSdkManager::cancelOperatons()
+390 {
+391     emit cancelActiveOperations();
+392     foreach (auto f, m_d->m_activeOperations) {
+393         if (!f->isFinished())
+394             f->waitForFinished();
+395         delete f;
+396     }
+397     m_d->m_activeOperations.clear();
+398 }
+399 
+400 void SdkManagerOutputParser::parsePackageListing(const QString &output)
+401 {
+402     QStringList packageData;
+403     bool collectingPackageData = false;
+404     MarkerTag currentPackageMarker = MarkerTag::None;
+405 
+406     auto processCurrentPackage = [&]() {
+407         if (collectingPackageData) {
+408             collectingPackageData = false;
+409             parsePackageData(currentPackageMarker, packageData);
+410             packageData.clear();
+411         }
+412     };
+413 
+414     QRegularExpression delimiters("[\n\r]");
+415     foreach (QString outputLine, output.split(delimiters)) {
+416         MarkerTag marker = parseMarkers(outputLine);
+417 
+418         if (marker & SectionMarkers) {
+419             // Section marker found. Update the current section being parsed.
+420             m_currentSection = marker;
+421             processCurrentPackage();
+422             continue;
+423         }
+424 
+425         if (m_currentSection == None)
+426             continue; // Continue with the verbose output utill a valid section starts.
+427 
+428         if (marker == EmptyMarker) {
+429             // Empty marker. Occurs at the end of a package details.
+430             // Process the collected package data, if any.
+431             processCurrentPackage();
+432             continue;
+433         }
+434 
+435         if (marker == None) {
+436             if (collectingPackageData)
+437                 packageData << outputLine; // Collect data until next marker.
+438             else
+439                 continue;
+440         } else {
+441             // Package marker found.
+442             processCurrentPackage(); // New package starts. Process the collected package data, if any.
+443             currentPackageMarker = marker;
+444             collectingPackageData = true;
+445             packageData << outputLine;
+446         }
+447     }
+448     compilePackageAssociations();
+449 }
+450 
+451 void SdkManagerOutputParser::compilePackageAssociations()
+452 {
+453     // Index of the installed package having same sdk style path and same revision as of p.
+454     auto isInstalled = [](const AndroidSdkPackageList &container, AndroidSdkPackage *p) {
+455         return Utils::anyOf(container, [p](AndroidSdkPackage *other) {
+456             return other->state() == AndroidSdkPackage::Installed &&
+457                     other->sdkStylePath() == p->sdkStylePath() &&
+458                     other->revision() == p->revision();
+459         });
+460     };
+461 
+462     auto deleteAlreeadyInstalled = [isInstalled](AndroidSdkPackageList &packages) {
+463         for (auto p = packages.begin(); p != packages.end();) {
+464             if ((*p)->state() == AndroidSdkPackage::Available && isInstalled(packages, *p)) {
+465                 delete *p;
+466                 p = packages.erase(p);
+467             } else {
+468                 ++p;
+469             }
+470         }
+471     };
+472 
+473     // Remove already installed packages.
+474     deleteAlreeadyInstalled(m_packages);
+475 
+476     // Filter out available images that are already installed.
+477     AndroidSdkPackageList images = m_systemImages.keys();
+478     deleteAlreeadyInstalled(images);
+479 
+480     // Associate the system images with sdk platforms.
+481     for (AndroidSdkPackage *image : images) {
+482         int imageApi = m_systemImages[image];
+483         auto findPlatform = [imageApi](const AndroidSdkPackage *p) {
+484             const SdkPlatform *platform = nullptr;
+485             if (p->type() == AndroidSdkPackage::SdkPlatformPackage)
+486                 platform = static_cast<const SdkPlatform*>(p);
+487             return platform && platform->apiLevel() == imageApi;
+488         };
+489         auto itr = std::find_if(m_packages.begin(), m_packages.end(),
+490                                 findPlatform);
+491         if (itr != m_packages.end()) {
+492             SdkPlatform *platform = static_cast<SdkPlatform*>(*itr);
+493             platform->addSystemImage(static_cast<SystemImage *>(image));
+494         }
+495     }
+496 }
+497 
+498 void SdkManagerOutputParser::parsePackageData(MarkerTag packageMarker, const QStringList &data)
+499 {
+500     QTC_ASSERT(!data.isEmpty() && packageMarker != None, return);
+501 
+502     AndroidSdkPackage *package = nullptr;
+503     auto createPackage = [&](std::function<AndroidSdkPackage *(SdkManagerOutputParser *,
+504                                                                const QStringList &)> creator) {
+505         if ((package = creator(this, data)))
+506             m_packages.append(package);
+507     };
+508 
+509     switch (packageMarker) {
+510     case MarkerTag::BuildToolsMarker:
+511         createPackage(&SdkManagerOutputParser::parseBuildToolsPackage);
+512         break;
+513 
+514     case MarkerTag::SdkToolsMarker:
+515         createPackage(&SdkManagerOutputParser::parseSdkToolsPackage);
+516         break;
+517 
+518     case MarkerTag::PlatformToolsMarker:
+519         createPackage(&SdkManagerOutputParser::parsePlatformToolsPackage);
+520         break;
+521 
+522     case MarkerTag::PlatformMarker:
+523         createPackage(&SdkManagerOutputParser::parsePlatform);
+524         break;
+525 
+526     case MarkerTag::SystemImageMarker:
+527     {
+528         QPair<SystemImage *, int> result = parseSystemImage(data);
+529         if (result.first) {
+530             m_systemImages[result.first] = result.second;
+531             package = result.first;
+532         }
+533     }
+534         break;
+535 
+536     default:
+537         qCDebug(sdkManagerLog) << "Unhandled package: " << markerTags.at(packageMarker);
+538         break;
+539     }
+540 
+541     if (package) {
+542         switch (m_currentSection) {
+543         case MarkerTag::InstalledPackagesMarker:
+544             package->setState(AndroidSdkPackage::Installed);
+545             break;
+546         case MarkerTag::AvailablePackagesMarkers:
+547         case MarkerTag::AvailableUpdatesMarker:
+548             package->setState(AndroidSdkPackage::Available);
+549             break;
+550         default:
+551             qCDebug(sdkManagerLog) << "Invalid section marker: " << markerTags.at(m_currentSection);
+552             break;
+553         }
+554     }
+555 }
+556 
+557 bool SdkManagerOutputParser::parseAbstractData(SdkManagerOutputParser::GenericPackageData &output,
+558                                                const QStringList &input, int minParts,
+559                                                const QString &logStrTag,
+560                                                QStringList extraKeys) const
+561 {
+562     if (input.isEmpty()) {
+563         qCDebug(sdkManagerLog) << logStrTag + ": Empty input";
+564         return false;
+565     }
+566 
+567     output.headerParts = input.at(0).split(';');
+568     if (output.headerParts.count() < minParts) {
+569         qCDebug(sdkManagerLog) << logStrTag + "%1: Unexpected header:" << input;
+570         return false;
+571     }
+572 
+573     extraKeys << installLocationKey << revisionKey << descriptionKey;
+574     foreach (QString line, input) {
+575         QString value;
+576         for (auto key: extraKeys) {
+577             if (valueForKey(key, line, &value)) {
+578                 if (key == installLocationKey)
+579                     output.installedLocation = Utils::FileName::fromString(value);
+580                 else if (key == revisionKey)
+581                     output.revision = QVersionNumber::fromString(value);
+582                 else if (key == descriptionKey)
+583                     output.description = value;
+584                 else
+585                     output.extraData[key] = value;
+586                 break;
+587             }
+588         }
+589     }
+590 
+591     return output.isValid();
+592 }
+593 
+594 AndroidSdkPackage *SdkManagerOutputParser::parsePlatform(const QStringList &data) const
+595 {
+596     SdkPlatform *platform = nullptr;
+597     GenericPackageData packageData;
+598     if (parseAbstractData(packageData, data, 2, "Platform")) {
+599         int apiLevel = platformNameToApiLevel(packageData.headerParts.at(1));
+600         if (apiLevel == -1) {
+601             qCDebug(sdkManagerLog) << "Platform: Can not parse api level:"<< data;
+602             return nullptr;
+603         }
+604         platform = new SdkPlatform(packageData.revision, data.at(0), apiLevel);
+605         platform->setDescriptionText(packageData.description);
+606         platform->setInstalledLocation(packageData.installedLocation);
+607     } else {
+608         qCDebug(sdkManagerLog) << "Platform: Parsing failed. Minimum required data unavailable:"
+609                                << data;
+610     }
+611     return platform;
+612 }
+613 
+614 QPair<SystemImage *, int> SdkManagerOutputParser::parseSystemImage(const QStringList &data) const
+615 {
+616     QPair <SystemImage *, int> result(nullptr, -1);
+617     GenericPackageData packageData;
+618     if (parseAbstractData(packageData, data, 4, "System-image")) {
+619         int apiLevel = platformNameToApiLevel(packageData.headerParts.at(1));
+620         if (apiLevel == -1) {
+621             qCDebug(sdkManagerLog) << "System-image: Can not parse api level:"<< data;
+622             return result;
+623         }
+624         auto image = new SystemImage(packageData.revision, data.at(0),
+625                                      packageData.headerParts.at(3));
+626         image->setInstalledLocation(packageData.installedLocation);
+627         image->setDisplayText(packageData.description);
+628         image->setDescriptionText(packageData.description);
+629         result = qMakePair(image, apiLevel);
+630     } else {
+631         qCDebug(sdkManagerLog) << "System-image: Minimum required data unavailable: "<< data;
+632     }
+633     return result;
+634 }
+635 
+636 BuildTools *SdkManagerOutputParser::parseBuildToolsPackage(const QStringList &data) const
+637 {
+638     BuildTools *buildTools = nullptr;
+639     GenericPackageData packageData;
+640     if (parseAbstractData(packageData, data, 2, "Build-tools")) {
+641         buildTools = new BuildTools(packageData.revision, data.at(0));
+642         buildTools->setDescriptionText(packageData.description);
+643         buildTools->setDisplayText(packageData.description);
+644         buildTools->setInstalledLocation(packageData.installedLocation);
+645     } else {
+646         qCDebug(sdkManagerLog) << "Build-tools: Parsing failed. Minimum required data unavailable:"
+647                                << data;
+648     }
+649     return buildTools;
+650 }
+651 
+652 SdkTools *SdkManagerOutputParser::parseSdkToolsPackage(const QStringList &data) const
+653 {
+654     SdkTools *sdkTools = nullptr;
+655     GenericPackageData packageData;
+656     if (parseAbstractData(packageData, data, 1, "SDK-tools")) {
+657         sdkTools = new SdkTools(packageData.revision, data.at(0));
+658         sdkTools->setDescriptionText(packageData.description);
+659         sdkTools->setDisplayText(packageData.description);
+660         sdkTools->setInstalledLocation(packageData.installedLocation);
+661     } else {
+662         qCDebug(sdkManagerLog) << "SDK-tools: Parsing failed. Minimum required data unavailable:"
+663                                << data;
+664     }
+665     return sdkTools;
+666 }
+667 
+668 PlatformTools *SdkManagerOutputParser::parsePlatformToolsPackage(const QStringList &data) const
+669 {
+670     PlatformTools *platformTools = nullptr;
+671     GenericPackageData packageData;
+672     if (parseAbstractData(packageData, data, 1, "Platform-tools")) {
+673         platformTools = new PlatformTools(packageData.revision, data.at(0));
+674         platformTools->setDescriptionText(packageData.description);
+675         platformTools->setDisplayText(packageData.description);
+676         platformTools->setInstalledLocation(packageData.installedLocation);
+677     } else {
+678         qCDebug(sdkManagerLog) << "Platform-tools: Parsing failed. Minimum required data "
+679                                   "unavailable:" << data;
+680     }
+681     return platformTools;
+682 }
+683 
+684 SdkManagerOutputParser::MarkerTag SdkManagerOutputParser::parseMarkers(const QString &line)
+685 {
+686     if (line.isEmpty())
+687         return EmptyMarker;
+688 
+689     for (auto pair: markerTags) {
+690         if (line.startsWith(QLatin1String(pair.second)))
+691             return pair.first;
+692     }
+693 
+694     return None;
+695 }
+696 
+697 AndroidSdkManagerPrivate::AndroidSdkManagerPrivate(AndroidSdkManager &sdkManager,
+698                                                    const AndroidConfig &config):
+699     m_sdkManager(sdkManager),
+700     m_config(config)
+701 {
+702     load();
+703 }
+704 
+705 AndroidSdkManagerPrivate::~AndroidSdkManagerPrivate()
+706 {
+707     save();
+708     clearPackages();
+709 }
+710 
+711 AndroidSdkPackageList
+712 AndroidSdkManagerPrivate::filteredPackages(AndroidSdkPackage::PackageState state,
+713                                            AndroidSdkPackage::PackageType type, bool forceUpdate)
+714 {
+715     refreshSdkPackages(forceUpdate);
+716     return Utils::filtered(m_allPackages, [state, type](const AndroidSdkPackage *p) {
+717        return p->state() & state && p->type() & type;
+718     });
+719 }
+720 
+721 const AndroidSdkPackageList &AndroidSdkManagerPrivate::allPackages(bool forceUpdate)
+722 {
+723     refreshSdkPackages(forceUpdate);
+724     return m_allPackages;
+725 }
+726 
+727 void AndroidSdkManagerPrivate::reloadSdkPackages()
+728 {
+729     m_sdkManager.packageReloadBegin();
+730     clearPackages();
+731 
+732     lastSdkManagerPath = m_config.sdkManagerToolPath();
+733 
+734     if (m_config.sdkToolsVersion().isNull()) {
+735         // Configuration has invalid sdk path or corrupt installation.
+736         m_sdkManager.packageReloadFinished();
+737         return;
+738     }
+739 
+740     if (m_config.sdkToolsVersion() < sdkManagerIntroVersion) {
+741         // Old Sdk tools.
+742         AndroidToolManager toolManager(m_config);
+743         auto toAndroidSdkPackages = [](SdkPlatform *p) -> AndroidSdkPackage *{
+744             return p;
+745         };
+746         m_allPackages = Utils::transform(toolManager.availableSdkPlatforms(), toAndroidSdkPackages);
+747     } else {
+748         QString packageListing;
+749         QStringList args({"--list", "--verbose"});
+750         args << m_sdkManagerArgs;
+751         if (sdkManagerCommand(m_config.sdkManagerToolPath(), args, &packageListing)) {
+752             SdkManagerOutputParser parser(m_allPackages);
+753             parser.parsePackageListing(packageListing);
+754         }
+755     }
+756     m_sdkManager.packageReloadFinished();
+757 }
+758 
+759 void AndroidSdkManagerPrivate::refreshSdkPackages(bool forceReload)
+760 {
+761     // Sdk path changed. Updated packages.
+762     // QTC updates the package listing only
+763     if (m_config.sdkManagerToolPath() != lastSdkManagerPath || forceReload)
+764         reloadSdkPackages();
+765 }
+766 
+767 void AndroidSdkManagerPrivate::installPackage(SdkCmdFutureInterface &fi,
+768                                               const QString &sdkStylePath)
+769 {
+770     AndroidSdkManager::OperationOutput result;
+771     result.sdkStylePath = sdkStylePath;
+772     QStringList args(sdkStylePath);
+773     args << m_sdkManagerArgs;
+774     if (!fi.isCanceled())
+775         sdkManagerCommand(m_config.sdkManagerToolPath(), args, m_sdkManager, fi, result);
+776     else
+777         qCDebug(sdkManagerLog) << sdkStylePath << "Install: Operation cancelled before start";
+778     fi.reportResult(result);
+779 }
+780 
+781 void AndroidSdkManagerPrivate::uninstallPackage(SdkCmdFutureInterface &fi,
+782                                                 const QString &sdkStylePath)
+783 {
+784     AndroidSdkManager::OperationOutput result;
+785     result.sdkStylePath = sdkStylePath;
+786     QStringList args({"--uninstall", sdkStylePath});
+787     args << m_sdkManagerArgs;
+788     if (!fi.isCanceled())
+789         sdkManagerCommand(m_config.sdkManagerToolPath(), args, m_sdkManager, fi, result);
+790     else
+791         qCDebug(sdkManagerLog) << sdkStylePath << "Uninstall: Operation cancelled before start";
+792     fi.reportResult(result);
+793 }
+794 
+795 void AndroidSdkManagerPrivate::updateInstalled(SdkCmdFutureInterface &fi)
+796 {
+797     AndroidSdkManager::OperationOutput result;
+798     QStringList args("--update");
+799     args << m_sdkManagerArgs;
+800     if (!fi.isCanceled())
+801         sdkManagerCommand(m_config.sdkManagerToolPath(), args, m_sdkManager, fi, result);
+802     else
+803         qCDebug(sdkManagerLog) << "Update: Operation cancelled before start";
+804     fi.reportResult(result);
+805 }
+806 
+807 void AndroidSdkManagerPrivate::addWatcher(const QFuture<AndroidSdkManager::OperationOutput> &future)
+808 {
+809     if (future.isFinished())
+810         return;
+811     auto watcher = new QFutureWatcher<void>();
+812     watcher->setFuture(future);
+813     m_activeOperations << watcher;
+814     auto onFutureFinished = [watcher, this]() {
+815         m_activeOperations.removeAll(watcher);
+816         watcher->deleteLater();
+817     };
+818     QObject::connect(watcher, &QFutureWatcher<void>::finished, onFutureFinished);
+819 }
+820 
+821 void AndroidSdkManagerPrivate::parseCommonArguments(QFutureInterface<QString> &fi)
+822 {
+823     QString argumentDetails;
+824     QString output;
+825     sdkManagerCommand(m_config.sdkManagerToolPath(), QStringList("--help"), &output);
+826     bool foundTag = false;
+827     for (const QString& line : output.split('\n')) {
+828         if (fi.isCanceled())
+829             break;
+830         if (foundTag)
+831             argumentDetails.append(line + "\n");
+832         else if (line.startsWith(commonArgsKey))
+833             foundTag = true;
+834     }
+835 
+836     if (!fi.isCanceled())
+837         fi.reportResult(argumentDetails);
+838 }
+839 
+840 void AndroidSdkManagerPrivate::clearPackages()
+841 {
+842     for (AndroidSdkPackage *p : m_allPackages)
+843         delete p;
+844     m_allPackages.clear();
+845 }
+846 
+847 void AndroidSdkManagerPrivate::load()
+848 {
+849     QSettings *settings = Core::ICore::settings();
+850     settings->beginGroup(Constants::ANDROID_SETTINGS_GROUP);
+851     settings->beginGroup(Constants::ANDROID_SETTINGS_SDKMANAGER);
+852     m_sdkManagerArgs = settings->value(sdkManagerArgsKey).toStringList();
+853     settings->endGroup();
+854     settings->endGroup();
+855 }
+856 
+857 void AndroidSdkManagerPrivate::save() const
+858 {
+859     QSettings *settings = Core::ICore::settings();
+860     settings->beginGroup(Constants::ANDROID_SETTINGS_GROUP);
+861     settings->beginGroup(Constants::ANDROID_SETTINGS_SDKMANAGER);
+862     settings->setValue(sdkManagerArgsKey, m_sdkManagerArgs);
+863     settings->endGroup();
+864     settings->endGroup();
+865 }
+866 
+867 } // namespace Internal
+868 } // namespace Android

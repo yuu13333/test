@@ -1,0 +1,547 @@
+I want you to act as a code reviewer of Neutron in OpenStack. Please review the code below to detect security defects. If any are found, please describe the security defect in detail and indicate the corresponding line number of code and solution. If none are found, please state '''No security defects are detected in the code'''.
+
+1 # Copyright 2019 Red Hat, Inc.
+2 # All Rights Reserved.
+3 #
+4 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
+5 #    not use this file except in compliance with the License. You may obtain
+6 #    a copy of the License at
+7 #
+8 #         http://www.apache.org/licenses/LICENSE-2.0
+9 #
+10 #    Unless required by applicable law or agreed to in writing, software
+11 #    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+12 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+13 #    License for the specific language governing permissions and limitations
+14 #    under the License.
+15 
+16 import abc
+17 import inspect
+18 import threading
+19 
+20 from futurist import periodics
+21 from neutron_lib.api.definitions import external_net
+22 from neutron_lib import constants as n_const
+23 from neutron_lib import context as n_context
+24 from neutron_lib import exceptions as n_exc
+25 from oslo_config import cfg
+26 from oslo_log import log
+27 from oslo_utils import timeutils
+28 from ovsdbapp.backend.ovs_idl import event as row_event
+29 
+30 from neutron.common.ovn import constants as ovn_const
+31 from neutron.conf.plugins.ml2.drivers.ovn import ovn_conf
+32 from neutron.db import ovn_hash_ring_db as hash_ring_db
+33 from neutron.db import ovn_revision_numbers_db as revision_numbers_db
+34 from neutron.plugins.ml2.drivers.ovn.mech_driver.ovsdb import ovn_db_sync
+35 
+36 
+37 CONF = cfg.CONF
+38 LOG = log.getLogger(__name__)
+39 
+40 DB_CONSISTENCY_CHECK_INTERVAL = 300  # 5 minutes
+41 INCONSISTENCY_TYPE_CREATE_UPDATE = 'create/update'
+42 INCONSISTENCY_TYPE_DELETE = 'delete'
+43 
+44 
+45 class MaintenanceThread(object):
+46 
+47     def __init__(self):
+48         self._callables = []
+49         self._thread = None
+50         self._worker = None
+51 
+52     def add_periodics(self, obj):
+53         for name, member in inspect.getmembers(obj):
+54             if periodics.is_periodic(member):
+55                 LOG.debug('Periodic task found: %(owner)s.%(member)s',
+56                           {'owner': obj.__class__.__name__, 'member': name})
+57                 self._callables.append((member, (), {}))
+58 
+59     def start(self):
+60         if self._thread is None:
+61             self._worker = periodics.PeriodicWorker(self._callables)
+62             self._thread = threading.Thread(target=self._worker.start)
+63             self._thread.daemon = True
+64             self._thread.start()
+65 
+66     def stop(self):
+67         self._worker.stop()
+68         self._worker.wait()
+69         self._thread.join()
+70         self._worker = self._thread = None
+71 
+72 
+73 def rerun_on_schema_updates(func):
+74     """Tasks decorated with this will rerun upon database version updates."""
+75     func._rerun_on_schema_updates = True
+76     return func
+77 
+78 
+79 class OVNNBDBReconnectionEvent(row_event.RowEvent):
+80     """Event listening to reconnections from OVN Northbound DB."""
+81 
+82     def __init__(self, driver, version):
+83         self.driver = driver
+84         self.version = version
+85         table = 'Connection'
+86         events = (self.ROW_UPDATE,)
+87         super(OVNNBDBReconnectionEvent, self).__init__(
+88             events, table, (('is_connected', '=', True),),
+89             old_conditions=(('is_connected', '=', False),))
+90         self.event_name = self.__class__.__name__
+91 
+92     def run(self, event, row, old):
+93         curr_version = self.driver.get_ovn_nbdb_version()
+94         if self.version != curr_version:
+95             self.driver.nbdb_schema_updated_hook()
+96             self.version = curr_version
+97 
+98 
+99 class SchemaAwarePeriodicsBase(object):
+100 
+101     def __init__(self, ovn_client):
+102         self._nb_idl = ovn_client._nb_idl
+103         self._set_schema_aware_periodics()
+104         self._nb_idl.idl.notify_handler.watch_event(OVNNBDBReconnectionEvent(
+105             self, self.get_ovn_nbdb_version()))
+106 
+107     def get_ovn_nbdb_version(self):
+108         return self._nb_idl.idl._db.version
+109 
+110     def _set_schema_aware_periodics(self):
+111         self._schema_aware_periodics = []
+112         for name, member in inspect.getmembers(self):
+113             if not inspect.ismethod(member):
+114                 continue
+115 
+116             schema_upt = getattr(member, '_rerun_on_schema_updates', None)
+117             if schema_upt and periodics.is_periodic(member):
+118                 LOG.debug('Schema aware periodic task found: '
+119                           '%(owner)s.%(member)s',
+120                           {'owner': self.__class__.__name__, 'member': name})
+121                 self._schema_aware_periodics.append(member)
+122 
+123     @abc.abstractmethod
+124     def nbdb_schema_updated_hook(self):
+125         """Hook invoked upon OVN NB schema is updated."""
+126 
+127 
+128 class DBInconsistenciesPeriodics(SchemaAwarePeriodicsBase):
+129 
+130     def __init__(self, ovn_client):
+131         self._ovn_client = ovn_client
+132         # FIXME(lucasagomes): We should not be accessing private
+133         # attributes like that, perhaps we should extend the OVNClient
+134         # class and create an interface for the locks ?
+135         self._nb_idl = self._ovn_client._nb_idl
+136         self._idl = self._nb_idl.idl
+137         self._idl.set_lock('ovn_db_inconsistencies_periodics')
+138         self._sync_timer = timeutils.StopWatch()
+139         super(DBInconsistenciesPeriodics, self).__init__(ovn_client)
+140 
+141         self._resources_func_map = {
+142             ovn_const.TYPE_NETWORKS: {
+143                 'neutron_get': self._ovn_client._plugin.get_network,
+144                 'ovn_get': self._nb_idl.get_lswitch,
+145                 'ovn_create': self._ovn_client.create_network,
+146                 'ovn_update': self._ovn_client.update_network,
+147                 'ovn_delete': self._ovn_client.delete_network,
+148             },
+149             ovn_const.TYPE_PORTS: {
+150                 'neutron_get': self._ovn_client._plugin.get_port,
+151                 'ovn_get': self._nb_idl.get_lswitch_port,
+152                 'ovn_create': self._ovn_client.create_port,
+153                 'ovn_update': self._ovn_client.update_port,
+154                 'ovn_delete': self._ovn_client.delete_port,
+155             },
+156             ovn_const.TYPE_FLOATINGIPS: {
+157                 'neutron_get': self._ovn_client._l3_plugin.get_floatingip,
+158                 'ovn_get': self._nb_idl.get_floatingip,
+159                 'ovn_create': self._ovn_client.create_floatingip,
+160                 'ovn_update': self._ovn_client.update_floatingip,
+161                 'ovn_delete': self._ovn_client.delete_floatingip,
+162             },
+163             ovn_const.TYPE_ROUTERS: {
+164                 'neutron_get': self._ovn_client._l3_plugin.get_router,
+165                 'ovn_get': self._nb_idl.get_lrouter,
+166                 'ovn_create': self._ovn_client.create_router,
+167                 'ovn_update': self._ovn_client.update_router,
+168                 'ovn_delete': self._ovn_client.delete_router,
+169             },
+170             ovn_const.TYPE_SECURITY_GROUPS: {
+171                 'neutron_get': self._ovn_client._plugin.get_security_group,
+172                 'ovn_get': self._get_security_group,
+173                 'ovn_create': self._ovn_client.create_security_group,
+174                 'ovn_delete': self._ovn_client.delete_security_group,
+175             },
+176             ovn_const.TYPE_SECURITY_GROUP_RULES: {
+177                 'neutron_get':
+178                     self._ovn_client._plugin.get_security_group_rule,
+179                 'ovn_get': self._nb_idl.get_acl_by_id,
+180                 'ovn_create': self._ovn_client.create_security_group_rule,
+181                 'ovn_delete': self._ovn_client.delete_security_group_rule,
+182             },
+183             ovn_const.TYPE_ROUTER_PORTS: {
+184                 'neutron_get':
+185                     self._ovn_client._plugin.get_port,
+186                 'ovn_get': self._nb_idl.get_lrouter_port,
+187                 'ovn_create': self._create_lrouter_port,
+188                 'ovn_update': self._ovn_client.update_router_port,
+189                 'ovn_delete': self._ovn_client.delete_router_port,
+190             },
+191         }
+192 
+193     def _get_security_group(self, uuid):
+194         return (self._nb_idl.get_address_set(uuid) or
+195                 self._nb_idl.get_port_group(uuid))
+196 
+197     @property
+198     def has_lock(self):
+199         return not self._idl.is_lock_contended
+200 
+201     def nbdb_schema_updated_hook(self):
+202         if not self.has_lock:
+203             return
+204 
+205         for func in self._schema_aware_periodics:
+206             LOG.debug('OVN Northbound DB schema version was updated,'
+207                       'invoking "%s"', func.__name__)
+208             try:
+209                 func()
+210             except periodics.NeverAgain:
+211                 pass
+212 
+213     def _fix_create_update(self, context, row):
+214         res_map = self._resources_func_map[row.resource_type]
+215         try:
+216             # Get the latest version of the resource in Neutron DB
+217             n_obj = res_map['neutron_get'](context, row.resource_uuid)
+218         except n_exc.NotFound:
+219             LOG.warning('Skip fixing resource %(res_uuid)s (type: '
+220                         '%(res_type)s). Resource does not exist in Neutron '
+221                         'database anymore', {'res_uuid': row.resource_uuid,
+222                                              'res_type': row.resource_type})
+223             return
+224 
+225         ovn_obj = res_map['ovn_get'](row.resource_uuid)
+226 
+227         if not ovn_obj:
+228             res_map['ovn_create'](n_obj)
+229         else:
+230             if row.resource_type == ovn_const.TYPE_SECURITY_GROUP_RULES:
+231                 LOG.error("SG rule %s found with a revision number while "
+232                           "this resource doesn't support updates",
+233                           row.resource_uuid)
+234             elif row.resource_type == ovn_const.TYPE_SECURITY_GROUPS:
+235                 # In OVN, we don't care about updates to security groups,
+236                 # so just bump the revision number to whatever it's
+237                 # supposed to be.
+238                 revision_numbers_db.bump_revision(context, n_obj,
+239                                                   row.resource_type)
+240             else:
+241                 ext_ids = getattr(ovn_obj, 'external_ids', {})
+242                 ovn_revision = int(ext_ids.get(
+243                     ovn_const.OVN_REV_NUM_EXT_ID_KEY, -1))
+244                 # If the resource exist in the OVN DB but the revision
+245                 # number is different from Neutron DB, updated it.
+246                 if ovn_revision != n_obj['revision_number']:
+247                     res_map['ovn_update'](n_obj)
+248                 else:
+249                     # If the resource exist and the revision number
+250                     # is equal on both databases just bump the revision on
+251                     # the cache table.
+252                     revision_numbers_db.bump_revision(context, n_obj,
+253                                                       row.resource_type)
+254 
+255     def _fix_delete(self, context, row):
+256         res_map = self._resources_func_map[row.resource_type]
+257         ovn_obj = res_map['ovn_get'](row.resource_uuid)
+258         if not ovn_obj:
+259             revision_numbers_db.delete_revision(
+260                 context, row.resource_uuid, row.resource_type)
+261         else:
+262             res_map['ovn_delete'](context, row.resource_uuid)
+263 
+264     def _fix_create_update_subnet(self, context, row):
+265         # Get the lasted version of the port in Neutron DB
+266         sn_db_obj = self._ovn_client._plugin.get_subnet(
+267             context, row.resource_uuid)
+268         n_db_obj = self._ovn_client._plugin.get_network(
+269             context, sn_db_obj['network_id'])
+270 
+271         if row.revision_number == ovn_const.INITIAL_REV_NUM:
+272             self._ovn_client.create_subnet(sn_db_obj, n_db_obj)
+273         else:
+274             self._ovn_client.update_subnet(sn_db_obj, n_db_obj)
+275 
+276     # The migration will run just once per neutron-server instance. If the lock
+277     # is held by some other neutron-server instance in the cloud, we'll attempt
+278     # to perform the migration every 10 seconds until completed.
+279     @periodics.periodic(spacing=10, run_immediately=True)
+280     @rerun_on_schema_updates
+281     def migrate_to_port_groups(self):
+282         """Perform the migration from Address Sets to Port Groups. """
+283         # TODO(dalvarez): Remove this in U cycle when we're sure that all
+284         # versions are running using Port Groups (and OVS >= 2.10).
+285 
+286         # If Port Groups are not supported or we've already migrated, we don't
+287         # need to attempt to migrate again.
+288         if (not self._nb_idl.is_port_groups_supported() or
+289                 not self._nb_idl.get_address_sets()):
+290             raise periodics.NeverAgain()
+291 
+292         # Only the worker holding a valid lock within OVSDB will perform the
+293         # migration.
+294         if not self.has_lock:
+295             return
+296 
+297         admin_context = n_context.get_admin_context()
+298         nb_sync = ovn_db_sync.OvnNbSynchronizer(
+299             self._ovn_client._plugin, self._nb_idl, self._ovn_client._sb_idl,
+300             None, None)
+301         nb_sync.migrate_to_port_groups(admin_context)
+302         raise periodics.NeverAgain()
+303 
+304     def _log_maintenance_inconsistencies(self, create_update_inconsistencies,
+305                                          delete_inconsistencies):
+306         if not CONF.debug:
+307             return
+308 
+309         def _log(inconsistencies, type_):
+310             if not inconsistencies:
+311                 return
+312 
+313             c = {}
+314             for f in inconsistencies:
+315                 if f.resource_type not in c:
+316                     c[f.resource_type] = 1
+317                 else:
+318                     c[f.resource_type] += 1
+319 
+320             fail_str = ', '.join('{}={}'.format(k, v) for k, v in c.items())
+321             LOG.debug('Maintenance task: Number of inconsistencies '
+322                       'found at %(type_)s: %(fail_str)s',
+323                       {'type_': type_, 'fail_str': fail_str})
+324 
+325         _log(create_update_inconsistencies, INCONSISTENCY_TYPE_CREATE_UPDATE)
+326         _log(delete_inconsistencies, INCONSISTENCY_TYPE_DELETE)
+327 
+328     @periodics.periodic(spacing=DB_CONSISTENCY_CHECK_INTERVAL,
+329                         run_immediately=True)
+330     def check_for_inconsistencies(self):
+331         # Only the worker holding a valid lock within OVSDB will run
+332         # this periodic
+333         if not self.has_lock:
+334             return
+335 
+336         admin_context = n_context.get_admin_context()
+337         create_update_inconsistencies = (
+338             revision_numbers_db.get_inconsistent_resources(admin_context))
+339         delete_inconsistencies = (
+340             revision_numbers_db.get_deleted_resources(admin_context))
+341         if not any([create_update_inconsistencies, delete_inconsistencies]):
+342             LOG.debug('Maintenance task: No inconsistencies found. Skipping')
+343             return
+344 
+345         LOG.debug('Maintenance task: Synchronizing Neutron '
+346                   'and OVN databases')
+347         self._log_maintenance_inconsistencies(create_update_inconsistencies,
+348                                               delete_inconsistencies)
+349         self._sync_timer.restart()
+350 
+351         dbg_log_msg = ('Maintenance task: Fixing resource %(res_uuid)s '
+352                        '(type: %(res_type)s) at %(type_)s')
+353         # Fix the create/update resources inconsistencies
+354         for row in create_update_inconsistencies:
+355             LOG.debug(dbg_log_msg, {'res_uuid': row.resource_uuid,
+356                                     'res_type': row.resource_type,
+357                                     'type_': INCONSISTENCY_TYPE_CREATE_UPDATE})
+358             try:
+359                 # NOTE(lucasagomes): The way to fix subnets is bit
+360                 # different than other resources. A subnet in OVN language
+361                 # is just a DHCP rule but, this rule only exist if the
+362                 # subnet in Neutron has the "enable_dhcp" attribute set
+363                 # to True. So, it's possible to have a consistent subnet
+364                 # resource even when it does not exist in the OVN database.
+365                 if row.resource_type == ovn_const.TYPE_SUBNETS:
+366                     self._fix_create_update_subnet(admin_context, row)
+367                 else:
+368                     self._fix_create_update(admin_context, row)
+369             except Exception:
+370                 LOG.exception('Maintenance task: Failed to fix resource '
+371                               '%(res_uuid)s (type: %(res_type)s)',
+372                               {'res_uuid': row.resource_uuid,
+373                                'res_type': row.resource_type})
+374 
+375         # Fix the deleted resources inconsistencies
+376         for row in delete_inconsistencies:
+377             LOG.debug(dbg_log_msg, {'res_uuid': row.resource_uuid,
+378                                     'res_type': row.resource_type,
+379                                     'type_': INCONSISTENCY_TYPE_DELETE})
+380             try:
+381                 if row.resource_type == ovn_const.TYPE_SUBNETS:
+382                     self._ovn_client.delete_subnet(row.resource_uuid)
+383                 else:
+384                     self._fix_delete(admin_context, row)
+385             except Exception:
+386                 LOG.exception('Maintenance task: Failed to fix deleted '
+387                               'resource %(res_uuid)s (type: %(res_type)s)',
+388                               {'res_uuid': row.resource_uuid,
+389                                'res_type': row.resource_type})
+390 
+391         self._sync_timer.stop()
+392         LOG.info('Maintenance task: Synchronization finished '
+393                  '(took %.2f seconds)', self._sync_timer.elapsed())
+394 
+395     def _create_lrouter_port(self, port):
+396         admin_context = n_context.get_admin_context()
+397         router_id = port['device_id']
+398         self._ovn_client._l3_plugin.add_router_interface(
+399             admin_context, router_id, {'port_id': port['id']}, may_exist=True)
+400 
+401     def _check_subnet_global_dhcp_opts(self):
+402         inconsistent_subnets = []
+403         admin_context = n_context.get_admin_context()
+404         subnet_filter = {'enable_dhcp': [True]}
+405         neutron_subnets = self._ovn_client._plugin.get_subnets(
+406             admin_context, subnet_filter)
+407         global_v4_opts = ovn_conf.get_global_dhcpv4_opts()
+408         global_v6_opts = ovn_conf.get_global_dhcpv6_opts()
+409         LOG.debug('Checking %s subnets for global DHCP option consistency',
+410                   len(neutron_subnets))
+411         for subnet in neutron_subnets:
+412             ovn_dhcp_opts = self._nb_idl.get_subnet_dhcp_options(
+413                 subnet['id'])['subnet']
+414             inconsistent_opts = []
+415             if ovn_dhcp_opts:
+416                 if subnet['ip_version'] == n_const.IP_VERSION_4:
+417                     for opt, value in global_v4_opts.items():
+418                         if value != ovn_dhcp_opts['options'].get(opt, None):
+419                             inconsistent_opts.append(opt)
+420                 if subnet['ip_version'] == n_const.IP_VERSION_6:
+421                     for opt, value in global_v6_opts.items():
+422                         if value != ovn_dhcp_opts['options'].get(opt, None):
+423                             inconsistent_opts.append(opt)
+424             if inconsistent_opts:
+425                 LOG.debug('Subnet %s has inconsistent DHCP opts: %s',
+426                           subnet['id'], inconsistent_opts)
+427                 inconsistent_subnets.append(subnet)
+428         return inconsistent_subnets
+429 
+430     # A static spacing value is used here, but this method will only run
+431     # once per lock due to the use of periodics.NeverAgain().
+432     @periodics.periodic(spacing=600,
+433                         run_immediately=True)
+434     def check_global_dhcp_opts(self):
+435         # This periodic task is included in DBInconsistenciesPeriodics since
+436         # it uses the lock to ensure only one worker is executing
+437         if not self.has_lock:
+438             return
+439         if (not ovn_conf.get_global_dhcpv4_opts() and
+440                 not ovn_conf.get_global_dhcpv6_opts()):
+441             # No need to scan the subnets if the settings are unset.
+442             raise periodics.NeverAgain()
+443         LOG.debug('Maintenance task: Checking DHCP options on subnets')
+444         self._sync_timer.restart()
+445         fix_subnets = self._check_subnet_global_dhcp_opts()
+446         if fix_subnets:
+447             admin_context = n_context.get_admin_context()
+448             LOG.debug('Triggering update for %s subnets', len(fix_subnets))
+449             for subnet in fix_subnets:
+450                 neutron_net = self._ovn_client._plugin.get_network(
+451                     admin_context, subnet['network_id'])
+452                 try:
+453                     self._ovn_client.update_subnet(subnet, neutron_net)
+454                 except Exception:
+455                     LOG.exception('Failed to update subnet %s',
+456                                   subnet['id'])
+457 
+458         self._sync_timer.stop()
+459         LOG.info('Maintenance task: DHCP options check finished '
+460                  '(took %.2f seconds)', self._sync_timer.elapsed())
+461 
+462         raise periodics.NeverAgain()
+463 
+464     # A static spacing value is used here, but this method will only run
+465     # once per lock due to the use of periodics.NeverAgain().
+466     @periodics.periodic(spacing=1800, run_immediately=True)
+467     def check_metadata_ports(self):
+468         # If OVN metadata is disabled do not run this task again
+469         if not ovn_conf.is_ovn_metadata_enabled():
+470             raise periodics.NeverAgain()
+471 
+472         # Make sure that only one worker is executing this
+473         if not self.has_lock:
+474             return
+475 
+476         admin_context = n_context.get_admin_context()
+477         for n in self._ovn_client._plugin.get_networks(admin_context):
+478             self._ovn_client.create_metadata_port(admin_context, n)
+479 
+480         raise periodics.NeverAgain()
+481 
+482     # TODO(lucasagomes): Remove this in the U cycle
+483     # A static spacing value is used here, but this method will only run
+484     # once per lock due to the use of periodics.NeverAgain().
+485     @periodics.periodic(spacing=600, run_immediately=True)
+486     def check_for_port_security_unknown_address(self):
+487 
+488         if not self.has_lock:
+489             return
+490 
+491         for port in self._nb_idl.lsp_list().execute(check_error=True):
+492 
+493             if port.type == ovn_const.LSP_TYPE_LOCALNET:
+494                 continue
+495 
+496             addresses = port.addresses
+497             type_ = port.type.strip()
+498             if not port.port_security:
+499                 if not type_ and ovn_const.UNKNOWN_ADDR not in addresses:
+500                     addresses = [ovn_const.UNKNOWN_ADDR]
+501                 elif type_ and ovn_const.UNKNOWN_ADDR in addresses:
+502                     addresses.remove(ovn_const.UNKNOWN_ADDR)
+503             else:
+504                 if type_ and ovn_const.UNKNOWN_ADDR in addresses:
+505                     addresses.remove(ovn_const.UNKNOWN_ADDR)
+506                 elif not type_ and ovn_const.UNKNOWN_ADDR in addresses:
+507                     addresses.remove(ovn_const.UNKNOWN_ADDR)
+508 
+509             if addresses:
+510                 self._nb_idl.lsp_set_addresses(
+511                     port.name, addresses=addresses).execute(check_error=True)
+512             else:
+513                 self._nb_idl.db_clear(
+514                     'Logical_Switch_Port', port.name,
+515                     'addresses').execute(check_error=True)
+516 
+517         raise periodics.NeverAgain()
+518 
+519     # A static spacing value is used here, but this method will only run
+520     # once per lock due to the use of periodics.NeverAgain().
+521     @periodics.periodic(spacing=600, run_immediately=True)
+522     def check_for_fragmentation_support(self):
+523         if not self.has_lock:
+524             return
+525 
+526         context = n_context.get_admin_context()
+527         for net in self._ovn_client._plugin.get_networks(
+528                 context, {external_net.EXTERNAL: [True]}):
+529             self._ovn_client.set_gateway_mtu(context, net)
+530 
+531         raise periodics.NeverAgain()
+532 
+533 
+534 class HashRingHealthCheckPeriodics(object):
+535 
+536     def __init__(self, group):
+537         self._group = group
+538         self.ctx = n_context.get_admin_context()
+539 
+540     @periodics.periodic(spacing=ovn_const.HASH_RING_TOUCH_INTERVAL)
+541     def touch_hash_ring_nodes(self):
+542         # NOTE(lucasagomes): Note that we do not rely on the OVSDB lock
+543         # here because we want the maintenance tasks from each instance to
+544         # execute this task.
+545         hash_ring_db.touch_nodes_from_host(self.ctx, self._group)

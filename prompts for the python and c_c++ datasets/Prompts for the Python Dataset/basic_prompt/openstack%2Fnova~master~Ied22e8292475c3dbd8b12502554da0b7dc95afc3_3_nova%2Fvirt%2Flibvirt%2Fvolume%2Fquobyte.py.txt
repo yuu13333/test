@@ -1,0 +1,159 @@
+Please review the code below to detect security defects. If any are found, please describe the security defect in detail and indicate the corresponding line number of code and solution. If none are found, please state '''No security defects are detected in the code'''.
+
+1 # Copyright (c) 2015 Quobyte Inc.
+2 # All Rights Reserved.
+3 #
+4 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
+5 #    not use this file except in compliance with the License. You may obtain
+6 #    a copy of the License at
+7 #
+8 #         http://www.apache.org/licenses/LICENSE-2.0
+9 #
+10 #    Unless required by applicable law or agreed to in writing, software
+11 #    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+12 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+13 #    License for the specific language governing permissions and limitations
+14 #    under the License.
+15 
+16 import errno
+17 import os
+18 
+19 from oslo_concurrency import processutils
+20 from oslo_log import log as logging
+21 from oslo_utils import fileutils
+22 import six
+23 
+24 import nova.conf
+25 from nova import exception as nova_exception
+26 from nova.i18n import _
+27 from nova.i18n import _LE
+28 from nova.i18n import _LI
+29 from nova import utils
+30 from nova.virt.libvirt import utils as libvirt_utils
+31 from nova.virt.libvirt.volume import fs
+32 
+33 LOG = logging.getLogger(__name__)
+34 
+35 CONF = nova.conf.CONF
+36 
+37 SOURCE_PROTOCOL = 'quobyte'
+38 SOURCE_TYPE = 'file'
+39 DRIVER_CACHE = 'none'
+40 DRIVER_IO = 'native'
+41 
+42 
+43 def mount_volume(volume, mnt_base, configfile=None):
+44     """Wraps execute calls for mounting a Quobyte volume"""
+45     fileutils.ensure_tree(mnt_base)
+46 
+47     command = ['mount.quobyte', volume, mnt_base]
+48     if os.path.exists(" /run/systemd/system"):
+49         # Note(kaisers): with systemd this requires a separate CGROUP to
+50         # prevent Nova service stop/restarts from killing the mount.
+51         command = ['systemd-run', 'mount.quobyte', '-f', volume, mnt_base]
+52     if configfile:
+53         command.extend(['-c', configfile])
+54 
+55     LOG.debug('Mounting volume %s at mount point %s ...',
+56               volume,
+57               mnt_base)
+58     # Run mount command but do not fail on already mounted exit code
+59     utils.execute(*command, check_exit_code=[0, 4], run_as_root=True)
+60     LOG.info(_LI('Mounted volume: %s'), volume)
+61 
+62 
+63 def umount_volume(mnt_base):
+64     """Wraps execute calls for unmouting a Quobyte volume"""
+65     try:
+66         utils.execute('umount.quobyte', mnt_base, run_as_root=True)
+67     except processutils.ProcessExecutionError as exc:
+68         if 'Device or resource busy' in six.text_type(exc):
+69             LOG.error(_LE("The Quobyte volume at %s is still in use."),
+70                       mnt_base)
+71         else:
+72             LOG.exception(_LE("Couldn't unmount the Quobyte Volume at %s"),
+73                           mnt_base)
+74 
+75 
+76 def validate_volume(mnt_base):
+77     """Wraps execute calls for checking validity of a Quobyte volume"""
+78     command = ['getfattr', "-n", "quobyte.info", mnt_base]
+79     try:
+80         utils.execute(*command)
+81     except processutils.ProcessExecutionError as exc:
+82         msg = (_("The mount %(mount_path)s is not a valid"
+83                  " Quobyte volume. Error: %(exc)s")
+84                % {'mount_path': mnt_base, 'exc': exc})
+85         raise nova_exception.InternalError(msg)
+86 
+87     if not os.access(mnt_base, os.W_OK | os.X_OK):
+88         msg = (_LE("Volume is not writable. Please broaden the file"
+89                    " permissions. Mount: %s") % mnt_base)
+90         raise nova_exception.InternalError(msg)
+91 
+92 
+93 class LibvirtQuobyteVolumeDriver(fs.LibvirtBaseFileSystemVolumeDriver):
+94     """Class implements libvirt part of volume driver for Quobyte."""
+95 
+96     def _get_mount_point_base(self):
+97         return CONF.libvirt.quobyte_mount_point_base
+98 
+99     def get_config(self, connection_info, disk_info):
+100         conf = super(LibvirtQuobyteVolumeDriver,
+101                      self).get_config(connection_info, disk_info)
+102         data = connection_info['data']
+103         conf.source_protocol = SOURCE_PROTOCOL
+104         conf.source_type = SOURCE_TYPE
+105         conf.driver_cache = DRIVER_CACHE
+106         conf.driver_io = DRIVER_IO
+107         conf.driver_format = data.get('format', 'raw')
+108 
+109         conf.source_path = self._get_device_path(connection_info)
+110 
+111         return conf
+112 
+113     @utils.synchronized('connect_volume')
+114     def connect_volume(self, connection_info, disk_info):
+115         """Connect the volume."""
+116         data = connection_info['data']
+117         quobyte_volume = self._normalize_export(data['export'])
+118         mount_path = self._get_mount_path(connection_info)
+119         mounted = libvirt_utils.is_mounted(mount_path,
+120                                            SOURCE_PROTOCOL
+121                                            + '@' + quobyte_volume)
+122         if mounted:
+123             try:
+124                 os.stat(mount_path)
+125             except OSError as exc:
+126                 if exc.errno == errno.ENOTCONN:
+127                     mounted = False
+128                     LOG.info(_LI('Fixing previous mount %s which was not'
+129                                  ' unmounted correctly.'), mount_path)
+130                     umount_volume(mount_path)
+131 
+132         if not mounted:
+133             mount_volume(quobyte_volume,
+134                          mount_path,
+135                          CONF.libvirt.quobyte_client_cfg)
+136 
+137         validate_volume(mount_path)
+138 
+139     @utils.synchronized('connect_volume')
+140     def disconnect_volume(self, connection_info, disk_dev):
+141         """Disconnect the volume."""
+142 
+143         quobyte_volume = self._normalize_export(
+144                                         connection_info['data']['export'])
+145         mount_path = self._get_mount_path(connection_info)
+146 
+147         if libvirt_utils.is_mounted(mount_path, 'quobyte@' + quobyte_volume):
+148             umount_volume(mount_path)
+149         else:
+150             LOG.info(_LI("Trying to disconnected unmounted volume at %s"),
+151                      mount_path)
+152 
+153     def _normalize_export(self, export):
+154         protocol = SOURCE_PROTOCOL + "://"
+155         if export.startswith(protocol):
+156             export = export[len(protocol):]
+157         return export

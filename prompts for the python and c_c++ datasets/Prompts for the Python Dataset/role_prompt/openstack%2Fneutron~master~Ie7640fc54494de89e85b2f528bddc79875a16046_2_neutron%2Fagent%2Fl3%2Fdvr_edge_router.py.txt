@@ -1,0 +1,365 @@
+I want you to act as a code reviewer of Neutron in OpenStack. Please review the code below to detect security defects. If any are found, please describe the security defect in detail and indicate the corresponding line number of code and solution. If none are found, please state '''No security defects are detected in the code'''.
+
+1 # Copyright (c) 2015 OpenStack Foundation
+2 #
+3 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
+4 #    not use this file except in compliance with the License. You may obtain
+5 #    a copy of the License at
+6 #
+7 #         http://www.apache.org/licenses/LICENSE-2.0
+8 #
+9 #    Unless required by applicable law or agreed to in writing, software
+10 #    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+11 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+12 #    License for the specific language governing permissions and limitations
+13 #    under the License.
+14 
+15 from neutron_lib import constants as lib_constants
+16 from oslo_log import log as logging
+17 
+18 from neutron.agent.l3 import dvr_local_router
+19 from neutron.agent.l3 import dvr_snat_ns
+20 from neutron.agent.l3 import router_info as router
+21 from neutron.agent.linux import ip_lib
+22 from neutron.agent.linux import iptables_manager
+23 
+24 LOG = logging.getLogger(__name__)
+25 
+26 
+27 class DvrEdgeRouter(dvr_local_router.DvrLocalRouter):
+28 
+29     def __init__(self, host, *args, **kwargs):
+30         super(DvrEdgeRouter, self).__init__(host, *args, **kwargs)
+31         self.snat_namespace = dvr_snat_ns.SnatNamespace(
+32             self.router_id, self.agent_conf, self.driver, self.use_ipv6)
+33         self.snat_iptables_manager = None
+34 
+35     def get_gw_ns_name(self):
+36         return self.snat_namespace.name
+37 
+38     def external_gateway_added(self, ex_gw_port, interface_name):
+39         super(DvrEdgeRouter, self).external_gateway_added(
+40             ex_gw_port, interface_name)
+41         if self._is_this_snat_host():
+42             self._create_dvr_gateway(ex_gw_port, interface_name)
+43             # NOTE: When a router is created without a gateway the routes get
+44             # added to the router namespace, but if we wanted to populate
+45             # the same routes to the snat namespace after the gateway port
+46             # is added, we need to call routes_updated here.
+47             self.routes_updated([], self.router['routes'])
+48         elif self.snat_namespace.exists():
+49             # This is the case where the snat was moved manually or
+50             # rescheduled to a different agent when the agent was dead.
+51             LOG.debug("SNAT was moved or rescheduled to a different host "
+52                       "and does not match with the current host. This is "
+53                       "a stale namespace %s and will be cleared from the "
+54                       "current dvr_snat host.", self.snat_namespace.name)
+55             self.external_gateway_removed(ex_gw_port, interface_name)
+56 
+57     def external_gateway_updated(self, ex_gw_port, interface_name):
+58         if not self._is_this_snat_host():
+59             # no centralized SNAT gateway for this node/agent
+60             LOG.debug("not hosting snat for router: %s", self.router['id'])
+61             if self.snat_namespace.exists():
+62                 LOG.debug("SNAT was rescheduled to host %s. Clearing snat "
+63                           "namespace.", self.router.get('gw_port_host'))
+64                 return self.external_gateway_removed(
+65                     ex_gw_port, interface_name)
+66             return
+67 
+68         if not self.snat_namespace.exists():
+69             # SNAT might be rescheduled to this agent; need to process like
+70             # newly created gateway
+71             return self.external_gateway_added(ex_gw_port, interface_name)
+72         else:
+73             self._external_gateway_added(ex_gw_port,
+74                                         interface_name,
+75                                         self.snat_namespace.name,
+76                                         preserve_ips=[])
+77 
+78     def _external_gateway_removed(self, ex_gw_port, interface_name):
+79         super(DvrEdgeRouter, self).external_gateway_removed(ex_gw_port,
+80                                                             interface_name)
+81         if not self._is_this_snat_host() and not self.snat_namespace.exists():
+82             # no centralized SNAT gateway for this node/agent
+83             LOG.debug("not hosting snat for router: %s", self.router['id'])
+84             return
+85 
+86         self.driver.unplug(interface_name,
+87                            bridge=self.agent_conf.external_network_bridge,
+88                            namespace=self.snat_namespace.name,
+89                            prefix=router.EXTERNAL_DEV_PREFIX)
+90 
+91     def external_gateway_removed(self, ex_gw_port, interface_name):
+92         self._external_gateway_removed(ex_gw_port, interface_name)
+93         if self.snat_namespace.exists():
+94             self.snat_namespace.delete()
+95 
+96     def internal_network_added(self, port):
+97         super(DvrEdgeRouter, self).internal_network_added(port)
+98 
+99         # TODO(gsagie) some of this checks are already implemented
+100         # in the base class, think how to avoid re-doing them
+101         if not self._is_this_snat_host():
+102             return
+103 
+104         sn_port = self.get_snat_port_for_internal_port(port)
+105         if not sn_port:
+106             return
+107 
+108         ns_name = dvr_snat_ns.SnatNamespace.get_snat_ns_name(self.router['id'])
+109         interface_name = self._get_snat_int_device_name(sn_port['id'])
+110         self._internal_network_added(
+111             ns_name,
+112             sn_port['network_id'],
+113             sn_port['id'],
+114             sn_port['fixed_ips'],
+115             sn_port['mac_address'],
+116             interface_name,
+117             lib_constants.SNAT_INT_DEV_PREFIX,
+118             mtu=sn_port.get('mtu'))
+119 
+120     def _dvr_internal_network_removed(self, port):
+121         super(DvrEdgeRouter, self)._dvr_internal_network_removed(port)
+122 
+123         if not self.ex_gw_port:
+124             return
+125 
+126         sn_port = self.get_snat_port_for_internal_port(port, self.snat_ports)
+127         if not sn_port:
+128             return
+129 
+130         if not self._is_this_snat_host():
+131             return
+132 
+133         snat_interface = self._get_snat_int_device_name(sn_port['id'])
+134         ns_name = self.snat_namespace.name
+135         prefix = lib_constants.SNAT_INT_DEV_PREFIX
+136         if ip_lib.device_exists(snat_interface, namespace=ns_name):
+137             self.driver.unplug(snat_interface, namespace=ns_name,
+138                                prefix=prefix)
+139 
+140     def _plug_snat_port(self, port):
+141         interface_name = self._get_snat_int_device_name(port['id'])
+142         self._internal_network_added(
+143             self.snat_namespace.name, port['network_id'],
+144             port['id'], port['fixed_ips'],
+145             port['mac_address'], interface_name,
+146             lib_constants.SNAT_INT_DEV_PREFIX,
+147             mtu=port.get('mtu'))
+148 
+149     def _create_dvr_gateway(self, ex_gw_port, gw_interface_name):
+150         snat_ns = self._create_snat_namespace()
+151         # connect snat_ports to br_int from SNAT namespace
+152         for port in self.get_snat_interfaces():
+153             self._plug_snat_port(port)
+154         self._external_gateway_added(ex_gw_port, gw_interface_name,
+155                                      snat_ns.name, preserve_ips=[])
+156         self.snat_iptables_manager = iptables_manager.IptablesManager(
+157             namespace=snat_ns.name,
+158             use_ipv6=self.use_ipv6)
+159 
+160         self._initialize_address_scope_iptables(self.snat_iptables_manager)
+161 
+162     def _create_snat_namespace(self):
+163         """Create SNAT namespace."""
+164         # TODO(mlavalle): in the near future, this method should contain the
+165         # code in the L3 agent that creates a gateway for a dvr. The first step
+166         # is to move the creation of the snat namespace here
+167         self.snat_namespace.create()
+168         return self.snat_namespace
+169 
+170     def _get_snat_int_device_name(self, port_id):
+171         long_name = lib_constants.SNAT_INT_DEV_PREFIX + port_id
+172         return long_name[:self.driver.DEV_NAME_LEN]
+173 
+174     def _is_this_snat_host(self):
+175         host = self.router.get('gw_port_host')
+176         if not host:
+177             LOG.debug("gw_port_host missing from router: %s",
+178                       self.router['id'])
+179         return host == self.host
+180 
+181     def _handle_router_snat_rules(self, ex_gw_port, interface_name):
+182         super(DvrEdgeRouter, self)._handle_router_snat_rules(
+183             ex_gw_port, interface_name)
+184 
+185         if not self._is_this_snat_host():
+186             return
+187         if not self.get_ex_gw_port():
+188             return
+189 
+190         if not self.snat_iptables_manager:
+191             LOG.debug("DVR router: no snat rules to be handled")
+192             return
+193 
+194         with self.snat_iptables_manager.defer_apply():
+195             self._empty_snat_chains(self.snat_iptables_manager)
+196 
+197             # NOTE: float-snat should be added for the
+198             # centralized floating-ips supported by the
+199             # snat namespace.
+200             self.snat_iptables_manager.ipv4['nat'].add_rule(
+201                 'snat', '-j $float-snat')
+202 
+203             self._add_snat_rules(ex_gw_port, self.snat_iptables_manager,
+204                                  interface_name)
+205 
+206     def update_routing_table(self, operation, route):
+207         if self.get_ex_gw_port() and self._is_this_snat_host():
+208             ns_name = self.snat_namespace.name
+209             # NOTE: For now let us apply the static routes both in SNAT
+210             # namespace and Router Namespace, to reduce the complexity.
+211             if self.snat_namespace.exists():
+212                 super(DvrEdgeRouter, self)._update_routing_table(
+213                     operation, route, namespace=ns_name)
+214             else:
+215                 LOG.error("The SNAT namespace %s does not exist for "
+216                           "the router.", ns_name)
+217         super(DvrEdgeRouter, self).update_routing_table(operation, route)
+218 
+219     def delete(self):
+220         super(DvrEdgeRouter, self).delete()
+221         if self.snat_namespace.exists():
+222             self.snat_namespace.delete()
+223 
+224     def process_address_scope(self):
+225         super(DvrEdgeRouter, self).process_address_scope()
+226 
+227         if not self._is_this_snat_host():
+228             return
+229         if not self.snat_iptables_manager:
+230             LOG.debug("DVR router: no snat rules to be handled")
+231             return
+232 
+233         # Prepare address scope iptables rule for dvr snat interfaces
+234         internal_ports = self.get_snat_interfaces()
+235         ports_scopemark = self._get_port_devicename_scopemark(
+236             internal_ports, self._get_snat_int_device_name)
+237         # Prepare address scope iptables rule for external port
+238         external_port = self.get_ex_gw_port()
+239         if external_port:
+240             external_port_scopemark = self._get_port_devicename_scopemark(
+241                 [external_port], self.get_external_device_name)
+242             for ip_version in (lib_constants.IP_VERSION_4,
+243                                lib_constants.IP_VERSION_6):
+244                 ports_scopemark[ip_version].update(
+245                     external_port_scopemark[ip_version])
+246 
+247         with self.snat_iptables_manager.defer_apply():
+248             self._add_address_scope_mark(
+249                 self.snat_iptables_manager, ports_scopemark)
+250 
+251     def _delete_stale_external_devices(self, interface_name):
+252         if not self.snat_namespace.exists():
+253             return
+254 
+255         ns_ip = ip_lib.IPWrapper(namespace=self.snat_namespace.name)
+256         for d in ns_ip.get_devices():
+257             if (d.name.startswith(router.EXTERNAL_DEV_PREFIX) and
+258                     d.name != interface_name):
+259                 LOG.debug('Deleting stale external router device: %s', d.name)
+260                 self.driver.unplug(
+261                     d.name,
+262                     bridge=self.agent_conf.external_network_bridge,
+263                     namespace=self.snat_namespace.name,
+264                     prefix=router.EXTERNAL_DEV_PREFIX)
+265 
+266     def get_snat_external_device_interface_name(self, ex_gw_port):
+267         long_name = router.EXTERNAL_DEV_PREFIX + ex_gw_port['id']
+268         return long_name[:self.driver.DEV_NAME_LEN]
+269 
+270     def get_centralized_fip_cidr_set(self):
+271         """Returns the fip_cidr set for centralized floatingips."""
+272         ex_gw_port = self.get_ex_gw_port()
+273         # Don't look for centralized FIP cidrs if gw_port not exists or
+274         # this is not snat host
+275         if (not ex_gw_port or not self._is_this_snat_host() or
+276                 not self.snat_namespace.exists()):
+277             return set()
+278         interface_name = self.get_snat_external_device_interface_name(
+279                 ex_gw_port)
+280         device = ip_lib.IPDevice(
+281             interface_name, namespace=self.snat_namespace.name)
+282         return set([addr['cidr'] for addr in device.addr.list()])
+283 
+284     def get_router_cidrs(self, device):
+285         """Over-ride the get_router_cidrs function to return the list.
+286 
+287         This function is overridden to provide the complete list of
+288         floating_ip cidrs that the router hosts.
+289         This includes the centralized floatingip cidr list and the
+290         regular floatingip cidr list that are bound to fip namespace.
+291         """
+292         fip_cidrs = super(DvrEdgeRouter, self).get_router_cidrs(device)
+293         centralized_cidrs = self.get_centralized_fip_cidr_set()
+294         return fip_cidrs | centralized_cidrs
+295 
+296     def remove_centralized_floatingip(self, fip_cidr):
+297         """Function to handle the centralized Floatingip remove."""
+298         if not self.get_ex_gw_port():
+299             return
+300         if not self._is_this_snat_host():
+301             return
+302         interface_name = self.get_snat_external_device_interface_name(
+303             self.get_ex_gw_port())
+304         device = ip_lib.IPDevice(
+305             interface_name, namespace=self.snat_namespace.name)
+306         device.delete_addr_and_conntrack_state(fip_cidr)
+307         self.process_floating_ip_nat_rules_for_centralized_floatingip()
+308 
+309     def add_centralized_floatingip(self, fip, fip_cidr):
+310         """Function to handle the centralized Floatingip addition."""
+311         if not self.get_ex_gw_port():
+312             return
+313         if not self._is_this_snat_host():
+314             return
+315         interface_name = self.get_snat_external_device_interface_name(
+316             self.get_ex_gw_port())
+317         try:
+318             ip_lib.add_ip_address(fip_cidr, interface_name,
+319                                   namespace=self.snat_namespace.name)
+320         except RuntimeError:
+321             LOG.warning("Unable to configure IP address for centralized "
+322                         "floating IP: %s", fip['id'])
+323             return lib_constants.FLOATINGIP_STATUS_ERROR
+324         self.process_floating_ip_nat_rules_for_centralized_floatingip()
+325         # Send a GARP message on the external interface for the
+326         # centralized floatingip configured.
+327         ip_lib.send_ip_addr_adv_notif(self.snat_namespace.name,
+328                                       interface_name,
+329                                       fip['floating_ip_address'])
+330         return lib_constants.FLOATINGIP_STATUS_ACTIVE
+331 
+332     def _centralized_floating_forward_rules(self, floating_ip, fixed_ip):
+333         return [('PREROUTING', '-d %s/32 -j DNAT --to-destination %s' %
+334                  (floating_ip, fixed_ip)),
+335                 ('OUTPUT', '-d %s/32 -j DNAT --to-destination %s' %
+336                  (floating_ip, fixed_ip)),
+337                 ('float-snat', '-s %s/32 -j SNAT --to-source %s' %
+338                  (fixed_ip, floating_ip))]
+339 
+340     def _set_floating_ip_nat_rules_for_centralized_floatingip(self, fip):
+341         if fip.get(lib_constants.DVR_SNAT_BOUND):
+342             fixed = fip['fixed_ip_address']
+343             fip_ip = fip['floating_ip_address']
+344             for chain, rule in self._centralized_floating_forward_rules(
+345                 fip_ip, fixed):
+346                 self.snat_iptables_manager.ipv4['nat'].add_rule(
+347                     chain, rule, tag='floating_ip')
+348 
+349     def process_floating_ip_nat_rules_for_centralized_floatingip(self):
+350         self.snat_iptables_manager.ipv4['nat'].clear_rules_by_tag(
+351             'floating_ip')
+352         floating_ips = self.get_floating_ips()
+353         for fip in floating_ips:
+354             self._set_floating_ip_nat_rules_for_centralized_floatingip(fip)
+355         self.snat_iptables_manager.apply()
+356 
+357     def process_floating_ip_nat_rules(self):
+358         if self._is_this_snat_host():
+359             self.process_floating_ip_nat_rules_for_centralized_floatingip()
+360 
+361         # Cover mixed dvr_snat and compute node, aka a dvr_snat node has both
+362         # centralized and distributed floating IPs.
+363         super(DvrEdgeRouter, self).process_floating_ip_nat_rules()

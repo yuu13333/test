@@ -1,0 +1,698 @@
+I want you to act as a code reviewer of Qt Creator in Qt. Please review the code below to detect security defects. If any are found, please describe the security defect in detail and indicate the corresponding line number of code and solution. If none are found, please state '''No security defects are detected in the code'''.
+
+1 /****************************************************************************
+2 **
+3 ** Copyright (C) 2016 The Qt Company Ltd.
+4 ** Contact: https://www.qt.io/licensing/
+5 **
+6 ** This file is part of Qt Creator.
+7 **
+8 ** Commercial License Usage
+9 ** Licensees holding valid commercial Qt licenses may use this file in
+10 ** accordance with the commercial license agreement provided with the
+11 ** Software or, alternatively, in accordance with the terms contained in
+12 ** a written agreement between you and The Qt Company. For licensing terms
+13 ** and conditions see https://www.qt.io/terms-conditions. For further
+14 ** information use the contact form at https://www.qt.io/contact-us.
+15 **
+16 ** GNU General Public License Usage
+17 ** Alternatively, this file may be used under the terms of the GNU
+18 ** General Public License version 3 as published by the Free Software
+19 ** Foundation with exceptions as appearing in the file LICENSE.GPL3-EXCEPT
+20 ** included in the packaging of this file. Please review the following
+21 ** information to ensure the GNU General Public License requirements will
+22 ** be met: https://www.gnu.org/licenses/gpl-3.0.html.
+23 **
+24 ****************************************************************************/
+25 
+26 #include "clangtoolsdiagnosticmodel.h"
+27 
+28 #include "clangtoolsdiagnosticview.h"
+29 #include "clangtoolsprojectsettings.h"
+30 #include "clangtoolsutils.h"
+31 
+32 #include <coreplugin/fileiconprovider.h>
+33 #include <projectexplorer/project.h>
+34 #include <projectexplorer/session.h>
+35 #include <utils/qtcassert.h>
+36 #include <utils/utilsicons.h>
+37 
+38 #include <QFileInfo>
+39 #include <QLoggingCategory>
+40 
+41 #include <tuple>
+42 
+43 static Q_LOGGING_CATEGORY(LOG, "qtc.clangtools.model", QtWarningMsg)
+44 
+45 namespace ClangTools {
+46 namespace Internal {
+47 
+48 FilePathItem::FilePathItem(const QString &filePath)
+49     : m_filePath(filePath)
+50 {}
+51 
+52 QVariant FilePathItem::data(int column, int role) const
+53 {
+54     if (column == DiagnosticView::DiagnosticColumn) {
+55         switch (role) {
+56         case Qt::DisplayRole:
+57             return m_filePath;
+58         case Qt::DecorationRole:
+59             return Core::FileIconProvider::icon(m_filePath);
+60         case Debugger::DetailedErrorView::FullTextRole:
+61             return m_filePath;
+62         default:
+63             return QVariant();
+64         }
+65     }
+66 
+67     return QVariant();
+68 }
+69 
+70 class ExplainingStepItem : public Utils::TreeItem
+71 {
+72 public:
+73     ExplainingStepItem(const ExplainingStep &step, int index);
+74     int index() const { return m_index; }
+75 
+76 private:
+77     QVariant data(int column, int role) const override;
+78 
+79     const ExplainingStep m_step;
+80     const int m_index = 0;
+81 };
+82 
+83 ClangToolsDiagnosticModel::ClangToolsDiagnosticModel(QObject *parent)
+84     : Utils::TreeModel<>(parent)
+85     , m_filesWatcher(std::make_unique<QFileSystemWatcher>())
+86 {
+87     setHeader({tr("Diagnostic")});
+88     connectFileWatcher();
+89 }
+90 
+91 QDebug operator<<(QDebug debug, const Diagnostic &d)
+92 {
+93     return debug << "category:" << d.category
+94                  << "type:" << d.type
+95                  << "context:" << d.issueContext
+96                  << "contextKind:" << d.issueContextKind
+97                  << "hasFixits:" << d.hasFixits
+98                  << "explainingSteps:" << d.explainingSteps.size()
+99                  << "location:" << d.location
+100                  << "description:" << d.description
+101                  ;
+102 }
+103 
+104 void ClangToolsDiagnosticModel::addDiagnostics(const QList<Diagnostic> &diagnostics)
+105 {
+106     const auto onFixitStatusChanged = [this](FixitStatus newStatus) {
+107         if (newStatus == FixitStatus::Scheduled)
+108             ++m_fixItsToApplyCount;
+109         else
+110             --m_fixItsToApplyCount;
+111         emit fixItsToApplyCountChanged(m_fixItsToApplyCount);
+112     };
+113 
+114     for (const Diagnostic &d : diagnostics) {
+115         // Check for duplicates
+116         const int previousItemCount = m_diagnostics.count();
+117         m_diagnostics.insert(d);
+118         if (m_diagnostics.count() == previousItemCount) {
+119             qCDebug(LOG) << "Not adding duplicate diagnostic:" << d;
+120             continue;
+121         }
+122 
+123         // Create file path item if necessary
+124         const QString filePath = d.location.filePath;
+125         FilePathItem *&filePathItem = m_filePathToItem[filePath];
+126         if (!filePathItem) {
+127             filePathItem = new FilePathItem(filePath);
+128             rootItem()->appendChild(filePathItem);
+129 
+130             addWatchedPath(d.location.filePath);
+131         }
+132 
+133         // Add to file path item
+134         qCDebug(LOG) << "Adding diagnostic:" << d;
+135         filePathItem->appendChild(new DiagnosticItem(d, onFixitStatusChanged, this));
+136     }
+137 }
+138 
+139 QSet<Diagnostic> ClangToolsDiagnosticModel::diagnostics() const
+140 {
+141     return m_diagnostics;
+142 }
+143 
+144 void ClangToolsDiagnosticModel::clear()
+145 {
+146     m_filePathToItem.clear();
+147     m_diagnostics.clear();
+148     clearAndSetupCache();
+149     Utils::TreeModel<>::clear();
+150 }
+151 
+152 void ClangToolsDiagnosticModel::updateItems(const DiagnosticItem *changedItem)
+153 {
+154     for (auto item : stepsToItemsCache[changedItem->diagnostic().explainingSteps]) {
+155         if (item != changedItem)
+156             item->setFixItStatus(changedItem->fixItStatus());
+157     }
+158 }
+159 
+160 void ClangToolsDiagnosticModel::connectFileWatcher()
+161 {
+162     connect(m_filesWatcher.get(),
+163             &QFileSystemWatcher::fileChanged,
+164             this,
+165             &ClangToolsDiagnosticModel::onFileChanged);
+166 }
+167 
+168 void ClangToolsDiagnosticModel::clearAndSetupCache()
+169 {
+170     m_filesWatcher = std::make_unique<QFileSystemWatcher>();
+171     connectFileWatcher();
+172     stepsToItemsCache.clear();
+173 }
+174 
+175 void ClangToolsDiagnosticModel::onFileChanged(const QString &path)
+176 {
+177     rootItem()->forChildrenAtLevel(2, [&](Utils::TreeItem *item){
+178         auto diagnosticItem = static_cast<DiagnosticItem *>(item);
+179         if (diagnosticItem->diagnostic().location.filePath == path)
+180             diagnosticItem->setFixItStatus(FixitStatus::Invalidated);
+181     });
+182     removeWatchedPath(path);
+183 }
+184 
+185 void ClangToolsDiagnosticModel::removeWatchedPath(const QString &path)
+186 {
+187     m_filesWatcher->removePath(path);
+188 }
+189 
+190 void ClangToolsDiagnosticModel::addWatchedPath(const QString &path)
+191 {
+192     m_filesWatcher->addPath(path);
+193 }
+194 
+195 static QString fixitStatus(FixitStatus status)
+196 {
+197     switch (status) {
+198     case FixitStatus::NotAvailable:
+199         return ClangToolsDiagnosticModel::tr("No Fixits");
+200     case FixitStatus::NotScheduled:
+201         return ClangToolsDiagnosticModel::tr("Not Scheduled");
+202     case FixitStatus::Invalidated:
+203         return ClangToolsDiagnosticModel::tr("Invalidated");
+204     case FixitStatus::Scheduled:
+205         return ClangToolsDiagnosticModel::tr("Scheduled");
+206     case FixitStatus::FailedToApply:
+207         return ClangToolsDiagnosticModel::tr("Failed to Apply");
+208     case FixitStatus::Applied:
+209         return ClangToolsDiagnosticModel::tr("Applied");
+210     }
+211     return QString();
+212 }
+213 
+214 static QString createDiagnosticToolTipString(const Diagnostic &diagnostic, FixitStatus fixItStatus)
+215 {
+216     using StringPair = QPair<QString, QString>;
+217     QList<StringPair> lines;
+218 
+219     if (!diagnostic.category.isEmpty()) {
+220         lines << qMakePair(
+221                      QCoreApplication::translate("ClangTools::Diagnostic", "Category:"),
+222                      diagnostic.category.toHtmlEscaped());
+223     }
+224 
+225     if (!diagnostic.type.isEmpty()) {
+226         lines << qMakePair(
+227                      QCoreApplication::translate("ClangTools::Diagnostic", "Type:"),
+228                      diagnostic.type.toHtmlEscaped());
+229     }
+230 
+231     if (!diagnostic.description.isEmpty()) {
+232         lines << qMakePair(
+233                      QCoreApplication::translate("ClangTools::Diagnostic", "Description:"),
+234                      diagnostic.description.toHtmlEscaped());
+235     }
+236 
+237     if (!diagnostic.issueContext.isEmpty() && !diagnostic.issueContextKind.isEmpty()) {
+238         lines << qMakePair(
+239                      QCoreApplication::translate("ClangTools::Diagnostic", "Context:"),
+240                      diagnostic.issueContextKind.toHtmlEscaped() + QLatin1Char(' ')
+241                      + diagnostic.issueContext.toHtmlEscaped());
+242     }
+243 
+244     lines << qMakePair(
+245         QCoreApplication::translate("ClangTools::Diagnostic", "Location:"),
+246                 createFullLocationString(diagnostic.location));
+247 
+248     lines << qMakePair(
+249         QCoreApplication::translate("ClangTools::Diagnostic", "Fixit Status:"),
+250         fixitStatus(fixItStatus));
+251 
+252     QString html = QLatin1String("<html>"
+253                    "<head>"
+254                    "<style>dt { font-weight:bold; } dd { font-family: monospace; }</style>\n"
+255                    "<body><dl>");
+256 
+257     foreach (const StringPair &pair, lines) {
+258         html += QLatin1String("<dt>");
+259         html += pair.first;
+260         html += QLatin1String("</dt><dd>");
+261         html += pair.second;
+262         html += QLatin1String("</dd>\n");
+263     }
+264     html += QLatin1String("</dl></body></html>");
+265     return html;
+266 }
+267 
+268 static QString createExplainingStepToolTipString(const ExplainingStep &step)
+269 {
+270     if (step.message == step.extendedMessage)
+271         return createFullLocationString(step.location);
+272 
+273     using StringPair = QPair<QString, QString>;
+274     QList<StringPair> lines;
+275 
+276     if (!step.message.isEmpty()) {
+277         lines << qMakePair(
+278             QCoreApplication::translate("ClangTools::ExplainingStep", "Message:"),
+279                 step.message.toHtmlEscaped());
+280     }
+281     if (!step.extendedMessage.isEmpty()) {
+282         lines << qMakePair(
+283             QCoreApplication::translate("ClangTools::ExplainingStep", "Extended message:"),
+284                 step.extendedMessage.toHtmlEscaped());
+285     }
+286 
+287     lines << qMakePair(
+288         QCoreApplication::translate("ClangTools::ExplainingStep", "Location:"),
+289                 createFullLocationString(step.location));
+290 
+291     QString html = QLatin1String("<html>"
+292                    "<head>"
+293                    "<style>dt { font-weight:bold; } dd { font-family: monospace; }</style>\n"
+294                    "<body><dl>");
+295 
+296     foreach (const StringPair &pair, lines) {
+297         html += QLatin1String("<dt>");
+298         html += pair.first;
+299         html += QLatin1String("</dt><dd>");
+300         html += pair.second;
+301         html += QLatin1String("</dd>\n");
+302     }
+303     html += QLatin1String("</dl></body></html>");
+304     return html;
+305 }
+306 
+307 static QString createLocationString(const Debugger::DiagnosticLocation &location)
+308 {
+309     const QString filePath = location.filePath;
+310     const QString lineNumber = QString::number(location.line);
+311     const QString fileAndLine = filePath + QLatin1Char(':') + lineNumber;
+312     return QLatin1String("in ") + fileAndLine;
+313 }
+314 
+315 static QString createExplainingStepNumberString(int number)
+316 {
+317     const int fieldWidth = 2;
+318     return QString::fromLatin1("%1:").arg(number, fieldWidth);
+319 }
+320 
+321 static QString createExplainingStepString(const ExplainingStep &explainingStep, int number)
+322 {
+323     return createExplainingStepNumberString(number)
+324             + QLatin1Char(' ')
+325             + explainingStep.message
+326             + QLatin1Char(' ')
+327             + createLocationString(explainingStep.location);
+328 }
+329 
+330 
+331 static QString lineColumnString(const Debugger::DiagnosticLocation &location)
+332 {
+333     return QString("%1:%2").arg(QString::number(location.line), QString::number(location.column));
+334 }
+335 
+336 static QString fullText(const Diagnostic &diagnostic)
+337 {
+338     QString text = diagnostic.location.filePath + QLatin1Char(':');
+339     text += lineColumnString(diagnostic.location) + QLatin1String(": ");
+340     if (!diagnostic.category.isEmpty())
+341         text += diagnostic.category + QLatin1String(": ");
+342     text += diagnostic.type;
+343     if (diagnostic.type != diagnostic.description)
+344         text += QLatin1String(": ") + diagnostic.description;
+345     text += QLatin1Char('\n');
+346 
+347     // Explaining steps.
+348     int explainingStepNumber = 1;
+349     foreach (const ExplainingStep &explainingStep, diagnostic.explainingSteps) {
+350         text += createExplainingStepString(explainingStep, explainingStepNumber++)
+351                 + QLatin1Char('\n');
+352     }
+353 
+354     text.chop(1); // Trailing newline.
+355     return text;
+356 }
+357 
+358 DiagnosticItem::DiagnosticItem(const Diagnostic &diag,
+359                                const OnFixitStatusChanged &onFixitStatusChanged,
+360                                ClangToolsDiagnosticModel *parent)
+361     : m_diagnostic(diag)
+362     , m_onFixitStatusChanged(onFixitStatusChanged)
+363     , m_parentModel(parent)
+364 {
+365     if (diag.hasFixits)
+366         m_fixitStatus = FixitStatus::NotScheduled;
+367 
+368     // Don't show explaining steps if they add no information.
+369     if (diag.explainingSteps.count() == 1) {
+370         const ExplainingStep &step = diag.explainingSteps.first();
+371         if (step.message == diag.description && step.location == diag.location)
+372             return;
+373     }
+374 
+375     if (!diag.explainingSteps.isEmpty())
+376         m_parentModel->stepsToItemsCache[diag.explainingSteps].push_back(this);
+377 
+378     for (int i = 0; i < diag.explainingSteps.size(); ++i )
+379         appendChild(new ExplainingStepItem(diag.explainingSteps[i], i));
+380 }
+381 
+382 DiagnosticItem::~DiagnosticItem()
+383 {
+384     setFixitOperations(ReplacementOperations());
+385 }
+386 
+387 Qt::ItemFlags DiagnosticItem::flags(int column) const
+388 {
+389     const Qt::ItemFlags itemFlags = TreeItem::flags(column);
+390     if (column == DiagnosticView::DiagnosticColumn)
+391         return itemFlags | Qt::ItemIsUserCheckable;
+392     return itemFlags;
+393 }
+394 
+395 static QVariant iconData(const QString &type)
+396 {
+397     if (type == "warning")
+398         return Utils::Icons::CODEMODEL_WARNING.icon();
+399     if (type == "error" || type == "fatal")
+400         return Utils::Icons::CODEMODEL_ERROR.icon();
+401     if (type == "note")
+402         return Utils::Icons::INFO.icon();
+403     if (type == "fix-it")
+404         return Utils::Icons::CODEMODEL_FIXIT.icon();
+405     return QVariant();
+406 }
+407 
+408 QVariant DiagnosticItem::data(int column, int role) const
+409 {
+410     if (column == DiagnosticView::DiagnosticColumn) {
+411         switch (role) {
+412         case Debugger::DetailedErrorView::LocationRole:
+413             return QVariant::fromValue(m_diagnostic.location);
+414         case Debugger::DetailedErrorView::FullTextRole:
+415             return fullText(m_diagnostic);
+416         case ClangToolsDiagnosticModel::DiagnosticRole:
+417             return QVariant::fromValue(m_diagnostic);
+418         case ClangToolsDiagnosticModel::TextRole:
+419             return m_diagnostic.description;
+420         case ClangToolsDiagnosticModel::CheckBoxEnabledRole:
+421             switch (m_fixitStatus) {
+422             case FixitStatus::NotAvailable:
+423             case FixitStatus::Applied:
+424             case FixitStatus::FailedToApply:
+425             case FixitStatus::Invalidated:
+426                 return false;
+427             case FixitStatus::Scheduled:
+428             case FixitStatus::NotScheduled:
+429                 return true;
+430             }
+431         case Qt::CheckStateRole: {
+432             switch (m_fixitStatus) {
+433             case FixitStatus::NotAvailable:
+434             case FixitStatus::Invalidated:
+435             case FixitStatus::Applied:
+436             case FixitStatus::FailedToApply:
+437             case FixitStatus::NotScheduled:
+438                 return Qt::Unchecked;
+439             case FixitStatus::Scheduled:
+440                 return Qt::Checked;
+441             }
+442         }
+443         case Qt::DisplayRole:
+444             return QString("%1: %2").arg(lineColumnString(m_diagnostic.location),
+445                                          m_diagnostic.description);
+446         case Qt::ToolTipRole:
+447             return createDiagnosticToolTipString(m_diagnostic, m_fixitStatus);
+448         case Qt::DecorationRole:
+449             return iconData(m_diagnostic.type);
+450         default:
+451             return QVariant();
+452         }
+453     }
+454 
+455     return QVariant();
+456 }
+457 
+458 bool DiagnosticItem::setData(int column, const QVariant &data, int role)
+459 {
+460     if (column == DiagnosticView::DiagnosticColumn && role == Qt::CheckStateRole) {
+461         if (m_fixitStatus != FixitStatus::Scheduled && m_fixitStatus != FixitStatus::NotScheduled)
+462             return false;
+463 
+464         const FixitStatus newStatus = data.value<Qt::CheckState>() == Qt::Checked
+465                                           ? FixitStatus::Scheduled
+466                                           : FixitStatus::NotScheduled;
+467 
+468         setFixItStatus(newStatus);
+469         m_parentModel->updateItems(this);
+470         return true;
+471     }
+472 
+473     return Utils::TreeItem::setData(column, data, role);
+474 }
+475 
+476 void DiagnosticItem::setFixItStatus(const FixitStatus &status)
+477 {
+478     const FixitStatus oldStatus = m_fixitStatus;
+479     m_fixitStatus = status;
+480     update();
+481     if (m_onFixitStatusChanged && status != oldStatus)
+482         m_onFixitStatusChanged(status);
+483 }
+484 
+485 void DiagnosticItem::setFixitOperations(const ReplacementOperations &replacements)
+486 {
+487     qDeleteAll(m_fixitOperations);
+488     m_fixitOperations = replacements;
+489 }
+490 
+491 bool DiagnosticItem::hasNewFixIts() const
+492 {
+493     if (m_diagnostic.explainingSteps.empty())
+494         return false;
+495 
+496     return m_parentModel->stepsToItemsCache[m_diagnostic.explainingSteps].front() == this;
+497 }
+498 
+499 ExplainingStepItem::ExplainingStepItem(const ExplainingStep &step, int index)
+500     : m_step(step)
+501     , m_index(index)
+502 {}
+503 
+504 static QString rangeString(const QVector<Debugger::DiagnosticLocation> &ranges)
+505 {
+506     return QString("%1-%2").arg(lineColumnString(ranges[0]), lineColumnString(ranges[1]));
+507 }
+508 
+509 QVariant ExplainingStepItem::data(int column, int role) const
+510 {
+511     if (column == DiagnosticView::DiagnosticColumn) {
+512         // DiagnosticColumn
+513         switch (role) {
+514         case Debugger::DetailedErrorView::LocationRole:
+515             return QVariant::fromValue(m_step.location);
+516         case Debugger::DetailedErrorView::FullTextRole: {
+517             return QString("%1:%2: %3")
+518                 .arg(m_step.location.filePath, lineColumnString(m_step.location), m_step.message);
+519         }
+520         case ClangToolsDiagnosticModel::TextRole:
+521             return m_step.message;
+522         case ClangToolsDiagnosticModel::DiagnosticRole:
+523             return QVariant::fromValue(static_cast<DiagnosticItem *>(parent())->diagnostic());
+524         case Qt::DisplayRole: {
+525             const QString mainFilePath = static_cast<DiagnosticItem *>(parent())->diagnostic().location.filePath;
+526             const QString locationString
+527                 = m_step.location.filePath == mainFilePath
+528                       ? lineColumnString(m_step.location)
+529                       : QString("%1:%2").arg(QFileInfo(m_step.location.filePath).fileName(),
+530                                              lineColumnString(m_step.location));
+531 
+532             if (m_step.isFixIt) {
+533                 if (m_step.ranges[0] == m_step.ranges[1]) {
+534                     return QString("%1: Insertion of \"%2\".")
+535                         .arg(locationString, m_step.message);
+536                 }
+537                 if (m_step.message.isEmpty()) {
+538                     return QString("%1: Removal of %2.")
+539                         .arg(locationString, rangeString(m_step.ranges));
+540                 }
+541                 return QString("%1: Replacement of %2 with: \"%3\".")
+542                     .arg(locationString,
+543                          rangeString(m_step.ranges),
+544                          m_step.message);
+545             }
+546             return QString("%1: %2").arg(locationString, m_step.message);
+547         }
+548         case Qt::ToolTipRole:
+549             return createExplainingStepToolTipString(m_step);
+550         case Qt::DecorationRole:
+551             if (m_step.isFixIt)
+552                 return Utils::Icons::CODEMODEL_FIXIT.icon();
+553             return Utils::Icons::INFO.icon();
+554         default:
+555             return QVariant();
+556         }
+557     }
+558 
+559     return QVariant();
+560 }
+561 
+562 DiagnosticFilterModel::DiagnosticFilterModel(QObject *parent)
+563     : QSortFilterProxyModel(parent)
+564 {
+565     // So that when a user closes and re-opens a project and *then* clicks "Suppress",
+566     // we enter that information into the project settings.
+567     connect(ProjectExplorer::SessionManager::instance(),
+568             &ProjectExplorer::SessionManager::projectAdded, this,
+569             [this](ProjectExplorer::Project *project) {
+570                 if (!m_project && project->projectDirectory() == m_lastProjectDirectory)
+571                     setProject(project);
+572             });
+573 }
+574 
+575 void DiagnosticFilterModel::setProject(ProjectExplorer::Project *project)
+576 {
+577     QTC_ASSERT(project, return);
+578     if (m_project) {
+579         disconnect(ClangToolsProjectSettingsManager::getSettings(m_project),
+580                    &ClangToolsProjectSettings::suppressedDiagnosticsChanged, this,
+581                    &DiagnosticFilterModel::handleSuppressedDiagnosticsChanged);
+582     }
+583     m_project = project;
+584     m_lastProjectDirectory = m_project->projectDirectory();
+585     connect(ClangToolsProjectSettingsManager::getSettings(m_project),
+586             &ClangToolsProjectSettings::suppressedDiagnosticsChanged,
+587             this, &DiagnosticFilterModel::handleSuppressedDiagnosticsChanged);
+588     handleSuppressedDiagnosticsChanged();
+589 }
+590 
+591 void DiagnosticFilterModel::addSuppressedDiagnostic(
+592         const SuppressedDiagnostic &diag)
+593 {
+594     QTC_ASSERT(!m_project, return);
+595     m_suppressedDiagnostics << diag;
+596     invalidate();
+597 }
+598 
+599 void DiagnosticFilterModel::invalidateFilter()
+600 {
+601     QSortFilterProxyModel::invalidateFilter();
+602 }
+603 
+604 bool DiagnosticFilterModel::filterAcceptsRow(int sourceRow,
+605         const QModelIndex &sourceParent) const
+606 {
+607     auto model = static_cast<ClangToolsDiagnosticModel *>(sourceModel());
+608 
+609     // FilePathItem - hide if no diagnostics match
+610     if (!sourceParent.isValid()) {
+611         const QModelIndex filePathIndex = model->index(sourceRow, 0);
+612         const int rowCount = model->rowCount(filePathIndex);
+613         if (rowCount == 0)
+614             return true; // Children not yet added.
+615         for (int row = 0; row < rowCount; ++row) {
+616             if (filterAcceptsRow(row, filePathIndex))
+617                 return true;
+618         }
+619         return false;
+620     }
+621 
+622     // DiagnosticItem
+623     Utils::TreeItem *parentItem = model->itemForIndex(sourceParent);
+624     if (parentItem->level() == 1) {
+625         auto filePathItem = static_cast<FilePathItem *>(parentItem);
+626         auto diagnosticItem = static_cast<DiagnosticItem *>(filePathItem->childAt(sourceRow));
+627 
+628         // Is the diagnostic explicitly suppressed?
+629         const Diagnostic &diag = diagnosticItem->diagnostic();
+630         foreach (const SuppressedDiagnostic &d, m_suppressedDiagnostics) {
+631             if (d.description != diag.description)
+632                 continue;
+633             QString filePath = d.filePath.toString();
+634             QFileInfo fi(filePath);
+635             if (fi.isRelative())
+636                 filePath = m_lastProjectDirectory.toString() + QLatin1Char('/') + filePath;
+637             if (filePath == diag.location.filePath)
+638                 return false;
+639         }
+640 
+641         // Does the diagnostic match the filter?
+642         return diag.description.contains(filterRegExp());
+643     }
+644 
+645     return true; // ExplainingStepItem
+646 }
+647 
+648 bool DiagnosticFilterModel::lessThan(const QModelIndex &l, const QModelIndex &r) const
+649 {
+650     auto model = static_cast<ClangToolsDiagnosticModel *>(sourceModel());
+651     Utils::TreeItem *itemLeft = model->itemForIndex(l);
+652     const bool isComparingDiagnostics = itemLeft->level() > 1;
+653 
+654     if (sortColumn() == Debugger::DetailedErrorView::DiagnosticColumn && isComparingDiagnostics) {
+655         bool result = false;
+656         if (itemLeft->level() == 2) {
+657             using Debugger::DiagnosticLocation;
+658             const int role = Debugger::DetailedErrorView::LocationRole;
+659 
+660             const auto leftLoc = sourceModel()->data(l, role).value<DiagnosticLocation>();
+661             const auto leftText
+662                 = sourceModel()->data(l, ClangToolsDiagnosticModel::TextRole).toString();
+663 
+664             const auto rightLoc = sourceModel()->data(r, role).value<DiagnosticLocation>();
+665             const auto rightText
+666                 = sourceModel()->data(r, ClangToolsDiagnosticModel::TextRole).toString();
+667 
+668             result = std::tie(leftLoc.line, leftLoc.column, leftText)
+669                      < std::tie(rightLoc.line, rightLoc.column, rightText);
+670         } else if (itemLeft->level() == 3) {
+671             const auto left = static_cast<ExplainingStepItem *>(itemLeft);
+672             const auto right = static_cast<ExplainingStepItem *>(model->itemForIndex(r));
+673             result = left->index() < right->index();
+674         } else {
+675             QTC_CHECK(false && "Unexpected item");
+676         }
+677 
+678         if (sortOrder() == Qt::DescendingOrder)
+679             return !result; // Do not change the order of these item as this might be confusing.
+680         return result;
+681     }
+682 
+683     // FilePathItem
+684     return QSortFilterProxyModel::lessThan(l, r);
+685 }
+686 
+687 void DiagnosticFilterModel::handleSuppressedDiagnosticsChanged()
+688 {
+689     QTC_ASSERT(m_project, return);
+690     m_suppressedDiagnostics
+691             = ClangToolsProjectSettingsManager::getSettings(m_project)->suppressedDiagnostics();
+692     invalidate();
+693 }
+694 
+695 } // namespace Internal
+696 } // namespace ClangTools

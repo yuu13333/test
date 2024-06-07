@@ -1,0 +1,1026 @@
+Based on the given code from a commit, please generate supplementary code files according to the commit message.
+####commit message
+Delay HA router transition from "backup" to "master"
+
+As described in the bug, when a HA router transitions from "master" to
+"backup", "keepalived" processes will set the virtual IP in all other
+HA routers. Each HA router will then advert it and "keepalived" will
+decide, according to a trivial algorithm (higher interface IP), which
+one should be "master". At this point, the other "keepalived" processes
+running in the other servers, will remove the HA router virtual IP
+assigned an instant before
+
+To avoid transitioning some routers form "backup" to "master" and then
+to "backup" in a very short period, this patch delays the "backup" to
+"master" transition, waiting for a possible new "backup" state. If
+during the waiting period (set to the HA VRRP advert time, 2 seconds
+default) to set the HA state to "master", the L3 agent receives a new
+"backup" HA state, the L3 agent does nothing.
+
+Closes-Bug: #1837635
+
+Change-Id: I70037da9cdd0f8448e0af8dd96b4e3f5de5728ad
+
+####code 
+1 # Copyright 2012 VMware, Inc.  All rights reserved.
+2 #
+3 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
+4 #    not use this file except in compliance with the License. You may obtain
+5 #    a copy of the License at
+6 #
+7 #         http://www.apache.org/licenses/LICENSE-2.0
+8 #
+9 #    Unless required by applicable law or agreed to in writing, software
+10 #    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+11 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+12 #    License for the specific language governing permissions and limitations
+13 #    under the License.
+14 #
+15 
+16 import eventlet
+17 import netaddr
+18 from neutron_lib.agent import constants as agent_consts
+19 from neutron_lib.agent import topics
+20 from neutron_lib.callbacks import events
+21 from neutron_lib.callbacks import registry
+22 from neutron_lib.callbacks import resources
+23 from neutron_lib import constants as lib_const
+24 from neutron_lib import context as n_context
+25 from neutron_lib.exceptions import l3 as l3_exc
+26 from neutron_lib import rpc as n_rpc
+27 from oslo_concurrency import lockutils
+28 from oslo_config import cfg
+29 from oslo_context import context as common_context
+30 from oslo_log import log as logging
+31 import oslo_messaging
+32 from oslo_serialization import jsonutils
+33 from oslo_service import loopingcall
+34 from oslo_service import periodic_task
+35 from oslo_utils import excutils
+36 from oslo_utils import timeutils
+37 from osprofiler import profiler
+38 
+39 from neutron.agent.common import resource_processing_queue as queue
+40 from neutron.agent.common import utils as common_utils
+41 from neutron.agent.l3 import dvr
+42 from neutron.agent.l3 import dvr_edge_ha_router
+43 from neutron.agent.l3 import dvr_edge_router as dvr_router
+44 from neutron.agent.l3 import dvr_local_router
+45 from neutron.agent.l3 import ha
+46 from neutron.agent.l3 import ha_router
+47 from neutron.agent.l3 import l3_agent_extension_api as l3_ext_api
+48 from neutron.agent.l3 import l3_agent_extensions_manager as l3_ext_manager
+49 from neutron.agent.l3 import legacy_router
+50 from neutron.agent.l3 import namespace_manager
+51 from neutron.agent.linux import external_process
+52 from neutron.agent.linux import pd
+53 from neutron.agent.linux import utils as linux_utils
+54 from neutron.agent.metadata import driver as metadata_driver
+55 from neutron.agent import rpc as agent_rpc
+56 from neutron.common import ipv6_utils
+57 from neutron.common import utils
+58 from neutron import manager
+59 
+60 LOG = logging.getLogger(__name__)
+61 
+62 # Number of routers to fetch from server at a time on resync.
+63 # Needed to reduce load on server side and to speed up resync on agent side.
+64 SYNC_ROUTERS_MAX_CHUNK_SIZE = 256
+65 SYNC_ROUTERS_MIN_CHUNK_SIZE = 32
+66 
+67 # Priorities - lower value is higher priority
+68 PRIORITY_RELATED_ROUTER = 0
+69 PRIORITY_RPC = 1
+70 PRIORITY_SYNC_ROUTERS_TASK = 2
+71 PRIORITY_PD_UPDATE = 3
+72 
+73 # Actions
+74 DELETE_ROUTER = 1
+75 DELETE_RELATED_ROUTER = 2
+76 ADD_UPDATE_ROUTER = 3
+77 ADD_UPDATE_RELATED_ROUTER = 4
+78 PD_UPDATE = 5
+79 
+80 RELATED_ACTION_MAP = {DELETE_ROUTER: DELETE_RELATED_ROUTER,
+81                       ADD_UPDATE_ROUTER: ADD_UPDATE_RELATED_ROUTER}
+82 
+83 ROUTER_PROCESS_GREENLET_MAX = 32
+84 ROUTER_PROCESS_GREENLET_MIN = 8
+85 
+86 
+87 def log_verbose_exc(message, router_payload):
+88     LOG.exception(message)
+89     LOG.debug("Payload:\n%s",
+90               utils.DelayedStringRenderer(jsonutils.dumps,
+91                                           router_payload, indent=5))
+92 
+93 
+94 class L3PluginApi(object):
+95     """Agent side of the l3 agent RPC API.
+96 
+97     API version history:
+98         1.0 - Initial version.
+99         1.1 - Floating IP operational status updates
+100         1.2 - DVR support: new L3 plugin methods added.
+101               - get_ports_by_subnet
+102               - get_agent_gateway_port
+103               Needed by the agent when operating in DVR/DVR_SNAT mode
+104         1.3 - Get the list of activated services
+105         1.4 - Added L3 HA update_router_state. This method was reworked in
+106               to update_ha_routers_states
+107         1.5 - Added update_ha_routers_states
+108         1.6 - Added process_prefix_update
+109         1.7 - DVR support: new L3 plugin methods added.
+110               - delete_agent_gateway_port
+111         1.8 - Added address scope information
+112         1.9 - Added get_router_ids
+113         1.10 Added update_all_ha_network_port_statuses
+114         1.11 Added get_host_ha_router_count
+115     """
+116 
+117     def __init__(self, topic, host):
+118         self.host = host
+119         target = oslo_messaging.Target(topic=topic, version='1.0')
+120         self.client = n_rpc.get_client(target)
+121 
+122     @utils.timecost
+123     def get_routers(self, context, router_ids=None):
+124         """Make a remote process call to retrieve the sync data for routers."""
+125         cctxt = self.client.prepare()
+126         return cctxt.call(context, 'sync_routers', host=self.host,
+127                           router_ids=router_ids)
+128 
+129     @utils.timecost
+130     def update_all_ha_network_port_statuses(self, context):
+131         """Make a remote process call to update HA network port status."""
+132         cctxt = self.client.prepare(version='1.10')
+133         return cctxt.call(context, 'update_all_ha_network_port_statuses',
+134                           host=self.host)
+135 
+136     @utils.timecost
+137     def get_router_ids(self, context):
+138         """Make a remote process call to retrieve scheduled routers ids."""
+139         cctxt = self.client.prepare(version='1.9')
+140         return cctxt.call(context, 'get_router_ids', host=self.host)
+141 
+142     @utils.timecost
+143     def get_external_network_id(self, context):
+144         """Make a remote process call to retrieve the external network id.
+145 
+146         @raise oslo_messaging.RemoteError: with TooManyExternalNetworks as
+147                                            exc_type if there are more than one
+148                                            external network
+149         """
+150         cctxt = self.client.prepare()
+151         return cctxt.call(context, 'get_external_network_id', host=self.host)
+152 
+153     @utils.timecost
+154     def update_floatingip_statuses(self, context, router_id, fip_statuses):
+155         """Call the plugin update floating IPs's operational status."""
+156         cctxt = self.client.prepare(version='1.1')
+157         return cctxt.call(context, 'update_floatingip_statuses',
+158                           router_id=router_id, fip_statuses=fip_statuses)
+159 
+160     @utils.timecost
+161     def get_ports_by_subnet(self, context, subnet_id):
+162         """Retrieve ports by subnet id."""
+163         cctxt = self.client.prepare(version='1.2')
+164         return cctxt.call(context, 'get_ports_by_subnet', host=self.host,
+165                           subnet_id=subnet_id)
+166 
+167     @utils.timecost
+168     def get_agent_gateway_port(self, context, fip_net):
+169         """Get or create an agent_gateway_port."""
+170         cctxt = self.client.prepare(version='1.2')
+171         return cctxt.call(context, 'get_agent_gateway_port',
+172                           network_id=fip_net, host=self.host)
+173 
+174     @utils.timecost
+175     def get_service_plugin_list(self, context):
+176         """Make a call to get the list of activated services."""
+177         cctxt = self.client.prepare(version='1.3')
+178         return cctxt.call(context, 'get_service_plugin_list')
+179 
+180     @utils.timecost
+181     def update_ha_routers_states(self, context, states):
+182         """Update HA routers states."""
+183         cctxt = self.client.prepare(version='1.5')
+184         return cctxt.cast(context, 'update_ha_routers_states',
+185                           host=self.host, states=states)
+186 
+187     @utils.timecost
+188     def process_prefix_update(self, context, prefix_update):
+189         """Process prefix update whenever prefixes get changed."""
+190         cctxt = self.client.prepare(version='1.6')
+191         return cctxt.call(context, 'process_prefix_update',
+192                           subnets=prefix_update)
+193 
+194     @utils.timecost
+195     def delete_agent_gateway_port(self, context, fip_net):
+196         """Delete Floatingip_agent_gateway_port."""
+197         cctxt = self.client.prepare(version='1.7')
+198         return cctxt.call(context, 'delete_agent_gateway_port',
+199                           host=self.host, network_id=fip_net)
+200 
+201     @utils.timecost
+202     def get_host_ha_router_count(self, context):
+203         """Make a call to get the count of HA router."""
+204         cctxt = self.client.prepare(version='1.11')
+205         return cctxt.call(context, 'get_host_ha_router_count', host=self.host)
+206 
+207 
+208 class RouterFactory(object):
+209 
+210     def __init__(self):
+211         self._routers = {}
+212 
+213     def register(self, features, router_cls):
+214         """Register router class which implements BaseRouterInfo
+215 
+216         Features which is a list of strings converted to frozenset internally
+217         for key uniqueness.
+218 
+219         :param features: a list of strings of router's features
+220         :param router_cls: a router class which implements BaseRouterInfo
+221         """
+222         self._routers[frozenset(features)] = router_cls
+223 
+224     def create(self, features, **kwargs):
+225         """Create router instance with registered router class
+226 
+227         :param features: a list of strings of router's features
+228         :param kwargs: arguments for router class
+229         :returns: a router instance which implements BaseRouterInfo
+230         :raises: n_exc.RouterNotFoundInRouterFactory
+231         """
+232         try:
+233             router = self._routers[frozenset(features)]
+234             return router(**kwargs)
+235         except KeyError:
+236             exc = l3_exc.RouterNotFoundInRouterFactory(
+237                 router_id=kwargs['router_id'], features=features)
+238             LOG.exception(exc.msg)
+239             raise exc
+240 
+241 
+242 @profiler.trace_cls("l3-agent")
+243 class L3NATAgent(ha.AgentMixin,
+244                  dvr.AgentMixin,
+245                  manager.Manager):
+246     """Manager for L3NatAgent
+247 
+248         API version history:
+249         1.0 initial Version
+250         1.1 changed the type of the routers parameter
+251             to the routers_updated method.
+252             It was previously a list of routers in dict format.
+253             It is now a list of router IDs only.
+254             Per rpc versioning rules,  it is backwards compatible.
+255         1.2 - DVR support: new L3 agent methods added.
+256               - add_arp_entry
+257               - del_arp_entry
+258         1.3 - fipnamespace_delete_on_ext_net - to delete fipnamespace
+259               after the external network is removed
+260               Needed by the L3 service when dealing with DVR
+261         1.4 - support network_update to get MTU updates
+262     """
+263     target = oslo_messaging.Target(version='1.4')
+264 
+265     def __init__(self, host, conf=None):
+266         if conf:
+267             self.conf = conf
+268         else:
+269             self.conf = cfg.CONF
+270         self.router_info = {}
+271         self.router_factory = RouterFactory()
+272         self._register_router_cls(self.router_factory)
+273 
+274         self._check_config_params()
+275 
+276         self.process_monitor = external_process.ProcessMonitor(
+277             config=self.conf,
+278             resource_type='router')
+279 
+280         self.driver = common_utils.load_interface_driver(self.conf)
+281 
+282         self._context = n_context.get_admin_context_without_session()
+283         self.plugin_rpc = L3PluginApi(topics.L3PLUGIN, host)
+284         self.fullsync = True
+285         self.sync_routers_chunk_size = SYNC_ROUTERS_MAX_CHUNK_SIZE
+286 
+287         # Get the HA router count from Neutron Server
+288         # This is the first place where we contact neutron-server on startup
+289         # so retry in case its not ready to respond.
+290         while True:
+291             try:
+292                 self.ha_router_count = int(
+293                     self.plugin_rpc.get_host_ha_router_count(self.context))
+294             except oslo_messaging.MessagingTimeout as e:
+295                 LOG.warning('l3-agent cannot contact neutron server '
+296                             'to retrieve HA router count. '
+297                             'Check connectivity to neutron server. '
+298                             'Retrying... '
+299                             'Detailed message: %(msg)s.', {'msg': e})
+300                 continue
+301             break
+302         LOG.info("Agent HA routers count %s", self.ha_router_count)
+303 
+304         self.init_extension_manager(self.plugin_rpc)
+305 
+306         self.metadata_driver = None
+307         if self.conf.enable_metadata_proxy:
+308             self.metadata_driver = metadata_driver.MetadataDriver(self)
+309 
+310         self.namespaces_manager = namespace_manager.NamespaceManager(
+311             self.conf,
+312             self.driver,
+313             self.metadata_driver)
+314 
+315         # L3 agent router processing green pool
+316         self._pool_size = ROUTER_PROCESS_GREENLET_MIN
+317         self._pool = eventlet.GreenPool(size=self._pool_size)
+318         self._queue = queue.ResourceProcessingQueue()
+319         super(L3NATAgent, self).__init__(host=self.conf.host)
+320 
+321         self.target_ex_net_id = None
+322         self.use_ipv6 = ipv6_utils.is_enabled_and_bind_by_default()
+323 
+324         self.pd = pd.PrefixDelegation(self.context, self.process_monitor,
+325                                       self.driver,
+326                                       self.plugin_rpc.process_prefix_update,
+327                                       self.create_pd_router_update,
+328                                       self.conf)
+329 
+330         # Consume network updates to trigger router resync
+331         consumers = [[topics.NETWORK, topics.UPDATE]]
+332         agent_rpc.create_consumers([self], topics.AGENT, consumers)
+333 
+334         self._check_ha_router_process_status()
+335 
+336     def _check_ha_router_process_status(self):
+337         """Check HA router VRRP process status in network node.
+338 
+339         Check if the HA router HA routers VRRP (keepalived) process count
+340         and state change python monitor process count meet the expected
+341         quantity. If so, l3-agent will not call neutron to set all related
+342         HA port to down state, this can prevent some unexpected VRRP
+343         re-election. If not, a physical host may have down and just
+344         restarted, set HA network port status to DOWN.
+345         """
+346         if (self.conf.agent_mode not in [lib_const.L3_AGENT_MODE_DVR_SNAT,
+347                                          lib_const.L3_AGENT_MODE_LEGACY]):
+348             return
+349 
+350         if self.ha_router_count <= 0:
+351             return
+352 
+353         # HA routers VRRP (keepalived) process count
+354         vrrp_pcount = linux_utils.get_process_count_by_name("keepalived")
+355         LOG.debug("VRRP process count %s.", vrrp_pcount)
+356         # HA routers state change python monitor process count
+357         vrrp_st_pcount = linux_utils.get_process_count_by_name(
+358             "neutron-keepalived-state-change")
+359         LOG.debug("neutron-keepalived-state-change process count %s.",
+360                   vrrp_st_pcount)
+361 
+362         # Due to the process structure design of keepalived and the current
+363         # config of l3-ha router, it will run one main 'keepalived' process
+364         # and a child  'VRRP' process. So in the following check, we divided
+365         # number of processes by 2 to match the ha router count.
+366         if (not (vrrp_pcount / 2 >= self.ha_router_count and
+367                  vrrp_st_pcount >= self.ha_router_count)):
+368             LOG.debug("Call neutron server to set HA port to DOWN state.")
+369             try:
+370                 # We set HA network port status to DOWN to let l2 agent
+371                 # update it to ACTIVE after wiring. This allows us to spawn
+372                 # keepalived only when l2 agent finished wiring the port.
+373                 self.plugin_rpc.update_all_ha_network_port_statuses(
+374                     self.context)
+375             except Exception:
+376                 LOG.exception('update_all_ha_network_port_statuses failed')
+377 
+378     def _register_router_cls(self, factory):
+379         factory.register([], legacy_router.LegacyRouter)
+380         factory.register(['ha'], ha_router.HaRouter)
+381 
+382         if self.conf.agent_mode == lib_const.L3_AGENT_MODE_DVR_SNAT:
+383             factory.register(['distributed'],
+384                              dvr_router.DvrEdgeRouter)
+385             factory.register(['ha', 'distributed'],
+386                              dvr_edge_ha_router.DvrEdgeHaRouter)
+387         else:
+388             factory.register(['distributed'],
+389                              dvr_local_router.DvrLocalRouter)
+390             factory.register(['ha', 'distributed'],
+391                              dvr_local_router.DvrLocalRouter)
+392 
+393     def _check_config_params(self):
+394         """Check items in configuration files.
+395 
+396         Check for required and invalid configuration items.
+397         The actual values are not verified for correctness.
+398         """
+399         if not self.conf.interface_driver:
+400             msg = 'An interface driver must be specified'
+401             LOG.error(msg)
+402             raise SystemExit(1)
+403 
+404         if self.conf.ipv6_gateway:
+405             # ipv6_gateway configured. Check for valid v6 link-local address.
+406             try:
+407                 msg = ("%s used in config as ipv6_gateway is not a valid "
+408                        "IPv6 link-local address.")
+409                 ip_addr = netaddr.IPAddress(self.conf.ipv6_gateway)
+410                 if ip_addr.version != 6 or not ip_addr.is_link_local():
+411                     LOG.error(msg, self.conf.ipv6_gateway)
+412                     raise SystemExit(1)
+413             except netaddr.AddrFormatError:
+414                 LOG.error(msg, self.conf.ipv6_gateway)
+415                 raise SystemExit(1)
+416 
+417     def _fetch_external_net_id(self, force=False):
+418         """Find UUID of single external network for this agent."""
+419         if self.conf.gateway_external_network_id:
+420             return self.conf.gateway_external_network_id
+421 
+422         if not force and self.target_ex_net_id:
+423             return self.target_ex_net_id
+424 
+425         try:
+426             self.target_ex_net_id = self.plugin_rpc.get_external_network_id(
+427                 self.context)
+428             return self.target_ex_net_id
+429         except oslo_messaging.RemoteError as e:
+430             with excutils.save_and_reraise_exception() as ctx:
+431                 if e.exc_type == 'TooManyExternalNetworks':
+432                     # At this point we know gateway_external_network_id is not
+433                     # defined. Since there are more than one external network,
+434                     # we will handle all of them
+435                     ctx.reraise = False
+436 
+437     def _create_router(self, router_id, router):
+438         kwargs = {
+439             'agent': self,
+440             'router_id': router_id,
+441             'router': router,
+442             'use_ipv6': self.use_ipv6,
+443             'agent_conf': self.conf,
+444             'interface_driver': self.driver,
+445         }
+446 
+447         features = []
+448         if router.get('distributed'):
+449             features.append('distributed')
+450             kwargs['host'] = self.host
+451 
+452         if router.get('ha'):
+453             features.append('ha')
+454             kwargs['state_change_callback'] = self.enqueue_state_change
+455 
+456         if router.get('distributed') and router.get('ha'):
+457             # Case 1: If the router contains information about the HA interface
+458             # and if the requesting agent is a DVR_SNAT agent then go ahead
+459             # and create a HA router.
+460             # Case 2: If the router does not contain information about the HA
+461             # interface this means that this DVR+HA router needs to host only
+462             # the edge side of it, typically because it's landing on a node
+463             # that needs to provision a router namespace because of a DVR
+464             # service port (e.g. DHCP). So go ahead and create a regular DVR
+465             # edge router.
+466             if (not router.get(lib_const.HA_INTERFACE_KEY) or
+467                     self.conf.agent_mode != lib_const.L3_AGENT_MODE_DVR_SNAT):
+468                 features.remove('ha')
+469                 kwargs.pop('state_change_callback')
+470 
+471         return self.router_factory.create(features, **kwargs)
+472 
+473     @lockutils.synchronized('resize_greenpool')
+474     def _resize_process_pool(self):
+475         pool_size = max([ROUTER_PROCESS_GREENLET_MIN,
+476                          min([ROUTER_PROCESS_GREENLET_MAX,
+477                               len(self.router_info)])])
+478         if pool_size == self._pool_size:
+479             return
+480         LOG.info("Resizing router processing queue green pool size to: %d",
+481                  pool_size)
+482         self._pool.resize(pool_size)
+483         self._pool_size = pool_size
+484 
+485     def _router_added(self, router_id, router):
+486         ri = self._create_router(router_id, router)
+487         registry.notify(resources.ROUTER, events.BEFORE_CREATE,
+488                         self, router=ri)
+489 
+490         self.router_info[router_id] = ri
+491 
+492         # If initialize() fails, cleanup and retrigger complete sync
+493         try:
+494             ri.initialize(self.process_monitor)
+495         except Exception:
+496             with excutils.save_and_reraise_exception():
+497                 del self.router_info[router_id]
+498                 LOG.exception('Error while initializing router %s',
+499                               router_id)
+500                 self.namespaces_manager.ensure_router_cleanup(router_id)
+501                 try:
+502                     ri.delete()
+503                 except Exception:
+504                     LOG.exception('Error while deleting router %s',
+505                                   router_id)
+506 
+507         self._resize_process_pool()
+508 
+509     def _safe_router_removed(self, router_id):
+510         """Try to delete a router and return True if successful."""
+511         # The l3_ext_manager API expects a router dict, look it up
+512         ri = self.router_info.get(router_id)
+513 
+514         try:
+515             self._router_removed(ri, router_id)
+516             if ri:
+517                 self.l3_ext_manager.delete_router(self.context, ri.router)
+518         except Exception:
+519             LOG.exception('Error while deleting router %s', router_id)
+520             return False
+521 
+522         self._resize_process_pool()
+523         return True
+524 
+525     def _router_removed(self, ri, router_id):
+526         """Delete the router and stop the auxiliary processes
+527 
+528         This stops the auxiliary processes (keepalived, keepvalived-state-
+529         change, radvd, etc) and deletes the router ports and the namespace.
+530         The "router_info" cache is updated too at the beginning of the process,
+531         to avoid any other concurrent process to handle the router being
+532         deleted. If an exception is raised, the "router_info" cache is
+533         restored.
+534         """
+535         if ri is None:
+536             LOG.warning("Info for router %s was not found. "
+537                         "Performing router cleanup", router_id)
+538             self.namespaces_manager.ensure_router_cleanup(router_id)
+539             return
+540 
+541         registry.publish(resources.ROUTER, events.BEFORE_DELETE, self,
+542                          payload=events.DBEventPayload(
+543                              self.context, states=(ri,),
+544                              resource_id=router_id))
+545 
+546         del self.router_info[router_id]
+547         try:
+548             ri.delete()
+549         except Exception:
+550             with excutils.save_and_reraise_exception():
+551                 self.router_info[router_id] = ri
+552 
+553         registry.notify(resources.ROUTER, events.AFTER_DELETE, self, router=ri)
+554 
+555     def init_extension_manager(self, connection):
+556         l3_ext_manager.register_opts(self.conf)
+557         self.agent_api = l3_ext_api.L3AgentExtensionAPI(self.router_info,
+558                                                         self.router_factory)
+559         self.l3_ext_manager = (
+560             l3_ext_manager.L3AgentExtensionsManager(self.conf))
+561         self.l3_ext_manager.initialize(
+562             connection, lib_const.L3_AGENT_MODE,
+563             self.agent_api)
+564 
+565     def router_deleted(self, context, router_id):
+566         """Deal with router deletion RPC message."""
+567         LOG.debug('Got router deleted notification for %s', router_id)
+568         update = queue.ResourceUpdate(router_id,
+569                                       PRIORITY_RPC,
+570                                       action=DELETE_ROUTER)
+571         self._queue.add(update)
+572 
+573     def routers_updated(self, context, routers):
+574         """Deal with routers modification and creation RPC message."""
+575         LOG.debug('Got routers updated notification :%s', routers)
+576         if routers:
+577             # This is needed for backward compatibility
+578             if isinstance(routers[0], dict):
+579                 routers = [router['id'] for router in routers]
+580             for id in routers:
+581                 update = queue.ResourceUpdate(
+582                     id, PRIORITY_RPC, action=ADD_UPDATE_ROUTER)
+583                 self._queue.add(update)
+584 
+585     def router_removed_from_agent(self, context, payload):
+586         LOG.debug('Got router removed from agent :%r', payload)
+587         router_id = payload['router_id']
+588         update = queue.ResourceUpdate(router_id,
+589                                       PRIORITY_RPC,
+590                                       action=DELETE_ROUTER)
+591         self._queue.add(update)
+592 
+593     def router_added_to_agent(self, context, payload):
+594         LOG.debug('Got router added to agent :%r', payload)
+595         self.routers_updated(context, payload)
+596 
+597     def network_update(self, context, **kwargs):
+598         network_id = kwargs['network']['id']
+599         for ri in self.router_info.values():
+600             ports = list(ri.internal_ports)
+601             if ri.ex_gw_port:
+602                 ports.append(ri.ex_gw_port)
+603             port_belongs = lambda p: p['network_id'] == network_id
+604             if any(port_belongs(p) for p in ports):
+605                 update = queue.ResourceUpdate(
+606                     ri.router_id, PRIORITY_SYNC_ROUTERS_TASK)
+607                 self._resync_router(update)
+608 
+609     def _process_router_if_compatible(self, router):
+610         # Either ex_net_id or handle_internal_only_routers must be set
+611         ex_net_id = (router['external_gateway_info'] or {}).get('network_id')
+612         if not ex_net_id and not self.conf.handle_internal_only_routers:
+613             raise l3_exc.RouterNotCompatibleWithAgent(router_id=router['id'])
+614 
+615         # If target_ex_net_id and ex_net_id are set they must be equal
+616         target_ex_net_id = self._fetch_external_net_id()
+617         if (target_ex_net_id and ex_net_id and ex_net_id != target_ex_net_id):
+618             # Double check that our single external_net_id has not changed
+619             # by forcing a check by RPC.
+620             if ex_net_id != self._fetch_external_net_id(force=True):
+621                 raise l3_exc.RouterNotCompatibleWithAgent(
+622                     router_id=router['id'])
+623 
+624         if router['id'] not in self.router_info:
+625             self._process_added_router(router)
+626         else:
+627             self._process_updated_router(router)
+628 
+629     def _process_added_router(self, router):
+630         self._router_added(router['id'], router)
+631         ri = self.router_info[router['id']]
+632         ri.router = router
+633         ri.process()
+634         registry.notify(resources.ROUTER, events.AFTER_CREATE, self, router=ri)
+635         self.l3_ext_manager.add_router(self.context, router)
+636 
+637     def _process_updated_router(self, router):
+638         ri = self.router_info[router['id']]
+639         is_dvr_snat_agent = (self.conf.agent_mode ==
+640                              lib_const.L3_AGENT_MODE_DVR_SNAT)
+641         is_dvr_only_agent = (self.conf.agent_mode in
+642                              [lib_const.L3_AGENT_MODE_DVR,
+643                               lib_const.L3_AGENT_MODE_DVR_NO_EXTERNAL])
+644         old_router_ha_interface = ri.router.get(lib_const.HA_INTERFACE_KEY)
+645         current_router_ha_interface = router.get(lib_const.HA_INTERFACE_KEY)
+646         ha_interface_change = ((old_router_ha_interface is None and
+647                                 current_router_ha_interface is not None) or
+648                                (old_router_ha_interface is not None and
+649                                 current_router_ha_interface is None))
+650         is_dvr_ha_router = router.get('distributed') and router.get('ha')
+651 
+652         if is_dvr_snat_agent and is_dvr_ha_router and ha_interface_change:
+653             LOG.debug("Removing HA router %s, since it is not bound to "
+654                       "the current agent, and recreating regular DVR router "
+655                       "based on service port requirements.",
+656                       router['id'])
+657             if self._safe_router_removed(router['id']):
+658                 self._process_added_router(router)
+659         else:
+660             is_ha_router = getattr(ri, 'ha_state', False)
+661             # For HA routers check that DB state matches actual state
+662             if router.get('ha') and not is_dvr_only_agent and is_ha_router:
+663                 self.check_ha_state_for_router(
+664                     router['id'], router.get(lib_const.HA_ROUTER_STATE_KEY))
+665             ri.router = router
+666             registry.notify(resources.ROUTER, events.BEFORE_UPDATE,
+667                             self, router=ri)
+668             ri.process()
+669             registry.notify(
+670                 resources.ROUTER, events.AFTER_UPDATE, self, router=ri)
+671             self.l3_ext_manager.update_router(self.context, router)
+672 
+673     def _resync_router(self, router_update,
+674                        priority=PRIORITY_SYNC_ROUTERS_TASK):
+675         # Don't keep trying to resync if it's failing
+676         if router_update.hit_retry_limit():
+677             LOG.warning("Hit retry limit with router update for %s, action %s",
+678                         router_update.id, router_update.action)
+679             if router_update.action != DELETE_ROUTER:
+680                 LOG.debug("Deleting router %s", router_update.id)
+681                 self._safe_router_removed(router_update.id)
+682             return
+683         router_update.timestamp = timeutils.utcnow()
+684         router_update.priority = priority
+685         router_update.resource = None  # Force the agent to resync the router
+686         self._queue.add(router_update)
+687 
+688     def _process_router_update(self):
+689         for rp, update in self._queue.each_update_to_next_resource():
+690             LOG.info("Starting router update for %s, action %s, priority %s, "
+691                      "update_id %s. Wait time elapsed: %.3f",
+692                      update.id, update.action, update.priority,
+693                      update.update_id,
+694                      update.time_elapsed_since_create)
+695             if update.action == PD_UPDATE:
+696                 self.pd.process_prefix_update()
+697                 LOG.info("Finished a router update for %s IPv6 PD, "
+698                          "update_id. %s. Time elapsed: %.3f",
+699                          update.id, update.update_id,
+700                          update.time_elapsed_since_start)
+701                 continue
+702 
+703             routers = [update.resource] if update.resource else []
+704 
+705             not_delete_no_routers = (update.action != DELETE_ROUTER and
+706                                      not routers)
+707             related_action = update.action in (DELETE_RELATED_ROUTER,
+708                                                ADD_UPDATE_RELATED_ROUTER)
+709             if not_delete_no_routers or related_action:
+710                 try:
+711                     update.timestamp = timeutils.utcnow()
+712                     routers = self.plugin_rpc.get_routers(self.context,
+713                                                           [update.id])
+714                 except Exception:
+715                     msg = "Failed to fetch router information for '%s'"
+716                     LOG.exception(msg, update.id)
+717                     self._resync_router(update)
+718                     continue
+719 
+720                 # For a related action, verify the router is still hosted here,
+721                 # since it could have just been deleted and we don't want to
+722                 # add it back.
+723                 if related_action:
+724                     routers = [r for r in routers if r['id'] == update.id]
+725 
+726             if not routers:
+727                 removed = self._safe_router_removed(update.id)
+728                 if not removed:
+729                     self._resync_router(update)
+730                 else:
+731                     # need to update timestamp of removed router in case
+732                     # there are older events for the same router in the
+733                     # processing queue (like events from fullsync) in order to
+734                     # prevent deleted router re-creation
+735                     rp.fetched_and_processed(update.timestamp)
+736                 LOG.info("Finished a router update for %s, update_id %s. "
+737                          "Time elapsed: %.3f",
+738                          update.id, update.update_id,
+739                          update.time_elapsed_since_start)
+740                 continue
+741 
+742             if not self._process_routers_if_compatible(routers, update):
+743                 self._resync_router(update)
+744                 continue
+745 
+746             rp.fetched_and_processed(update.timestamp)
+747             LOG.info("Finished a router update for %s, update_id %s. "
+748                      "Time elapsed: %.3f",
+749                      update.id, update.update_id,
+750                      update.time_elapsed_since_start)
+751 
+752     def _process_routers_if_compatible(self, routers, update):
+753         process_result = True
+754         for router in routers:
+755             if router['id'] != update.id:
+756                 # Don't do the work here, instead create a new update and
+757                 # enqueue it, since there could be another thread working
+758                 # on it already and we don't want to race.
+759                 new_action = RELATED_ACTION_MAP.get(
+760                     update.action, ADD_UPDATE_RELATED_ROUTER)
+761                 new_update = queue.ResourceUpdate(
+762                     router['id'],
+763                     priority=PRIORITY_RELATED_ROUTER,
+764                     action=new_action)
+765                 self._queue.add(new_update)
+766                 LOG.debug('Queued a router update for %(router_id)s '
+767                           '(related router %(related_router_id)s). '
+768                           'Original event action %(action)s, '
+769                           'priority %(priority)s. '
+770                           'New event action %(new_action)s, '
+771                           'priority %(new_priority)s',
+772                           {'router_id': router['id'],
+773                            'related_router_id': update.id,
+774                            'action': update.action,
+775                            'priority': update.priority,
+776                            'new_action': new_update.action,
+777                            'new_priority': new_update.priority})
+778                 continue
+779 
+780             try:
+781                 self._process_router_if_compatible(router)
+782             except l3_exc.RouterNotCompatibleWithAgent as e:
+783                 log_verbose_exc(e.msg, router)
+784                 # Was the router previously handled by this agent?
+785                 if router['id'] in self.router_info:
+786                     LOG.error("Removing incompatible router '%s'",
+787                               router['id'])
+788                     self._safe_router_removed(router['id'])
+789             except Exception:
+790                 log_verbose_exc(
+791                     "Failed to process compatible router: %s" % update.id,
+792                     router)
+793                 process_result = False
+794         return process_result
+795 
+796     def _process_routers_loop(self):
+797         LOG.debug("Starting _process_routers_loop")
+798         while True:
+799             self._pool.spawn_n(self._process_router_update)
+800 
+801     # NOTE(kevinbenton): this is set to 1 second because the actual interval
+802     # is controlled by a FixedIntervalLoopingCall in neutron/service.py that
+803     # is responsible for task execution.
+804     @periodic_task.periodic_task(spacing=1, run_immediately=True)
+805     def periodic_sync_routers_task(self, context):
+806         if not self.fullsync:
+807             return
+808         LOG.debug("Starting fullsync periodic_sync_routers_task")
+809 
+810         # self.fullsync is True at this point. If an exception -- caught or
+811         # uncaught -- prevents setting it to False below then the next call
+812         # to periodic_sync_routers_task will re-enter this code and try again.
+813 
+814         # Context manager self.namespaces_manager captures a picture of
+815         # namespaces *before* fetch_and_sync_all_routers fetches the full list
+816         # of routers from the database.  This is important to correctly
+817         # identify stale ones.
+818 
+819         try:
+820             with self.namespaces_manager as ns_manager:
+821                 self.fetch_and_sync_all_routers(context, ns_manager)
+822         except l3_exc.AbortSyncRouters:
+823             self.fullsync = True
+824 
+825     def fetch_and_sync_all_routers(self, context, ns_manager):
+826         prev_router_ids = set(self.router_info)
+827         curr_router_ids = set()
+828         timestamp = timeutils.utcnow()
+829         router_ids = []
+830         chunk = []
+831         is_snat_agent = (self.conf.agent_mode ==
+832                          lib_const.L3_AGENT_MODE_DVR_SNAT)
+833         try:
+834             router_ids = self.plugin_rpc.get_router_ids(context)
+835             # fetch routers by chunks to reduce the load on server and to
+836             # start router processing earlier
+837             for i in range(0, len(router_ids), self.sync_routers_chunk_size):
+838                 chunk = router_ids[i:i + self.sync_routers_chunk_size]
+839                 routers = self.plugin_rpc.get_routers(context, chunk)
+840                 LOG.debug('Processing :%r', routers)
+841                 for r in routers:
+842                     curr_router_ids.add(r['id'])
+843                     ns_manager.keep_router(r['id'])
+844                     if r.get('distributed'):
+845                         # need to keep fip namespaces as well
+846                         ext_net_id = (r['external_gateway_info'] or {}).get(
+847                             'network_id')
+848                         if ext_net_id:
+849                             ns_manager.keep_ext_net(ext_net_id)
+850                         elif is_snat_agent and not r.get('ha'):
+851                             ns_manager.ensure_snat_cleanup(r['id'])
+852                     update = queue.ResourceUpdate(
+853                         r['id'],
+854                         PRIORITY_SYNC_ROUTERS_TASK,
+855                         resource=r,
+856                         action=ADD_UPDATE_ROUTER,
+857                         timestamp=timestamp)
+858                     self._queue.add(update)
+859         except oslo_messaging.MessagingTimeout:
+860             if self.sync_routers_chunk_size > SYNC_ROUTERS_MIN_CHUNK_SIZE:
+861                 self.sync_routers_chunk_size = max(
+862                     self.sync_routers_chunk_size / 2,
+863                     SYNC_ROUTERS_MIN_CHUNK_SIZE)
+864                 LOG.error('Server failed to return info for routers in '
+865                           'required time, decreasing chunk size to: %s',
+866                           self.sync_routers_chunk_size)
+867             else:
+868                 LOG.error('Server failed to return info for routers in '
+869                           'required time even with min chunk size: %s. '
+870                           'It might be under very high load or '
+871                           'just inoperable',
+872                           self.sync_routers_chunk_size)
+873             raise
+874         except oslo_messaging.MessagingException:
+875             failed_routers = chunk or router_ids
+876             LOG.exception("Failed synchronizing routers '%s' "
+877                           "due to RPC error", failed_routers)
+878             raise l3_exc.AbortSyncRouters()
+879 
+880         self.fullsync = False
+881         LOG.debug("periodic_sync_routers_task successfully completed")
+882         # adjust chunk size after successful sync
+883         if self.sync_routers_chunk_size < SYNC_ROUTERS_MAX_CHUNK_SIZE:
+884             self.sync_routers_chunk_size = min(
+885                 self.sync_routers_chunk_size + SYNC_ROUTERS_MIN_CHUNK_SIZE,
+886                 SYNC_ROUTERS_MAX_CHUNK_SIZE)
+887 
+888         # Delete routers that have disappeared since the last sync
+889         for router_id in prev_router_ids - curr_router_ids:
+890             ns_manager.keep_router(router_id)
+891             update = queue.ResourceUpdate(router_id,
+892                                           PRIORITY_SYNC_ROUTERS_TASK,
+893                                           timestamp=timestamp,
+894                                           action=DELETE_ROUTER)
+895             self._queue.add(update)
+896 
+897     @property
+898     def context(self):
+899         # generate a new request-id on each call to make server side tracking
+900         # of RPC calls easier.
+901         self._context.request_id = common_context.generate_request_id()
+902         return self._context
+903 
+904     def after_start(self):
+905         # Note: the FWaaS' vArmourL3NATAgent is a subclass of L3NATAgent. It
+906         # calls this method here. So Removing this after_start() would break
+907         # vArmourL3NATAgent. We need to find out whether vArmourL3NATAgent
+908         # can have L3NATAgentWithStateReport as its base class instead of
+909         # L3NATAgent.
+910         eventlet.spawn_n(self._process_routers_loop)
+911         LOG.info("L3 agent started")
+912 
+913     def create_pd_router_update(self):
+914         router_id = None
+915         update = queue.ResourceUpdate(router_id,
+916                                       PRIORITY_PD_UPDATE,
+917                                       timestamp=timeutils.utcnow(),
+918                                       action=PD_UPDATE)
+919         self._queue.add(update)
+920 
+921 
+922 class L3NATAgentWithStateReport(L3NATAgent):
+923 
+924     def __init__(self, host, conf=None):
+925         super(L3NATAgentWithStateReport, self).__init__(host=host, conf=conf)
+926         self.state_rpc = agent_rpc.PluginReportStateAPI(topics.REPORTS)
+927         self.failed_report_state = False
+928         self.agent_state = {
+929             'binary': 'neutron-l3-agent',
+930             'host': host,
+931             'availability_zone': self.conf.AGENT.availability_zone,
+932             'topic': topics.L3_AGENT,
+933             'configurations': {
+934                 'agent_mode': self.conf.agent_mode,
+935                 'handle_internal_only_routers':
+936                 self.conf.handle_internal_only_routers,
+937                 'gateway_external_network_id':
+938                 self.conf.gateway_external_network_id,
+939                 'interface_driver': self.conf.interface_driver,
+940                 'log_agent_heartbeats': self.conf.AGENT.log_agent_heartbeats},
+941             'start_flag': True,
+942             'agent_type': lib_const.AGENT_TYPE_L3}
+943         report_interval = self.conf.AGENT.report_interval
+944         if report_interval:
+945             self.heartbeat = loopingcall.FixedIntervalLoopingCall(
+946                 self._report_state)
+947             self.heartbeat.start(interval=report_interval)
+948 
+949     def _report_state(self):
+950         num_ex_gw_ports = 0
+951         num_interfaces = 0
+952         num_floating_ips = 0
+953         router_infos = self.router_info.values()
+954         num_routers = len(router_infos)
+955         for ri in router_infos:
+956             ex_gw_port = ri.get_ex_gw_port()
+957             if ex_gw_port:
+958                 num_ex_gw_ports += 1
+959             num_interfaces += len(ri.router.get(lib_const.INTERFACE_KEY,
+960                                                 []))
+961             num_floating_ips += len(ri.router.get(lib_const.FLOATINGIP_KEY,
+962                                                   []))
+963         configurations = self.agent_state['configurations']
+964         configurations['routers'] = num_routers
+965         configurations['ex_gw_ports'] = num_ex_gw_ports
+966         configurations['interfaces'] = num_interfaces
+967         configurations['floating_ips'] = num_floating_ips
+968         try:
+969             agent_status = self.state_rpc.report_state(self.context,
+970                                                        self.agent_state,
+971                                                        True)
+972             if agent_status == agent_consts.AGENT_REVIVED:
+973                 LOG.info('Agent has just been revived. '
+974                          'Doing a full sync.')
+975                 self.fullsync = True
+976             self.agent_state.pop('start_flag', None)
+977         except AttributeError:
+978             # This means the server does not support report_state
+979             LOG.warning("Neutron server does not support state report. "
+980                         "State report for this agent will be disabled.")
+981             self.heartbeat.stop()
+982             return
+983         except Exception:
+984             self.failed_report_state = True
+985             LOG.exception("Failed reporting state!")
+986             return
+987         if self.failed_report_state:
+988             self.failed_report_state = False
+989             LOG.info("Successfully reported state after a previous failure.")
+990 
+991     def after_start(self):
+992         eventlet.spawn_n(self._process_routers_loop)
+993         LOG.info("L3 agent started")
+994         # Do the report state before we do the first full sync.
+995         self._report_state()
+996 
+997         self.pd.after_start()
+998 
+999     def agent_updated(self, context, payload):
+1000         """Handle the agent_updated notification event."""
+1001         self.fullsync = True
+1002         LOG.info("agent_updated by server side %s!", payload)

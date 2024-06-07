@@ -1,0 +1,333 @@
+Please review the code below for security defects using the CWE (Common Weakness Enumeration) as a reference standard. If any are found, please describe the security defect in detail and indicate the corresponding line number of code and solution. If none are detected, state: 'No security defects are detected in the code'.
+
+1 # Copyright (c) 2018 OpenStack Foundation
+2 # All Rights Reserved.
+3 #
+4 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
+5 #    not use this file except in compliance with the License. You may obtain
+6 #    a copy of the License at
+7 #
+8 #         http://www.apache.org/licenses/LICENSE-2.0
+9 #
+10 #    Unless required by applicable law or agreed to in writing, software
+11 #    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+12 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+13 #    License for the specific language governing permissions and limitations
+14 #    under the License.
+15 
+16 import collections
+17 
+18 import functools
+19 
+20 import netaddr
+21 
+22 from neutron._i18n import _
+23 
+24 from neutron.api.rpc.callbacks import events as rpc_events
+25 from neutron.api.rpc.handlers import resources_rpc
+26 from neutron.db import _resource_extend as resource_extend
+27 from neutron.db import _utils as db_utils
+28 from neutron.db import api as db_api
+29 from neutron.db import db_base_plugin_common
+30 from neutron.extensions import floating_ip_port_forwarding as fip_pf
+31 from neutron.objects import base as base_obj
+32 from neutron.objects import port_forwarding as pf
+33 from neutron.objects import router
+34 from neutron.services.portforwarding.common import exceptions as pf_exc
+35 
+36 from neutron_lib.api.definitions import floating_ip_port_forwarding as apidef
+37 from neutron_lib.callbacks import registry
+38 from neutron_lib import constants as lib_conts
+39 from neutron_lib import exceptions as lib_exc
+40 from neutron_lib.exceptions import l3 as lib_l3_exc
+41 from neutron_lib.objects import exceptions as obj_exc
+42 from neutron_lib.plugins import constants
+43 from neutron_lib.plugins import directory
+44 
+45 
+46 def make_result_with_fields(f):
+47     @functools.wraps(f)
+48     def inner(*args, **kwargs):
+49         fields = kwargs.get('fields')
+50         result = f(*args, **kwargs)
+51         if fields is None:
+52             return result
+53         elif isinstance(result, list):
+54             return [db_utils.resource_fields(r, fields) for r in result]
+55         else:
+56             return db_utils.resource_fields(result, fields)
+57 
+58     return inner
+59 
+60 
+61 @resource_extend.has_resource_extenders
+62 @registry.has_registry_receivers
+63 class PortForwardingPlugin(fip_pf.PortForwardingPluginBase):
+64     """Implementation of the Neutron Port Forwarding Service Plugin.
+65 
+66     This class implements a Port Forwarding plugin.
+67     """
+68 
+69     supported_extension_aliases = ['floating-ip-port-forwarding']
+70 
+71     __native_pagination_support = True
+72     __native_sorting_support = True
+73 
+74     def __init__(self):
+75         super(PortForwardingPlugin, self).__init__()
+76         self.push_api = resources_rpc.ResourcesPushRpcApi()
+77         self.l3_plugin = directory.get_plugin(constants.L3)
+78         self.core_plugin = directory.get_plugin()
+79 
+80     def _get_subnet_check_valid_internal_ip(self, request_ip, exist_fixed_ips):
+81         for fixed_ip in exist_fixed_ips:
+82             if netaddr.IPNetwork(
+83                     fixed_ip['ip_address']) == netaddr.IPNetwork(request_ip):
+84                 return fixed_ip['subnet_id']
+85 
+86     def _find_a_router_for_fippf(self, context, pf_dict, fip_obj):
+87         internal_port_id = pf_dict['internal_port_id']
+88         internal_port = self.core_plugin.get_port(context, internal_port_id)
+89         v4_fixed_ips = [fixed_ip for fixed_ip in internal_port['fixed_ips']
+90                         if (netaddr.IPNetwork(fixed_ip['ip_address']
+91                                               ).version ==
+92                             lib_conts.IP_VERSION_4)]
+93         # Get the internal ip address, if not specified, choose the first ipv4
+94         # address.
+95         internal_ip_address = pf_dict.get('internal_ip_address')
+96         if not internal_ip_address:
+97             internal_ip_address = v4_fixed_ips[0]['ip_address']
+98             pf_dict['internal_ip_address'] = internal_ip_address
+99 
+100         # check the matched fixed ip
+101         internal_subnet_id = self._get_subnet_check_valid_internal_ip(
+102             internal_ip_address, v4_fixed_ips)
+103         if not internal_subnet_id:
+104             message = _(
+105                 "Requested internal IP address %(internal_ip_address)s is not "
+106                 "suitable for internal neutron port %(internal_port_id)s, as "
+107                 "its fixed_ips are %(fixed_ips)s") % {
+108                 'internal_ip_address': internal_ip_address,
+109                 'internal_port_id': internal_port['id'],
+110                 'fixed_ips': v4_fixed_ips}
+111             raise lib_exc.BadRequest(resource=apidef.RESOURCE_NAME,
+112                                      msg=message)
+113 
+114         internal_subnet = self.core_plugin.get_subnet(
+115             context, internal_subnet_id)
+116         external_network_id = fip_obj.floating_network_id
+117         try:
+118             router_id = self.l3_plugin.get_router_for_floatingip(
+119                 context, internal_port, internal_subnet, external_network_id)
+120         except lib_l3_exc.ExternalGatewayForFloatingIPNotFound:
+121             message = _(
+122                 "External network %(external_net_id)s is not reachable from "
+123                 "subnet %(internal_subnet_id)s. Cannot set "
+124                 "Port forwarding for Port %(internal_port_id)s with "
+125                 "Floating IP %(port_forwarding_id)s") % {
+126                 'external_net_id': external_network_id,
+127                 'internal_subnet_id': internal_subnet_id,
+128                 'internal_port_id': internal_port_id,
+129                 'port_forwarding_id': fip_obj.id}
+130             raise lib_exc.BadRequest(resource=apidef.RESOURCE_NAME,
+131                                      msg=message)
+132         return router_id
+133 
+134     @db_base_plugin_common.convert_result_to_dict
+135     @db_api.context_manager.writer
+136     def create_floatingip_port_forwarding(self, context, floatingip_id,
+137                                           port_forwarding):
+138         port_forwarding = port_forwarding.get(apidef.RESOURCE_NAME)
+139         port_forwarding['floatingip_id'] = floatingip_id
+140         pf_obj = pf.PortForwarding(context, **port_forwarding)
+141 
+142         try:
+143             with db_api.context_manager.writer.using(context):
+144                 fip_obj = router.FloatingIP.get_object(context,
+145                                                        id=floatingip_id)
+146 
+147                 router_id = self._find_a_router_for_fippf(context,
+148                                                           port_forwarding,
+149                                                           fip_obj)
+150                 # If this func does not raise an exception, means the
+151                 # router_id matched.
+152                 # case1: fip_obj.router_id = None
+153                 # case2: fip_obj.router_id is the same with we selected.
+154                 self._check_router_match(context, fip_obj,
+155                                          router_id, port_forwarding)
+156                 if not fip_obj.router_id:
+157                     fip_obj.router_id = router_id
+158                     fip_obj.update()
+159                 pf_obj.create()
+160         except obj_exc.NeutronDbObjectDuplicateEntry:
+161             (__, conflict_params) = self.try_find_exist(context, floatingip_id,
+162                                                         port_forwarding)
+163             message = _("Duplicate portforwarding, a port forwarding with "
+164                         "same attributes already exists, conflict params like "
+165                         "%s") % conflict_params
+166             raise lib_exc.BadRequest(resource=apidef.RESOURCE_NAME,
+167                                      msg=message)
+168         self.push_api.push(context, [pf_obj], rpc_events.CREATED)
+169         return pf_obj
+170 
+171     @db_base_plugin_common.convert_result_to_dict
+172     def update_floatingip_port_forwarding(self, context, id, floatingip_id,
+173                                           port_forwarding):
+174         pf_data = port_forwarding.get(apidef.RESOURCE_NAME)
+175         new_internal_port_id = None
+176         if pf_data and pf_data.get('internal_port_id'):
+177             new_internal_port_id = pf_data.get('internal_port_id')
+178         try:
+179             with db_api.context_manager.writer.using(context):
+180                 pf_obj = pf.PortForwarding.get_object(context, id=id)
+181                 if not pf_obj:
+182                     raise pf_exc.PortForwardingNotFound(id=id)
+183                 ori_internal_port_id = pf_obj.internal_port_id
+184                 if new_internal_port_id and (new_internal_port_id !=
+185                                              ori_internal_port_id):
+186                     fip_obj = router.FloatingIP.get_object(context,
+187                                                            id=floatingip_id)
+188                     router_id = self._find_a_router_for_fippf(context,
+189                                                               port_forwarding,
+190                                                               fip_obj)
+191                     self._check_router_match(context, fip_obj,
+192                                              router_id, port_forwarding)
+193 
+194                 pf_obj.update_fields(pf_data, reset_changes=True)
+195                 pf_obj.update()
+196         except obj_exc.NeutronDbObjectDuplicateEntry:
+197             (__, conflict_params) = self.try_find_exist(context, floatingip_id,
+198                                                         pf_obj.to_dict())
+199             message = _("Duplicate portforwarding, a port forwarding with "
+200                         "same attributes already exists, conflict params like "
+201                         "%s") % conflict_params
+202             raise lib_exc.BadRequest(resource=apidef.RESOURCE_NAME,
+203                                      msg=message)
+204         self.push_api.push(context, [pf_obj], rpc_events.UPDATED)
+205         return pf_obj
+206 
+207     def _check_router_match(self, context, fip_obj, router_id, pf_dict):
+208         internal_port_id = pf_dict['internal_port_id']
+209         if fip_obj.router_id and fip_obj.router_id != router_id:
+210             objs = pf.PortForwarding.get_objects(
+211                 context, floatingip_id=fip_obj.id,
+212                 internal_ip_address=pf_dict['internal_ip_address'],
+213                 internal_port=pf_dict['internal_port'])
+214             if objs:
+215                 message = _("Floating IP %(floatingip_id)s with params: "
+216                             "internal_ip_address: %(internal_ip_address)s, "
+217                             "internal_port: %(internal_port)s "
+218                             "already exists") % {
+219                     'floatingip_id': fip_obj.id,
+220                     'internal_ip_address': pf_dict['internal_ip_address'],
+221                     'internal_port': pf_dict['internal_port']}
+222             else:
+223                 message = _("The Floating IP %(floatingip_id)s had been set "
+224                             "on router %(router_id)s, the internal Neutron "
+225                             "port %(internal_port_id)s can not reach it") % {
+226                     'floatingip_id': fip_obj.id,
+227                     'router_id': fip_obj.router_id,
+228                     'internal_port_id': internal_port_id}
+229             raise lib_exc.BadRequest(resource=apidef.RESOURCE_NAME,
+230                                      msg=message)
+231 
+232     def try_find_exist(self, context, floatingip_id, port_forwarding,
+233                        specify_params=None):
+234         # Because the session had been flushed by NeutronDbObjectDuplicateEntry
+235         # so if we want to use the context to get another db queries, we need
+236         # to rollback first.
+237         context.session.rollback()
+238         if not specify_params:
+239             params = [{'floatingip_id': floatingip_id,
+240                        'external_port': port_forwarding['external_port']},
+241                       {'internal_port_id': port_forwarding['internal_port_id'],
+242                        'internal_ip_address': port_forwarding[
+243                            'internal_ip_address'],
+244                        'internal_port': port_forwarding['internal_port']}]
+245         else:
+246             params = specify_params
+247         for param in params:
+248             objs = pf.PortForwarding.get_objects(context, **param)
+249             if objs:
+250                 return (objs[0], param)
+251 
+252     def _get_fip_obj(self, context, fip_id):
+253         fip_obj = router.FloatingIP.get_object(context, id=fip_id)
+254         if not fip_obj:
+255             raise lib_l3_exc.FloatingIPNotFound(floatingip_id=fip_id)
+256 
+257     @make_result_with_fields
+258     @db_base_plugin_common.convert_result_to_dict
+259     def get_floatingip_port_forwarding(self, context, id, floatingip_id,
+260                                        fields=None):
+261         self._get_fip_obj(context, floatingip_id)
+262         obj = pf.PortForwarding.get_object(context, id=id)
+263         if not obj:
+264             raise pf_exc.PortForwardingNotFound(id=id)
+265         return obj
+266 
+267     def _validate_filter_for_port_forwarding(self, request_filter):
+268         if not request_filter:
+269             return
+270         for filter_member_key in request_filter.keys():
+271             if filter_member_key in pf.FIELDS_NOT_SUPPORT_FILTER:
+272                 raise pf_exc.PortForwardingNotSupportFilterField(
+273                     filter=filter_member_key)
+274 
+275     @make_result_with_fields
+276     @db_base_plugin_common.convert_result_to_dict
+277     def get_floatingip_port_forwardings(self, context, floatingip_id=None,
+278                                         filters=None, fields=None, sorts=None,
+279                                         limit=None, marker=None,
+280                                         page_reverse=False):
+281         self._get_fip_obj(context, floatingip_id)
+282         filters = filters or {}
+283         self._validate_filter_for_port_forwarding(filters)
+284         pager = base_obj.Pager(sorts, limit, page_reverse, marker)
+285         return pf.PortForwarding.get_objects(
+286             context, _pager=pager, floatingip_id=floatingip_id, **filters)
+287 
+288     def delete_floatingip_port_forwarding(self, context, id, floatingip_id):
+289         pf_obj = pf.PortForwarding.get_object(context, id=id)
+290         if not pf_obj:
+291             raise pf_exc.PortForwardingNotFound(id=id)
+292         with db_api.context_manager.writer.using(context):
+293             pf_objs = pf.PortForwarding.get_objects(
+294                 context, floatingip_id=floatingip_id)
+295             if len(pf_objs) == 1:
+296                 fip_obj = router.FloatingIP.get_object(
+297                     context, id=pf_obj.floatingip_id)
+298                 fip_obj.update_fields({'router_id': None})
+299                 fip_obj.update()
+300             pf_obj.delete()
+301         self.push_api.push(context, [pf_obj], rpc_events.DELETED)
+302 
+303     def _get_port_forwarding_by_routers(self, context, router_ids):
+304         return pf.PortForwarding.get_port_forwarding_obj_by_routers(
+305             context, router_ids)
+306 
+307     def sync_port_forwarding_fip(self, context, routers):
+308         if not routers:
+309             return
+310 
+311         router_ids = [router.get('id') for router in routers]
+312         router_pf_fip_set = collections.defaultdict(set)
+313         fip_pfs = collections.defaultdict(set)
+314         router_fip = collections.defaultdict(set)
+315         for (router_id,
+316              fip_addr, pf_id, fip_id) in self._get_port_forwarding_by_routers(
+317                 context, router_ids):
+318             router_pf_fip_set[router_id].add(fip_addr + '/32')
+319             fip_pfs[fip_id].add(pf_id)
+320             router_fip[router_id].add(fip_id)
+321 
+322         for router in routers:
+323             if router['id'] in router_fip:
+324                 router['port_forwardings_fip_set'] = router_pf_fip_set[
+325                     router['id']]
+326                 fip_ids = router_fip[router['id']]
+327                 map_list = []
+328                 for id in fip_ids:
+329                     map_list.append((id, fip_pfs[id]))
+330                 router['port_forwarding_mappings'] = {
+331                     'floatingip_port_forwarding_mapping': map_list}

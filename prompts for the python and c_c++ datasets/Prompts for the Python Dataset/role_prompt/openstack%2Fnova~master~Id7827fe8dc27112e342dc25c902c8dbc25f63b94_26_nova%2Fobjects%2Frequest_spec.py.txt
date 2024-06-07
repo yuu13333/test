@@ -1,0 +1,1026 @@
+I want you to act as a code reviewer of Nova in OpenStack. Please review the code below to detect security defects. If any are found, please describe the security defect in detail and indicate the corresponding line number of code and solution. If none are found, please state '''No security defects are detected in the code'''.
+
+1 #    Copyright 2015 Red Hat, Inc.
+2 #
+3 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
+4 #    not use this file except in compliance with the License. You may obtain
+5 #    a copy of the License at
+6 #
+7 #         http://www.apache.org/licenses/LICENSE-2.0
+8 #
+9 #    Unless required by applicable law or agreed to in writing, software
+10 #    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+11 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+12 #    License for the specific language governing permissions and limitations
+13 #    under the License.
+14 import copy
+15 import itertools
+16 
+17 from oslo_log import log as logging
+18 from oslo_serialization import jsonutils
+19 from oslo_utils import versionutils
+20 
+21 
+22 from nova.db.sqlalchemy import api as db
+23 from nova.db.sqlalchemy import api_models
+24 from nova import exception
+25 from nova import objects
+26 from nova.objects import base
+27 from nova.objects import fields
+28 from nova.objects import instance as obj_instance
+29 from nova.virt import hardware
+30 
+31 LOG = logging.getLogger(__name__)
+32 
+33 REQUEST_SPEC_OPTIONAL_ATTRS = ['requested_destination',
+34                                'security_groups',
+35                                'network_metadata',
+36                                'requested_resources']
+37 
+38 
+39 @base.NovaObjectRegistry.register
+40 class RequestSpec(base.NovaObject):
+41     # Version 1.0: Initial version
+42     # Version 1.1: ImageMeta version 1.6
+43     # Version 1.2: SchedulerRetries version 1.1
+44     # Version 1.3: InstanceGroup version 1.10
+45     # Version 1.4: ImageMeta version 1.7
+46     # Version 1.5: Added get_by_instance_uuid(), create(), save()
+47     # Version 1.6: Added requested_destination
+48     # Version 1.7: Added destroy()
+49     # Version 1.8: Added security_groups
+50     # Version 1.9: Added user_id
+51     # Version 1.10: Added network_metadata
+52     # Version 1.11: Added is_bfv
+53     # Version 1.12: Added requested_resources
+54     VERSION = '1.12'
+55 
+56     fields = {
+57         'id': fields.IntegerField(),
+58         'image': fields.ObjectField('ImageMeta', nullable=True),
+59         'numa_topology': fields.ObjectField('InstanceNUMATopology',
+60                                             nullable=True),
+61         'pci_requests': fields.ObjectField('InstancePCIRequests',
+62                                            nullable=True),
+63         # TODO(mriedem): The project_id shouldn't be nullable since the
+64         # scheduler relies on it being set.
+65         'project_id': fields.StringField(nullable=True),
+66         'user_id': fields.StringField(nullable=True),
+67         'availability_zone': fields.StringField(nullable=True),
+68         'flavor': fields.ObjectField('Flavor', nullable=False),
+69         'num_instances': fields.IntegerField(default=1),
+70         'ignore_hosts': fields.ListOfStringsField(nullable=True),
+71         # NOTE(mriedem): In reality, you can only ever have one
+72         # host in the force_hosts list. The fact this is a list
+73         # is a mistake perpetuated over time.
+74         'force_hosts': fields.ListOfStringsField(nullable=True),
+75         # NOTE(mriedem): In reality, you can only ever have one
+76         # node in the force_nodes list. The fact this is a list
+77         # is a mistake perpetuated over time.
+78         'force_nodes': fields.ListOfStringsField(nullable=True),
+79         'requested_destination': fields.ObjectField('Destination',
+80                                                     nullable=True,
+81                                                     default=None),
+82         'retry': fields.ObjectField('SchedulerRetries', nullable=True),
+83         'limits': fields.ObjectField('SchedulerLimits', nullable=True),
+84         'instance_group': fields.ObjectField('InstanceGroup', nullable=True),
+85         # NOTE(sbauza): Since hints are depending on running filters, we prefer
+86         # to leave the API correctly validating the hints per the filters and
+87         # just provide to the RequestSpec object a free-form dictionary
+88         'scheduler_hints': fields.DictOfListOfStringsField(nullable=True),
+89         'instance_uuid': fields.UUIDField(),
+90         'security_groups': fields.ObjectField('SecurityGroupList'),
+91         'network_metadata': fields.ObjectField('NetworkMetadata'),
+92         'is_bfv': fields.BooleanField(),
+93         # NOTE(gibi): Eventually we want to store every resource request as
+94         # RequestGroup objects here. However currently the flavor based
+95         # resources like vcpu, ram, disk, and flavor.extra_spec based resources
+96         # are not handled this way. See the Todo in from_components() where
+97         # requested_resources are set.
+98         'requested_resources': fields.ListOfObjectsField('RequestGroup',
+99                                                          nullable=True,
+100                                                          default=None)
+101     }
+102 
+103     def obj_make_compatible(self, primitive, target_version):
+104         super(RequestSpec, self).obj_make_compatible(primitive, target_version)
+105         target_version = versionutils.convert_version_to_tuple(target_version)
+106         if target_version < (1, 12):
+107             if 'requested_resources' in primitive:
+108                 del primitive['requested_resources']
+109         if target_version < (1, 11) and 'is_bfv' in primitive:
+110             del primitive['is_bfv']
+111         if target_version < (1, 10):
+112             if 'network_metadata' in primitive:
+113                 del primitive['network_metadata']
+114         if target_version < (1, 9):
+115             if 'user_id' in primitive:
+116                 del primitive['user_id']
+117         if target_version < (1, 8):
+118             if 'security_groups' in primitive:
+119                 del primitive['security_groups']
+120         if target_version < (1, 6):
+121             if 'requested_destination' in primitive:
+122                 del primitive['requested_destination']
+123 
+124     def obj_load_attr(self, attrname):
+125         if attrname not in REQUEST_SPEC_OPTIONAL_ATTRS:
+126             raise exception.ObjectActionError(
+127                 action='obj_load_attr',
+128                 reason='attribute %s not lazy-loadable' % attrname)
+129 
+130         if attrname == 'security_groups':
+131             self.security_groups = objects.SecurityGroupList(objects=[])
+132             return
+133 
+134         if attrname == 'network_metadata':
+135             self.network_metadata = objects.NetworkMetadata(
+136                 physnets=set(), tunneled=False)
+137             return
+138 
+139         # NOTE(sbauza): In case the primitive was not providing that field
+140         # because of a previous RequestSpec version, we want to default
+141         # that field in order to have the same behaviour.
+142         self.obj_set_defaults(attrname)
+143 
+144     @property
+145     def vcpus(self):
+146         return self.flavor.vcpus
+147 
+148     @property
+149     def memory_mb(self):
+150         return self.flavor.memory_mb
+151 
+152     @property
+153     def root_gb(self):
+154         return self.flavor.root_gb
+155 
+156     @property
+157     def ephemeral_gb(self):
+158         return self.flavor.ephemeral_gb
+159 
+160     @property
+161     def swap(self):
+162         return self.flavor.swap
+163 
+164     def _image_meta_from_image(self, image):
+165         if isinstance(image, objects.ImageMeta):
+166             self.image = image
+167         elif isinstance(image, dict):
+168             # NOTE(sbauza): Until Nova is fully providing an ImageMeta object
+169             # for getting properties, we still need to hydrate it here
+170             # TODO(sbauza): To be removed once all RequestSpec hydrations are
+171             # done on the conductor side and if the image is an ImageMeta
+172             self.image = objects.ImageMeta.from_dict(image)
+173         else:
+174             self.image = None
+175 
+176     def _from_instance(self, instance):
+177         if isinstance(instance, obj_instance.Instance):
+178             # NOTE(sbauza): Instance should normally be a NovaObject...
+179             getter = getattr
+180         elif isinstance(instance, dict):
+181             # NOTE(sbauza): ... but there are some cases where request_spec
+182             # has an instance key as a dictionary, just because
+183             # select_destinations() is getting a request_spec dict made by
+184             # sched_utils.build_request_spec()
+185             # TODO(sbauza): To be removed once all RequestSpec hydrations are
+186             # done on the conductor side
+187             getter = lambda x, y: x.get(y)
+188         else:
+189             # If the instance is None, there is no reason to set the fields
+190             return
+191 
+192         instance_fields = ['numa_topology', 'pci_requests', 'uuid',
+193                            'project_id', 'user_id', 'availability_zone']
+194         for field in instance_fields:
+195             if field == 'uuid':
+196                 setattr(self, 'instance_uuid', getter(instance, field))
+197             elif field == 'pci_requests':
+198                 self._from_instance_pci_requests(getter(instance, field))
+199             elif field == 'numa_topology':
+200                 self._from_instance_numa_topology(getter(instance, field))
+201             else:
+202                 setattr(self, field, getter(instance, field))
+203 
+204     def _from_instance_pci_requests(self, pci_requests):
+205         if isinstance(pci_requests, dict):
+206             pci_req_cls = objects.InstancePCIRequests
+207             self.pci_requests = pci_req_cls.from_request_spec_instance_props(
+208                 pci_requests)
+209         else:
+210             self.pci_requests = pci_requests
+211 
+212     def _from_instance_numa_topology(self, numa_topology):
+213         if isinstance(numa_topology, dict):
+214             self.numa_topology = hardware.instance_topology_from_instance(
+215                 dict(numa_topology=numa_topology))
+216         else:
+217             self.numa_topology = numa_topology
+218 
+219     def _from_flavor(self, flavor):
+220         if isinstance(flavor, objects.Flavor):
+221             self.flavor = flavor
+222         elif isinstance(flavor, dict):
+223             # NOTE(sbauza): Again, request_spec is primitived by
+224             # sched_utils.build_request_spec() and passed to
+225             # select_destinations() like this
+226             # TODO(sbauza): To be removed once all RequestSpec hydrations are
+227             # done on the conductor side
+228             self.flavor = objects.Flavor(**flavor)
+229 
+230     def _from_retry(self, retry_dict):
+231         self.retry = (SchedulerRetries.from_dict(self._context, retry_dict)
+232                       if retry_dict else None)
+233 
+234     def _populate_group_info(self, filter_properties):
+235         if filter_properties.get('instance_group'):
+236             # New-style group information as a NovaObject, we can directly set
+237             # the field
+238             self.instance_group = filter_properties.get('instance_group')
+239         elif filter_properties.get('group_updated') is True:
+240             # Old-style group information having ugly dict keys containing sets
+241             # NOTE(sbauza): Can be dropped once select_destinations is removed
+242             policies = list(filter_properties.get('group_policies'))
+243             hosts = list(filter_properties.get('group_hosts'))
+244             members = list(filter_properties.get('group_members'))
+245             self.instance_group = objects.InstanceGroup(policy=policies[0],
+246                                                         hosts=hosts,
+247                                                         members=members)
+248             # hosts has to be not part of the updates for saving the object
+249             self.instance_group.obj_reset_changes(['hosts'])
+250         else:
+251             # Set the value anyway to avoid any call to obj_attr_is_set for it
+252             self.instance_group = None
+253 
+254     def _from_limits(self, limits):
+255         if isinstance(limits, dict):
+256             self.limits = SchedulerLimits.from_dict(limits)
+257         else:
+258             # Already a SchedulerLimits object.
+259             self.limits = limits
+260 
+261     def _from_hints(self, hints_dict):
+262         if hints_dict is None:
+263             self.scheduler_hints = None
+264             return
+265         self.scheduler_hints = {
+266             hint: value if isinstance(value, list) else [value]
+267             for hint, value in hints_dict.items()}
+268 
+269     @classmethod
+270     def from_primitives(cls, context, request_spec, filter_properties):
+271         """Returns a new RequestSpec object by hydrating it from legacy dicts.
+272 
+273         Deprecated.  A RequestSpec object is created early in the boot process
+274         using the from_components method.  That object will either be passed to
+275         places that require it, or it can be looked up with
+276         get_by_instance_uuid.  This method can be removed when there are no
+277         longer any callers.  Because the method is not remotable it is not tied
+278         to object versioning.
+279 
+280         That helper is not intended to leave the legacy dicts kept in the nova
+281         codebase, but is rather just for giving a temporary solution for
+282         populating the Spec object until we get rid of scheduler_utils'
+283         build_request_spec() and the filter_properties hydratation in the
+284         conductor.
+285 
+286         :param context: a context object
+287         :param request_spec: An old-style request_spec dictionary
+288         :param filter_properties: An old-style filter_properties dictionary
+289         """
+290         num_instances = request_spec.get('num_instances', 1)
+291         spec = cls(context, num_instances=num_instances)
+292         # Hydrate from request_spec first
+293         image = request_spec.get('image')
+294         spec._image_meta_from_image(image)
+295         instance = request_spec.get('instance_properties')
+296         spec._from_instance(instance)
+297         flavor = request_spec.get('instance_type')
+298         spec._from_flavor(flavor)
+299         # Hydrate now from filter_properties
+300         spec.ignore_hosts = filter_properties.get('ignore_hosts')
+301         spec.force_hosts = filter_properties.get('force_hosts')
+302         spec.force_nodes = filter_properties.get('force_nodes')
+303         retry = filter_properties.get('retry', {})
+304         spec._from_retry(retry)
+305         limits = filter_properties.get('limits', {})
+306         spec._from_limits(limits)
+307         spec._populate_group_info(filter_properties)
+308         scheduler_hints = filter_properties.get('scheduler_hints', {})
+309         spec._from_hints(scheduler_hints)
+310         spec.requested_destination = filter_properties.get(
+311             'requested_destination')
+312 
+313         # NOTE(sbauza): Default the other fields that are not part of the
+314         # original contract
+315         spec.obj_set_defaults()
+316 
+317         return spec
+318 
+319     def get_scheduler_hint(self, hint_name, default=None):
+320         """Convenient helper for accessing a particular scheduler hint since
+321         it is hydrated by putting a single item into a list.
+322 
+323         In order to reduce the complexity, that helper returns a string if the
+324         requested hint is a list of only one value, and if not, returns the
+325         value directly (ie. the list). If the hint is not existing (or
+326         scheduler_hints is None), then it returns the default value.
+327 
+328         :param hint_name: name of the hint
+329         :param default: the default value if the hint is not there
+330         """
+331         if (not self.obj_attr_is_set('scheduler_hints')
+332                 or self.scheduler_hints is None):
+333             return default
+334         hint_val = self.scheduler_hints.get(hint_name, default)
+335         return (hint_val[0] if isinstance(hint_val, list)
+336                 and len(hint_val) == 1 else hint_val)
+337 
+338     def _to_legacy_image(self):
+339         return base.obj_to_primitive(self.image) if (
+340             self.obj_attr_is_set('image') and self.image) else {}
+341 
+342     def _to_legacy_instance(self):
+343         # NOTE(sbauza): Since the RequestSpec only persists a few Instance
+344         # fields, we can only return a dict.
+345         instance = {}
+346         instance_fields = ['numa_topology', 'pci_requests',
+347                            'project_id', 'user_id', 'availability_zone',
+348                            'instance_uuid']
+349         for field in instance_fields:
+350             if not self.obj_attr_is_set(field):
+351                 continue
+352             if field == 'instance_uuid':
+353                 instance['uuid'] = getattr(self, field)
+354             else:
+355                 instance[field] = getattr(self, field)
+356         flavor_fields = ['root_gb', 'ephemeral_gb', 'memory_mb', 'vcpus']
+357         if not self.obj_attr_is_set('flavor'):
+358             return instance
+359         for field in flavor_fields:
+360             instance[field] = getattr(self.flavor, field)
+361         return instance
+362 
+363     def _to_legacy_group_info(self):
+364         # NOTE(sbauza): Since this is only needed until the AffinityFilters are
+365         # modified by using directly the RequestSpec object, we need to keep
+366         # the existing dictionary as a primitive.
+367         return {'group_updated': True,
+368                 'group_hosts': set(self.instance_group.hosts),
+369                 'group_policies': set([self.instance_group.policy]),
+370                 'group_members': set(self.instance_group.members)}
+371 
+372     def to_legacy_request_spec_dict(self):
+373         """Returns a legacy request_spec dict from the RequestSpec object.
+374 
+375         Since we need to manage backwards compatibility and rolling upgrades
+376         within our RPC API, we need to accept to provide an helper for
+377         primitiving the right RequestSpec object into a legacy dict until we
+378         drop support for old Scheduler RPC API versions.
+379         If you don't understand why this method is needed, please don't use it.
+380         """
+381         req_spec = {}
+382         if not self.obj_attr_is_set('num_instances'):
+383             req_spec['num_instances'] = self.fields['num_instances'].default
+384         else:
+385             req_spec['num_instances'] = self.num_instances
+386         req_spec['image'] = self._to_legacy_image()
+387         req_spec['instance_properties'] = self._to_legacy_instance()
+388         if self.obj_attr_is_set('flavor'):
+389             req_spec['instance_type'] = self.flavor
+390         else:
+391             req_spec['instance_type'] = {}
+392         return req_spec
+393 
+394     def to_legacy_filter_properties_dict(self):
+395         """Returns a legacy filter_properties dict from the RequestSpec object.
+396 
+397         Since we need to manage backwards compatibility and rolling upgrades
+398         within our RPC API, we need to accept to provide an helper for
+399         primitiving the right RequestSpec object into a legacy dict until we
+400         drop support for old Scheduler RPC API versions.
+401         If you don't understand why this method is needed, please don't use it.
+402         """
+403         filt_props = {}
+404         if self.obj_attr_is_set('ignore_hosts') and self.ignore_hosts:
+405             filt_props['ignore_hosts'] = self.ignore_hosts
+406         if self.obj_attr_is_set('force_hosts') and self.force_hosts:
+407             filt_props['force_hosts'] = self.force_hosts
+408         if self.obj_attr_is_set('force_nodes') and self.force_nodes:
+409             filt_props['force_nodes'] = self.force_nodes
+410         if self.obj_attr_is_set('retry') and self.retry:
+411             filt_props['retry'] = self.retry.to_dict()
+412         if self.obj_attr_is_set('limits') and self.limits:
+413             filt_props['limits'] = self.limits.to_dict()
+414         if self.obj_attr_is_set('instance_group') and self.instance_group:
+415             filt_props.update(self._to_legacy_group_info())
+416         if self.obj_attr_is_set('scheduler_hints') and self.scheduler_hints:
+417             # NOTE(sbauza): We need to backport all the hints correctly since
+418             # we had to hydrate the field by putting a single item into a list.
+419             filt_props['scheduler_hints'] = {hint: self.get_scheduler_hint(
+420                 hint) for hint in self.scheduler_hints}
+421         if self.obj_attr_is_set('requested_destination'
+422                                 ) and self.requested_destination:
+423             filt_props['requested_destination'] = self.requested_destination
+424         return filt_props
+425 
+426     @classmethod
+427     def from_components(cls, context, instance_uuid, image, flavor,
+428             numa_topology, pci_requests, filter_properties, instance_group,
+429             availability_zone, security_groups=None, project_id=None,
+430             user_id=None, port_resource_requests=None):
+431         """Returns a new RequestSpec object hydrated by various components.
+432 
+433         This helper is useful in creating the RequestSpec from the various
+434         objects that are assembled early in the boot process.  This method
+435         creates a complete RequestSpec object with all properties set or
+436         intentionally left blank.
+437 
+438         :param context: a context object
+439         :param instance_uuid: the uuid of the instance to schedule
+440         :param image: a dict of properties for an image or volume
+441         :param flavor: a flavor NovaObject
+442         :param numa_topology: InstanceNUMATopology or None
+443         :param pci_requests: InstancePCIRequests
+444         :param filter_properties: a dict of properties for scheduling
+445         :param instance_group: None or an instance group NovaObject
+446         :param availability_zone: an availability_zone string
+447         :param security_groups: A SecurityGroupList object. If None, don't
+448                                 set security_groups on the resulting object.
+449         :param project_id: The project_id for the requestspec (should match
+450                            the instance project_id).
+451         :param user_id: The user_id for the requestspec (should match
+452                            the instance user_id).
+453         :param port_resource_requests: a list of RequestGroup objects
+454                                        representing the resource needs of the
+455                                        neutron ports
+456         """
+457         spec_obj = cls(context)
+458         spec_obj.num_instances = 1
+459         spec_obj.instance_uuid = instance_uuid
+460         spec_obj.instance_group = instance_group
+461         if spec_obj.instance_group is None and filter_properties:
+462             spec_obj._populate_group_info(filter_properties)
+463         spec_obj.project_id = project_id or context.project_id
+464         spec_obj.user_id = user_id or context.user_id
+465         spec_obj._image_meta_from_image(image)
+466         spec_obj._from_flavor(flavor)
+467         spec_obj._from_instance_pci_requests(pci_requests)
+468         spec_obj._from_instance_numa_topology(numa_topology)
+469         spec_obj.ignore_hosts = filter_properties.get('ignore_hosts')
+470         spec_obj.force_hosts = filter_properties.get('force_hosts')
+471         spec_obj.force_nodes = filter_properties.get('force_nodes')
+472         spec_obj._from_retry(filter_properties.get('retry', {}))
+473         spec_obj._from_limits(filter_properties.get('limits', {}))
+474         spec_obj._from_hints(filter_properties.get('scheduler_hints', {}))
+475         spec_obj.availability_zone = availability_zone
+476         if security_groups is not None:
+477             spec_obj.security_groups = security_groups
+478         spec_obj.requested_destination = filter_properties.get(
+479             'requested_destination')
+480 
+481         # TODO(gibi): do the creation of the unnumbered group and any
+482         # numbered group from the flavor by moving the logic from
+483         # nova.scheduler.utils.resources_from_request_spec() here.
+484         spec_obj.requested_resources = []
+485         if port_resource_requests:
+486             spec_obj.requested_resources.extend(port_resource_requests)
+487 
+488         # NOTE(sbauza): Default the other fields that are not part of the
+489         # original contract
+490         spec_obj.obj_set_defaults()
+491         return spec_obj
+492 
+493     def ensure_project_and_user_id(self, instance):
+494         if 'project_id' not in self or self.project_id is None:
+495             self.project_id = instance.project_id
+496         if 'user_id' not in self or self.user_id is None:
+497             self.user_id = instance.user_id
+498 
+499     def ensure_network_metadata(self, instance):
+500         if not (instance.info_cache and instance.info_cache.network_info):
+501             return
+502 
+503         physnets = set([])
+504         tunneled = True
+505 
+506         # physical_network and tunneled might not be in the cache for old
+507         # instances that haven't had their info_cache healed yet
+508         for vif in instance.info_cache.network_info:
+509             physnet = vif.get('network', {}).get('meta', {}).get(
+510                 'physical_network', None)
+511             if physnet:
+512                 physnets.add(physnet)
+513             tunneled |= vif.get('network', {}).get('meta', {}).get(
+514                 'tunneled', False)
+515 
+516         self.network_metadata = objects.NetworkMetadata(
+517             physnets=physnets, tunneled=tunneled)
+518 
+519     @staticmethod
+520     def _from_db_object(context, spec, db_spec):
+521         spec_obj = spec.obj_from_primitive(jsonutils.loads(db_spec['spec']))
+522         for key in spec.fields:
+523             # Load these from the db model not the serialized object within,
+524             # though they should match.
+525             if key in ['id', 'instance_uuid']:
+526                 setattr(spec, key, db_spec[key])
+527             elif key == 'requested_resources':
+528                 # Do not override what we already have in the object as this
+529                 # field is not persisted. If save() is called after
+530                 # requested_resources is populated, it will reset the field to
+531                 # None and we'll lose what is set (but not persisted) on the
+532                 # object.
+533                 continue
+534             elif key in spec_obj:
+535                 setattr(spec, key, getattr(spec_obj, key))
+536         spec._context = context
+537 
+538         if 'instance_group' in spec and spec.instance_group:
+539             # NOTE(danms): We don't store the full instance group in
+540             # the reqspec since it would be stale almost immediately.
+541             # Instead, load it by uuid here so it's up-to-date.
+542             try:
+543                 spec.instance_group = objects.InstanceGroup.get_by_uuid(
+544                     context, spec.instance_group.uuid)
+545             except exception.InstanceGroupNotFound:
+546                 # NOTE(danms): Instance group may have been deleted
+547                 spec.instance_group = None
+548 
+549         spec.obj_reset_changes()
+550         return spec
+551 
+552     @staticmethod
+553     @db.api_context_manager.reader
+554     def _get_by_instance_uuid_from_db(context, instance_uuid):
+555         db_spec = context.session.query(api_models.RequestSpec).filter_by(
+556             instance_uuid=instance_uuid).first()
+557         if not db_spec:
+558             raise exception.RequestSpecNotFound(
+559                     instance_uuid=instance_uuid)
+560         return db_spec
+561 
+562     @base.remotable_classmethod
+563     def get_by_instance_uuid(cls, context, instance_uuid):
+564         db_spec = cls._get_by_instance_uuid_from_db(context, instance_uuid)
+565         return cls._from_db_object(context, cls(), db_spec)
+566 
+567     @staticmethod
+568     @db.api_context_manager.writer
+569     def _create_in_db(context, updates):
+570         db_spec = api_models.RequestSpec()
+571         db_spec.update(updates)
+572         db_spec.save(context.session)
+573         return db_spec
+574 
+575     def _get_update_primitives(self):
+576         """Serialize object to match the db model.
+577 
+578         We store copies of embedded objects rather than
+579         references to these objects because we want a snapshot of the request
+580         at this point.  If the references changed or were deleted we would
+581         not be able to reschedule this instance under the same conditions as
+582         it was originally scheduled with.
+583         """
+584         updates = self.obj_get_changes()
+585         db_updates = None
+586         # NOTE(alaski): The db schema is the full serialized object in a
+587         # 'spec' column.  If anything has changed we rewrite the full thing.
+588         if updates:
+589             # NOTE(danms): Don't persist the could-be-large and could-be-stale
+590             # properties of InstanceGroup
+591             spec = self.obj_clone()
+592             if 'instance_group' in spec and spec.instance_group:
+593                 spec.instance_group.members = None
+594                 spec.instance_group.hosts = None
+595             # NOTE(mriedem): Don't persist retries or requested_destination
+596             # since those are per-request
+597             for excluded in ('retry', 'requested_destination',
+598                              'requested_resources'):
+599                 if excluded in spec and getattr(spec, excluded):
+600                     setattr(spec, excluded, None)
+601             # NOTE(stephenfin): Don't persist network metadata since we have
+602             # no need for it after scheduling
+603             if 'network_metadata' in spec and spec.network_metadata:
+604                 del spec.network_metadata
+605 
+606             db_updates = {'spec': jsonutils.dumps(spec.obj_to_primitive())}
+607             if 'instance_uuid' in updates:
+608                 db_updates['instance_uuid'] = updates['instance_uuid']
+609         return db_updates
+610 
+611     @base.remotable
+612     def create(self):
+613         if self.obj_attr_is_set('id'):
+614             raise exception.ObjectActionError(action='create',
+615                                               reason='already created')
+616 
+617         updates = self._get_update_primitives()
+618         if not updates:
+619             raise exception.ObjectActionError(action='create',
+620                                               reason='no fields are set')
+621         db_spec = self._create_in_db(self._context, updates)
+622         self._from_db_object(self._context, self, db_spec)
+623 
+624     @staticmethod
+625     @db.api_context_manager.writer
+626     def _save_in_db(context, instance_uuid, updates):
+627         # FIXME(sbauza): Provide a classmethod when oslo.db bug #1520195 is
+628         # fixed and released
+629         db_spec = RequestSpec._get_by_instance_uuid_from_db(context,
+630                                                             instance_uuid)
+631         db_spec.update(updates)
+632         db_spec.save(context.session)
+633         return db_spec
+634 
+635     @base.remotable
+636     def save(self):
+637         updates = self._get_update_primitives()
+638         if updates:
+639             db_spec = self._save_in_db(self._context, self.instance_uuid,
+640                                        updates)
+641             self._from_db_object(self._context, self, db_spec)
+642             self.obj_reset_changes()
+643 
+644     @staticmethod
+645     @db.api_context_manager.writer
+646     def _destroy_in_db(context, instance_uuid):
+647         result = context.session.query(api_models.RequestSpec).filter_by(
+648             instance_uuid=instance_uuid).delete()
+649         if not result:
+650             raise exception.RequestSpecNotFound(instance_uuid=instance_uuid)
+651 
+652     @base.remotable
+653     def destroy(self):
+654         self._destroy_in_db(self._context, self.instance_uuid)
+655 
+656     @staticmethod
+657     @db.api_context_manager.writer
+658     def _destroy_bulk_in_db(context, instance_uuids):
+659         return context.session.query(api_models.RequestSpec).filter(
+660                 api_models.RequestSpec.instance_uuid.in_(instance_uuids)).\
+661                 delete(synchronize_session=False)
+662 
+663     @classmethod
+664     def destroy_bulk(cls, context, instance_uuids):
+665         return cls._destroy_bulk_in_db(context, instance_uuids)
+666 
+667     def reset_forced_destinations(self):
+668         """Clears the forced destination fields from the RequestSpec object.
+669 
+670         This method is for making sure we don't ask the scheduler to give us
+671         again the same destination(s) without persisting the modifications.
+672         """
+673         self.force_hosts = None
+674         self.force_nodes = None
+675         # NOTE(sbauza): Make sure we don't persist this, we need to keep the
+676         # original request for the forced hosts
+677         self.obj_reset_changes(['force_hosts', 'force_nodes'])
+678 
+679     def _is_valid_group_rp_mapping(
+680             self, group_rp_mapping, placement_allocations, provider_traits):
+681         """Decides if the mapping is valid from resources and traits
+682         perspective.
+683 
+684         :param group_rp_mapping: A list of RequestGroup - RP UUID two tuples
+685                                 representing a mapping between request groups
+686                                 in this RequestSpec and RPs from the
+687                                 allocation. It contains every RequestGroup in
+688                                 this RequestSpec but the mapping might not be
+689                                 valid from resources and traits perspective.
+690         :param placement_allocations: The overall allocation made by the
+691                                       scheduler for this RequestSpec
+692         :param provider_traits: A dict keyed by resource provider uuids
+693                                 containing the list of traits the given RP has.
+694                                 This dict contains info only about RPs
+695                                 appearing in the placement_allocations param.
+696         :return: True if each group's resource and trait request can be
+697                  fulfilled from RP it is mapped to. False otherwise.
+698         """
+699 
+700         # Check that traits are matching for each group - rp pair in
+701         # this mapping
+702         for group, rp_uuid in group_rp_mapping:
+703             if (not all(req_trait in provider_traits[rp_uuid]
+704                         for req_trait in group.required_traits)):
+705                 return False
+706 
+707         # TODO(gibi): add support for groups with forbidden_traits and
+708         # aggregates
+709 
+710         # Check that each group can consume the requested resources from the rp
+711         # that it is mapped to in the current mapping. Consume each group's
+712         # request from the allocation, if anything drops below zero, then this
+713         # is not a solution
+714         allocs = copy.deepcopy(placement_allocations)
+715         for group, rp_uuid in group_rp_mapping:
+716             rp_allocs = allocs[rp_uuid]['resources']
+717             for rc, amount in group.resources.items():
+718                 if rc in rp_allocs:
+719                     rp_allocs[rc] -= amount
+720                     if rp_allocs[rc] < 0:
+721                         return False
+722                 else:
+723                     return False
+724         # If both the traits and the allocations are OK then mapping is valid
+725         return True
+726 
+727     def map_requested_resources_to_providers(
+728             self, placement_allocations, provider_traits):
+729         """Fill the provider_uuids field in each RequestGroup objects in the
+730         requested_resources field.
+731 
+732         The mapping is generated based on the overall allocation made for this
+733         RequestSpec, the request in each RequestGroup, and the traits of the
+734         RPs in the allocation.
+735 
+736         Limitations:
+737         * only groups with use_same_provider = True is mapped, the un-numbered
+738           group are not supported.
+739         * mapping is generated only based on the resource request and the
+740           required traits, aggregate membership and forbidden traits are not
+741           supported.
+742 
+743         We can live with these limitations today as Neutron does not use
+744         forbidden traits and aggregates in the request and each Neutron port is
+745         mapped to a numbered group.
+746 
+747         This is a workaround as placement does not return which RP fulfills
+748         which granular request group in the allocation candidate request. There
+749         is a spec proposing a solution in placement:
+750         https://review.openstack.org/#/c/597601/
+751 
+752         :param placement_allocations: The overall allocation made by the
+753                                       scheduler for this RequestSpec
+754         :param provider_traits: A dict keyed by resource provider uuids
+755                                 containing the list of traits the given RP has.
+756                                 This dict contains info only about RPs
+757                                 appearing in the placement_allocations param.
+758         """
+759         if 'requested_resources' not in self or not self.requested_resources:
+760             # Nothing to do, so let's return early
+761             return
+762 
+763         for group in self.requested_resources:
+764             # See the limitations in the func doc above
+765             if (not group.use_same_provider
+766                     or group.aggregates
+767                     or group.forbidden_traits):
+768                 raise NotImplementedError()
+769 
+770         # Iterate through every possible group - RP mappings and try to find a
+771         # valid one. If there are more than one possible solution then it is
+772         # enough to find one as these solutions are interchangeable from
+773         # backend (e.g. Neutron) perspective.
+774         LOG.debug('Trying to find a valid group - RP mapping for groups %s to '
+775                   'allocations %s with traits %s', self.requested_resources,
+776                   placement_allocations, provider_traits)
+777 
+778         # This generator first creates permutations with repetition of the RPs
+779         # with length of the number of groups we have. So if there is
+780         #   2 RPs (rp1, rp2) and
+781         #   3 groups (g1, g2, g3).
+782         # Then the itertools.product(('rp1', 'rp2'), repeat=3)) will be:
+783         #  (rp1, rp1, rp1)
+784         #  (rp1, rp1, rp2)
+785         #  (rp1, rp2, rp1)
+786         #  ...
+787         #  (rp2, rp2, rp2)
+788         # Then we zip each of this permutations to our group list resulting in
+789         # a list of list of group - rp pairs:
+790         # [[('g1', 'rp1'), ('g2', 'rp1'), ('g3', 'rp1')],
+791         #  [('g1', 'rp1'), ('g2', 'rp1'), ('g3', 'rp2')],
+792         #  [('g1', 'rp1'), ('g2', 'rp2'), ('g3', 'rp1')],
+793         #  ...
+794         #  [('g1', 'rp2'), ('g2', 'rp2'), ('g3', 'rp2')]]
+795         # NOTE(gibi): the list() around the zip() below is needed as the
+796         # algorithm looks into the mapping more than once and zip returns an
+797         # iterator in py3.x. Still we need to generate a mapping once hence the
+798         # generator expression.
+799         every_possible_mapping = (list(zip(self.requested_resources, rps))
+800                                   for rps in itertools.product(
+801                                       placement_allocations.keys(),
+802                                       repeat=len(self.requested_resources)))
+803         for mapping in every_possible_mapping:
+804             if self._is_valid_group_rp_mapping(
+805                     mapping, placement_allocations, provider_traits):
+806                 for group, rp in mapping:
+807                     # NOTE(gibi): un-numbered group might be mapped to more
+808                     # than one RP but we do not support that yet here.
+809                     group.provider_uuids = [rp]
+810                 LOG.debug('Found valid group - RP mapping %s', mapping)
+811                 return
+812 
+813         # if we reached this point then none of the possible mappings was
+814         # valid. This should never happen as Placement returns allocation
+815         # candidates based on the overall resource request of the server
+816         # including the request of the groups.
+817         raise ValueError('No valid group - RP mapping is found for '
+818                          'groups %s, allocation %s and provider traits %s' %
+819                          (self.requested_resources, placement_allocations,
+820                           provider_traits))
+821 
+822 
+823 @base.NovaObjectRegistry.register
+824 class Destination(base.NovaObject):
+825     # Version 1.0: Initial version
+826     # Version 1.1: Add cell field
+827     # Version 1.2: Add aggregates field
+828     VERSION = '1.2'
+829 
+830     fields = {
+831         'host': fields.StringField(),
+832         # NOTE(sbauza): Given we want to split the host/node relationship later
+833         # and also remove the possibility to have multiple nodes per service,
+834         # let's provide a possible nullable node here.
+835         'node': fields.StringField(nullable=True),
+836         'cell': fields.ObjectField('CellMapping', nullable=True),
+837 
+838         # NOTE(dansmith): These are required aggregates (or sets) and
+839         # are passed to placement.  See require_aggregates() below.
+840         'aggregates': fields.ListOfStringsField(nullable=True,
+841                                                 default=None),
+842     }
+843 
+844     def obj_make_compatible(self, primitive, target_version):
+845         super(Destination, self).obj_make_compatible(primitive, target_version)
+846         target_version = versionutils.convert_version_to_tuple(target_version)
+847         if target_version < (1, 2):
+848             if 'aggregates' in primitive:
+849                 del primitive['aggregates']
+850         if target_version < (1, 1):
+851             if 'cell' in primitive:
+852                 del primitive['cell']
+853 
+854     def obj_load_attr(self, attrname):
+855         self.obj_set_defaults(attrname)
+856 
+857     def require_aggregates(self, aggregates):
+858         """Add a set of aggregates to the list of required aggregates.
+859 
+860         This will take a list of aggregates, which are to be logically OR'd
+861         together and add them to the list of required aggregates that will
+862         be used to query placement. Aggregate sets provided in sequential calls
+863         to this method will be AND'd together.
+864 
+865         For example, the following set of calls:
+866             dest.require_aggregates(['foo', 'bar'])
+867             dest.require_aggregates(['baz'])
+868         will generate the following logical query to placement:
+869             "Candidates should be in 'foo' OR 'bar', but definitely in 'baz'"
+870 
+871         :param aggregates: A list of aggregates, at least one of which
+872                            must contain the destination host.
+873 
+874         """
+875         if self.aggregates is None:
+876             self.aggregates = []
+877         self.aggregates.append(','.join(aggregates))
+878 
+879 
+880 @base.NovaObjectRegistry.register
+881 class SchedulerRetries(base.NovaObject):
+882     # Version 1.0: Initial version
+883     # Version 1.1: ComputeNodeList version 1.14
+884     VERSION = '1.1'
+885 
+886     fields = {
+887         'num_attempts': fields.IntegerField(),
+888         # NOTE(sbauza): Even if we are only using host/node strings, we need to
+889         # know which compute nodes were tried
+890         'hosts': fields.ObjectField('ComputeNodeList'),
+891     }
+892 
+893     @classmethod
+894     def from_dict(cls, context, retry_dict):
+895         # NOTE(sbauza): We are not persisting the user context since it's only
+896         # needed for hydrating the Retry object
+897         retry_obj = cls()
+898         if not ('num_attempts' and 'hosts') in retry_dict:
+899             # NOTE(sbauza): We prefer to return an empty object if the
+900             # primitive is not good enough
+901             return retry_obj
+902         retry_obj.num_attempts = retry_dict.get('num_attempts')
+903         # NOTE(sbauza): each retry_dict['hosts'] item is a list of [host, node]
+904         computes = [objects.ComputeNode(context=context, host=host,
+905                                         hypervisor_hostname=node)
+906                     for host, node in retry_dict.get('hosts')]
+907         retry_obj.hosts = objects.ComputeNodeList(objects=computes)
+908         return retry_obj
+909 
+910     def to_dict(self):
+911         legacy_hosts = [[cn.host, cn.hypervisor_hostname] for cn in self.hosts]
+912         return {'num_attempts': self.num_attempts,
+913                 'hosts': legacy_hosts}
+914 
+915 
+916 @base.NovaObjectRegistry.register
+917 class SchedulerLimits(base.NovaObject):
+918     # Version 1.0: Initial version
+919     VERSION = '1.0'
+920 
+921     fields = {
+922         'numa_topology': fields.ObjectField('NUMATopologyLimits',
+923                                             nullable=True,
+924                                             default=None),
+925         'vcpu': fields.IntegerField(nullable=True, default=None),
+926         'disk_gb': fields.IntegerField(nullable=True, default=None),
+927         'memory_mb': fields.IntegerField(nullable=True, default=None),
+928     }
+929 
+930     @classmethod
+931     def from_dict(cls, limits_dict):
+932         limits = cls(**limits_dict)
+933         # NOTE(sbauza): Since the limits can be set for each field or not, we
+934         # prefer to have the fields nullable, but default the value to None.
+935         # Here we accept that the object is always generated from a primitive
+936         # hence the use of obj_set_defaults exceptionally.
+937         limits.obj_set_defaults()
+938         return limits
+939 
+940     def to_dict(self):
+941         limits = {}
+942         for field in self.fields:
+943             if getattr(self, field) is not None:
+944                 limits[field] = getattr(self, field)
+945         return limits
+946 
+947 
+948 @base.NovaObjectRegistry.register
+949 class RequestGroup(base.NovaObject):
+950     """Versioned object based on the unversioned
+951     nova.api.openstack.placement.lib.RequestGroup object.
+952     """
+953     # Version 1.0: Initial version
+954     # Version 1.1: add requester_id and provider_uuids fields
+955     VERSION = '1.1'
+956 
+957     fields = {
+958         'use_same_provider': fields.BooleanField(default=True),
+959         'resources': fields.DictOfIntegersField(default={}),
+960         'required_traits': fields.SetOfStringsField(default=set()),
+961         'forbidden_traits': fields.SetOfStringsField(default=set()),
+962         # The aggregates field has a form of
+963         #     [[aggregate_UUID1],
+964         #      [aggregate_UUID2, aggregate_UUID3]]
+965         # meaning that the request should be fulfilled from an RP that is a
+966         # member of the aggregate aggregate_UUID1 and member of the aggregate
+967         # aggregate_UUID2 or aggregate_UUID3 .
+968         'aggregates': fields.ListOfListsOfStringsField(default=[]),
+969         # The entity the request is coming from (e.g. the Neutron port uuid)
+970         # which may not always be a UUID.
+971         'requester_id': fields.StringField(nullable=True, default=None),
+972         # The resource provider UUIDs that together fulfill the request
+973         # NOTE(gibi): this can be more than one if this is the unnumbered
+974         # request group (i.e. use_same_provider=False)
+975         'provider_uuids': fields.ListOfUUIDField(default=[]),
+976     }
+977 
+978     def __init__(self, context=None, **kwargs):
+979         super(RequestGroup, self).__init__(context=context, **kwargs)
+980         self.obj_set_defaults()
+981 
+982     @classmethod
+983     def from_port_request(cls, context, port_uuid, port_resource_request):
+984         """Init the group from the resource request of a neutron port
+985 
+986         :param context: the request context
+987         :param port_uuid: the port requesting the resources
+988         :param port_resource_request: the resource_request attribute of the
+989                                       neutron port
+990         For example:
+991 
+992             port_resource_request = {
+993                 "resources": {
+994                     "NET_BW_IGR_KILOBIT_PER_SEC": 1000,
+995                     "NET_BW_EGR_KILOBIT_PER_SEC": 1000},
+996                 "required": ["CUSTOM_PHYSNET_2",
+997                              "CUSTOM_VNIC_TYPE_NORMAL"]
+998             }
+999         """
+1000 
+1001         # NOTE(gibi): Assumptions:
+1002         # * a port requests resource from a single provider.
+1003         # * a port only specifies resources and required traits
+1004         # NOTE(gibi): Placement rejects allocation candidates where a request
+1005         # group has traits but no resources specified. This is why resources
+1006         # are handled as mandatory below but not traits.
+1007         obj = cls(context=context,
+1008                   use_same_provider=True,
+1009                   resources=port_resource_request['resources'],
+1010                   required_traits=set(port_resource_request.get(
+1011                       'required', [])),
+1012                   requester_id=port_uuid)
+1013         obj.obj_set_defaults()
+1014         return obj
+1015 
+1016     def obj_make_compatible(self, primitive, target_version):
+1017         super(RequestGroup, self).obj_make_compatible(
+1018             primitive, target_version)
+1019         target_version = versionutils.convert_version_to_tuple(target_version)
+1020         if target_version < (1, 1):
+1021             if 'requester_id' in primitive:
+1022                 del primitive['requester_id']
+1023             if 'provider_uuids' in primitive:
+1024                 del primitive['provider_uuids']

@@ -1,0 +1,442 @@
+Please review the code below to detect security defects. If any are found, please describe the security defect in detail and indicate the corresponding line number of code and solution. If none are found, please state '''No security defects are detected in the code'''.
+
+1 # Copyright 2012 Locaweb.
+2 # All Rights Reserved.
+3 #
+4 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
+5 #    not use this file except in compliance with the License. You may obtain
+6 #    a copy of the License at
+7 #
+8 #         http://www.apache.org/licenses/LICENSE-2.0
+9 #
+10 #    Unless required by applicable law or agreed to in writing, software
+11 #    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+12 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+13 #    License for the specific language governing permissions and limitations
+14 #    under the License.
+15 
+16 import fcntl
+17 import glob
+18 import grp
+19 import os
+20 import pwd
+21 import shlex
+22 import socket
+23 import struct
+24 import threading
+25 
+26 import debtcollector
+27 import eventlet
+28 from eventlet.green import subprocess
+29 from eventlet import greenthread
+30 from neutron_lib import constants
+31 from neutron_lib.utils import helpers
+32 from oslo_config import cfg
+33 from oslo_log import log as logging
+34 from oslo_rootwrap import client
+35 from oslo_utils import encodeutils
+36 from oslo_utils import excutils
+37 from oslo_utils import fileutils
+38 from six import iterbytes
+39 from six.moves import http_client as httplib
+40 
+41 from neutron._i18n import _, _LE
+42 from neutron.agent.common import config
+43 from neutron.common import utils
+44 from neutron import wsgi
+45 
+46 
+47 LOG = logging.getLogger(__name__)
+48 
+49 
+50 class ProcessExecutionError(RuntimeError):
+51     def __init__(self, message, returncode):
+52         super(ProcessExecutionError, self).__init__(message)
+53         self.returncode = returncode
+54 
+55 
+56 class RootwrapDaemonHelper(object):
+57     __client = None
+58     __lock = threading.Lock()
+59 
+60     def __new__(cls):
+61         """There is no reason to instantiate this class"""
+62         raise NotImplementedError()
+63 
+64     @classmethod
+65     def get_client(cls):
+66         with cls.__lock:
+67             if cls.__client is None:
+68                 cls.__client = client.Client(
+69                     shlex.split(cfg.CONF.AGENT.root_helper_daemon))
+70             return cls.__client
+71 
+72 
+73 def addl_env_args(addl_env):
+74     """Build arguments for adding additional environment vars with env"""
+75 
+76     # NOTE (twilson) If using rootwrap, an EnvFilter should be set up for the
+77     # command instead of a CommandFilter.
+78     if addl_env is None:
+79         return []
+80     return ['env'] + ['%s=%s' % pair for pair in addl_env.items()]
+81 
+82 
+83 def create_process(cmd, run_as_root=False, addl_env=None):
+84     """Create a process object for the given command.
+85 
+86     The return value will be a tuple of the process object and the
+87     list of command arguments used to create it.
+88     """
+89     cmd = list(map(str, addl_env_args(addl_env) + cmd))
+90     if run_as_root:
+91         cmd = shlex.split(config.get_root_helper(cfg.CONF)) + cmd
+92     LOG.debug("Running command: %s", cmd)
+93     obj = utils.subprocess_popen(cmd, shell=False,
+94                                  stdin=subprocess.PIPE,
+95                                  stdout=subprocess.PIPE,
+96                                  stderr=subprocess.PIPE)
+97 
+98     return obj, cmd
+99 
+100 
+101 def execute_rootwrap_daemon(cmd, process_input, addl_env):
+102     cmd = list(map(str, addl_env_args(addl_env) + cmd))
+103     # NOTE(twilson) oslo_rootwrap.daemon will raise on filter match
+104     # errors, whereas oslo_rootwrap.cmd converts them to return codes.
+105     # In practice, no neutron code should be trying to execute something that
+106     # would throw those errors, and if it does it should be fixed as opposed to
+107     # just logging the execution error.
+108     LOG.debug("Running command (rootwrap daemon): %s", cmd)
+109     client = RootwrapDaemonHelper.get_client()
+110     return client.execute(cmd, process_input)
+111 
+112 
+113 def execute(cmd, process_input=None, addl_env=None,
+114             check_exit_code=True, return_stderr=False, log_fail_as_error=True,
+115             extra_ok_codes=None, run_as_root=False):
+116     try:
+117         if process_input is not None:
+118             _process_input = encodeutils.to_utf8(process_input)
+119         else:
+120             _process_input = None
+121         if run_as_root and cfg.CONF.AGENT.root_helper_daemon:
+122             returncode, _stdout, _stderr = (
+123                 execute_rootwrap_daemon(cmd, process_input, addl_env))
+124         else:
+125             obj, cmd = create_process(cmd, run_as_root=run_as_root,
+126                                       addl_env=addl_env)
+127             _stdout, _stderr = obj.communicate(_process_input)
+128             returncode = obj.returncode
+129             obj.stdin.close()
+130         _stdout = helpers.safe_decode_utf8(_stdout)
+131         _stderr = helpers.safe_decode_utf8(_stderr)
+132 
+133         extra_ok_codes = extra_ok_codes or []
+134         if returncode and returncode not in extra_ok_codes:
+135             msg = _("Exit code: %(returncode)d; "
+136                     "Stdin: %(stdin)s; "
+137                     "Stdout: %(stdout)s; "
+138                     "Stderr: %(stderr)s") % {
+139                         'returncode': returncode,
+140                         'stdin': process_input or '',
+141                         'stdout': _stdout,
+142                         'stderr': _stderr}
+143 
+144             if log_fail_as_error:
+145                 LOG.error(msg)
+146             if check_exit_code:
+147                 raise ProcessExecutionError(msg, returncode=returncode)
+148         else:
+149             LOG.debug("Exit code: %d", returncode)
+150 
+151     finally:
+152         # NOTE(termie): this appears to be necessary to let the subprocess
+153         #               call clean something up in between calls, without
+154         #               it two execute calls in a row hangs the second one
+155         greenthread.sleep(0)
+156 
+157     return (_stdout, _stderr) if return_stderr else _stdout
+158 
+159 
+160 @debtcollector.removals.remove(
+161     version='Ocata', removal_version='Pike',
+162     message="Use 'neutron.agent.linux.ip_lib.get_device_mac' instead."
+163 )
+164 def get_interface_mac(interface):
+165     MAC_START = 18
+166     MAC_END = 24
+167     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+168     dev = interface[:constants.DEVICE_NAME_MAX_LEN]
+169     dev = encodeutils.to_utf8(dev)
+170     info = fcntl.ioctl(s.fileno(), 0x8927, struct.pack('256s', dev))
+171     return ':'.join(["%02x" % b for b in iterbytes(info[MAC_START:MAC_END])])
+172 
+173 
+174 def find_child_pids(pid, recursive=False):
+175     """Retrieve a list of the pids of child processes of the given pid.
+176 
+177     It can also find all children through the hierarchy if recursive=True
+178     """
+179     try:
+180         raw_pids = execute(['ps', '--ppid', pid, '-o', 'pid='],
+181                            log_fail_as_error=False)
+182     except ProcessExecutionError as e:
+183         # Unexpected errors are the responsibility of the caller
+184         with excutils.save_and_reraise_exception() as ctxt:
+185             # Exception has already been logged by execute
+186             no_children_found = e.returncode == 1
+187             if no_children_found:
+188                 ctxt.reraise = False
+189                 return []
+190     child_pids = [x.strip() for x in raw_pids.split('\n') if x.strip()]
+191     if recursive:
+192         for child in child_pids:
+193             child_pids = child_pids + find_child_pids(child, True)
+194     return child_pids
+195 
+196 
+197 def find_parent_pid(pid):
+198     """Retrieve the pid of the parent process of the given pid.
+199 
+200     If the pid doesn't exist in the system, this function will return
+201     None
+202     """
+203     try:
+204         ppid = execute(['ps', '-o', 'ppid=', pid],
+205                        log_fail_as_error=False)
+206     except ProcessExecutionError as e:
+207         # Unexpected errors are the responsibility of the caller
+208         with excutils.save_and_reraise_exception() as ctxt:
+209             # Exception has already been logged by execute
+210             no_such_pid = e.returncode == 1
+211             if no_such_pid:
+212                 ctxt.reraise = False
+213                 return
+214     return ppid.strip()
+215 
+216 
+217 def find_fork_top_parent(pid):
+218     """Retrieve the pid of the top parent of the given pid through a fork.
+219 
+220     This function will search the top parent with its same cmdline. If the
+221     given pid has no parent, its own pid will be returned
+222     """
+223     while True:
+224         ppid = find_parent_pid(pid)
+225         if (ppid and ppid != pid and
+226                 pid_invoked_with_cmdline(ppid, get_cmdline_from_pid(pid))):
+227             pid = ppid
+228         else:
+229             return pid
+230 
+231 
+232 def kill_process(pid, signal, run_as_root=False):
+233     """Kill the process with the given pid using the given signal."""
+234     try:
+235         execute(['kill', '-%d' % signal, pid], run_as_root=run_as_root)
+236     except ProcessExecutionError as ex:
+237         if process_is_running(pid):
+238             raise
+239 
+240 
+241 def _get_conf_base(cfg_root, uuid, ensure_conf_dir):
+242     #TODO(mangelajo): separate responsibilities here, ensure_conf_dir
+243     #                 should be a separate function
+244     conf_dir = os.path.abspath(os.path.normpath(cfg_root))
+245     conf_base = os.path.join(conf_dir, uuid)
+246     if ensure_conf_dir:
+247         fileutils.ensure_tree(conf_dir, mode=0o755)
+248     return conf_base
+249 
+250 
+251 def get_conf_file_name(cfg_root, uuid, cfg_file, ensure_conf_dir=False):
+252     """Returns the file name for a given kind of config file."""
+253     conf_base = _get_conf_base(cfg_root, uuid, ensure_conf_dir)
+254     return "%s.%s" % (conf_base, cfg_file)
+255 
+256 
+257 def get_value_from_file(filename, converter=None):
+258 
+259     try:
+260         with open(filename, 'r') as f:
+261             try:
+262                 return converter(f.read()) if converter else f.read()
+263             except ValueError:
+264                 LOG.error(_LE('Unable to convert value in %s'), filename)
+265     except IOError:
+266         LOG.debug('Unable to access %s', filename)
+267 
+268 
+269 def remove_conf_files(cfg_root, uuid):
+270     conf_base = _get_conf_base(cfg_root, uuid, False)
+271     for file_path in glob.iglob("%s.*" % conf_base):
+272         os.unlink(file_path)
+273 
+274 
+275 def get_root_helper_child_pid(pid, expected_cmd, run_as_root=False):
+276     """
+277     Get the first non root_helper child pid in the process hierarchy.
+278 
+279     If root helper was used, two or more processes would be created:
+280 
+281      - a root helper process (e.g. sudo myscript)
+282      - possibly a rootwrap script (e.g. neutron-rootwrap)
+283      - a child process (e.g. myscript)
+284      - possibly its child processes
+285 
+286     Killing the root helper process will leave the child process
+287     running, re-parented to init, so the only way to ensure that both
+288     die is to target the child process directly.
+289     """
+290     pid = str(pid)
+291     if run_as_root:
+292         while True:
+293             try:
+294                 # We shouldn't have more than one child per process
+295                 # so keep getting the children of the first one
+296                 pid = find_child_pids(pid)[0]
+297             except IndexError:
+298                 return  # We never found the child pid with expected_cmd
+299 
+300             # If we've found a pid with no root helper, return it.
+301             # If we continue, we can find transient children.
+302             if pid_invoked_with_cmdline(pid, expected_cmd):
+303                 break
+304     return pid
+305 
+306 
+307 def remove_abs_path(cmd):
+308     """Remove absolute path of executable in cmd
+309 
+310     Note: New instance of list is returned
+311 
+312     :param cmd: parsed shlex command (e.g. ['/bin/foo', 'param1', 'param two'])
+313 
+314     """
+315     if cmd and os.path.isabs(cmd[0]):
+316         cmd = list(cmd)
+317         cmd[0] = os.path.basename(cmd[0])
+318 
+319     return cmd
+320 
+321 
+322 def process_is_running(pid):
+323     """Find if the given PID is running in the system.
+324 
+325     """
+326     return pid and os.path.exists('/proc/%s' % pid)
+327 
+328 
+329 def get_cmdline_from_pid(pid):
+330     if not process_is_running(pid):
+331         return []
+332     with open('/proc/%s/cmdline' % pid, 'r') as f:
+333         return f.readline().split('\0')[:-1]
+334 
+335 
+336 def cmd_matches_expected(cmd, expected_cmd):
+337     abs_cmd = remove_abs_path(cmd)
+338     abs_expected_cmd = remove_abs_path(expected_cmd)
+339     if abs_cmd != abs_expected_cmd:
+340         # Commands executed with #! are prefixed with the script
+341         # executable. Check for the expected cmd being a subset of the
+342         # actual cmd to cover this possibility.
+343         abs_cmd = remove_abs_path(abs_cmd[1:])
+344     return abs_cmd == abs_expected_cmd
+345 
+346 
+347 def pid_invoked_with_cmdline(pid, expected_cmd):
+348     """Validate process with given pid is running with provided parameters
+349 
+350     """
+351     cmd = get_cmdline_from_pid(pid)
+352     return cmd_matches_expected(cmd, expected_cmd)
+353 
+354 
+355 def ensure_directory_exists_without_file(path):
+356     dirname = os.path.dirname(path)
+357     if os.path.isdir(dirname):
+358         try:
+359             os.unlink(path)
+360         except OSError:
+361             with excutils.save_and_reraise_exception() as ctxt:
+362                 if not os.path.exists(path):
+363                     ctxt.reraise = False
+364     else:
+365         fileutils.ensure_tree(dirname, mode=0o755)
+366 
+367 
+368 def is_effective_user(user_id_or_name):
+369     """Returns True if user_id_or_name is effective user (id/name)."""
+370     euid = os.geteuid()
+371     if str(user_id_or_name) == str(euid):
+372         return True
+373     effective_user_name = pwd.getpwuid(euid).pw_name
+374     return user_id_or_name == effective_user_name
+375 
+376 
+377 def is_effective_group(group_id_or_name):
+378     """Returns True if group_id_or_name is effective group (id/name)."""
+379     egid = os.getegid()
+380     if str(group_id_or_name) == str(egid):
+381         return True
+382     effective_group_name = grp.getgrgid(egid).gr_name
+383     return group_id_or_name == effective_group_name
+384 
+385 
+386 class UnixDomainHTTPConnection(httplib.HTTPConnection):
+387     """Connection class for HTTP over UNIX domain socket."""
+388     def __init__(self, host, port=None, strict=None, timeout=None,
+389                  proxy_info=None):
+390         httplib.HTTPConnection.__init__(self, host, port, strict)
+391         self.timeout = timeout
+392         self.socket_path = cfg.CONF.metadata_proxy_socket
+393 
+394     def connect(self):
+395         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+396         if self.timeout:
+397             self.sock.settimeout(self.timeout)
+398         self.sock.connect(self.socket_path)
+399 
+400 
+401 class UnixDomainHttpProtocol(eventlet.wsgi.HttpProtocol):
+402     # TODO(jlibosva): This is just a workaround not to set TCP_NODELAY on
+403     # socket due to 40714b1ffadd47b315ca07f9b85009448f0fe63d evenlet change
+404     # This should be removed once
+405     # https://github.com/eventlet/eventlet/issues/301 is fixed
+406     disable_nagle_algorithm = False
+407 
+408     def __init__(self, request, client_address, server):
+409         if client_address == '':
+410             client_address = ('<local>', 0)
+411         # base class is old-style, so super does not work properly
+412         eventlet.wsgi.HttpProtocol.__init__(self, request, client_address,
+413                                             server)
+414 
+415 
+416 class UnixDomainWSGIServer(wsgi.Server):
+417     def __init__(self, name, num_threads=None):
+418         self._socket = None
+419         self._launcher = None
+420         self._server = None
+421         super(UnixDomainWSGIServer, self).__init__(name, disable_ssl=True,
+422                                                    num_threads=num_threads)
+423 
+424     def start(self, application, file_socket, workers, backlog, mode=None):
+425         self._socket = eventlet.listen(file_socket,
+426                                        family=socket.AF_UNIX,
+427                                        backlog=backlog)
+428         if mode is not None:
+429             os.chmod(file_socket, mode)
+430 
+431         self._launch(application, workers=workers)
+432 
+433     def _run(self, application, socket):
+434         """Start a WSGI service in a new green thread."""
+435         logger = logging.getLogger('eventlet.wsgi.server')
+436         eventlet.wsgi.server(socket,
+437                              application,
+438                              max_size=self.num_threads,
+439                              protocol=UnixDomainHttpProtocol,
+440                              log=logger)

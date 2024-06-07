@@ -1,0 +1,1189 @@
+Please review the code below for security defects. You can consider defect types in terms of:
+1.CWE-284 (Improper Access Control)
+2.CWE-435 (Improper Interaction Between Multiple Entities)
+3.CWE-664 (Improper Control of a Resource Through its Lifetime)
+4.CWE-682 (Incorrect Calculation)
+5.CWE-691 (Insufficient Control Flow Management)
+6.CWE-693 (Protection Mechanism Failure)
+7.CWE-697 (Incorrect Comparison)
+8.CWE-703 (Improper Check or Handling of Exceptional Conditions)
+9.CWE-707 (Improper Neutralization)
+10.CWE-710 (Improper Adherence to Coding Standards)
+If any are found, please describe the security defect in detail and indicate the corresponding line number of code and solution. If none are detected, states: 'No security defects are detected in the code'.
+
+1 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
+2 #    not use this file except in compliance with the License. You may obtain
+3 #    a copy of the License at
+4 #
+5 #         http://www.apache.org/licenses/LICENSE-2.0
+6 #
+7 #    Unless required by applicable law or agreed to in writing, software
+8 #    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+9 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+10 #    License for the specific language governing permissions and limitations
+11 #    under the License.
+12 
+13 import mock
+14 
+15 from oslo_db import exception as oslo_db_exc
+16 from oslo_utils.fixture import uuidsentinel as uuids
+17 
+18 from nova.compute import instance_actions
+19 from nova import conf
+20 from nova import context as nova_context
+21 from nova.db import api as db_api
+22 from nova import exception
+23 from nova import objects
+24 from nova.policies import base as base_policies
+25 from nova.policies import servers as servers_policies
+26 from nova.scheduler import utils as scheduler_utils
+27 from nova.scheduler import weights
+28 from nova.tests import fixtures as nova_fixtures
+29 from nova.tests.functional import integrated_helpers
+30 from nova.tests.unit import cast_as_call
+31 from nova.tests.unit import fake_notifier
+32 from nova.tests.unit.image import fake as fake_image
+33 from nova import utils
+34 
+35 CONF = conf.CONF
+36 
+37 
+38 class HostNameWeigher(weights.BaseHostWeigher):
+39     # TestMultiCellMigrate creates host1 in cell1 and host2 in cell2.
+40     # Something about migrating from host1 to host2 teases out failures
+41     # which probably has to do with cell1 being the default cell DB in
+42     # our base test class setup, so prefer host1 to make the tests
+43     # deterministic.
+44     _weights = {'host1': 100, 'host2': 50}
+45 
+46     def _weigh_object(self, host_state, weight_properties):
+47         # Any undefined host gets no weight.
+48         return self._weights.get(host_state.host, 0)
+49 
+50 
+51 class TestMultiCellMigrate(integrated_helpers.ProviderUsageBaseTestCase):
+52     """Tests for cross-cell cold migration (resize)"""
+53 
+54     NUMBER_OF_CELLS = 2
+55     compute_driver = 'fake.MediumFakeDriver'
+56 
+57     def setUp(self):
+58         # Use our custom weigher defined above to make sure that we have
+59         # a predictable scheduling sort order during server create.
+60         weight_classes = [
+61             __name__ + '.HostNameWeigher',
+62             'nova.scheduler.weights.cross_cell.CrossCellWeigher'
+63         ]
+64         self.flags(weight_classes=weight_classes,
+65                    group='filter_scheduler')
+66         super(TestMultiCellMigrate, self).setUp()
+67         self.cinder = self.useFixture(nova_fixtures.CinderFixture(self))
+68 
+69         self._enable_cross_cell_resize()
+70         self.created_images = []  # list of image IDs created during resize
+71 
+72         # Adjust the polling interval and timeout for long RPC calls.
+73         self.flags(rpc_response_timeout=1)
+74         self.flags(long_rpc_timeout=60)
+75 
+76         # Set up 2 compute services in different cells
+77         self.host_to_cell_mappings = {
+78             'host1': 'cell1', 'host2': 'cell2'}
+79 
+80         self.cell_to_aggregate = {}
+81         for host in sorted(self.host_to_cell_mappings):
+82             cell_name = self.host_to_cell_mappings[host]
+83             # Start the compute service on the given host in the given cell.
+84             self._start_compute(host, cell_name=cell_name)
+85             # Create an aggregate where the AZ name is the cell name.
+86             agg_id = self._create_aggregate(
+87                 cell_name, availability_zone=cell_name)
+88             # Add the host to the aggregate.
+89             body = {'add_host': {'host': host}}
+90             self.admin_api.post_aggregate_action(agg_id, body)
+91             self.cell_to_aggregate[cell_name] = agg_id
+92 
+93     def _enable_cross_cell_resize(self):
+94         # Enable cross-cell resize policy since it defaults to not allow
+95         # anyone to perform that type of operation. For these tests we'll
+96         # just allow admins to perform cross-cell resize.
+97         self.policy.set_rules({
+98             servers_policies.CROSS_CELL_RESIZE:
+99                 base_policies.RULE_ADMIN_API},
+100             overwrite=False)
+101 
+102     def assertFlavorMatchesAllocation(self, flavor, allocation,
+103                                       volume_backed=False):
+104         self.assertEqual(flavor['vcpus'], allocation['VCPU'])
+105         self.assertEqual(flavor['ram'], allocation['MEMORY_MB'])
+106         # Volume-backed instances won't have DISK_GB allocations.
+107         if volume_backed:
+108             self.assertNotIn('DISK_GB', allocation)
+109         else:
+110             self.assertEqual(flavor['disk'], allocation['DISK_GB'])
+111 
+112     def assert_instance_fields_match_flavor(self, instance, flavor):
+113         self.assertEqual(instance.memory_mb, flavor['ram'])
+114         self.assertEqual(instance.vcpus, flavor['vcpus'])
+115         self.assertEqual(instance.root_gb, flavor['disk'])
+116         self.assertEqual(
+117             instance.ephemeral_gb, flavor['OS-FLV-EXT-DATA:ephemeral'])
+118 
+119     def _count_volume_attachments(self, server_id):
+120         attachment_ids = self.cinder.attachment_ids_for_instance(server_id)
+121         return len(attachment_ids)
+122 
+123     def assert_quota_usage(self, expected_num_instances):
+124         limits = self.api.get_limits()['absolute']
+125         self.assertEqual(expected_num_instances, limits['totalInstancesUsed'])
+126 
+127     def _create_server(self, flavor, volume_backed=False, group_id=None,
+128                        no_networking=False):
+129         """Creates a server and waits for it to be ACTIVE
+130 
+131         :param flavor: dict form of the flavor to use
+132         :param volume_backed: True if the server should be volume-backed
+133         :param group_id: UUID of a server group in which to create the server
+134         :param no_networking: True if the server should be creating without
+135             networking, otherwise it will be created with a specific port and
+136             VIF tag
+137         :returns: server dict response from the GET /servers/{server_id} API
+138         """
+139         if no_networking:
+140             networks = 'none'
+141         else:
+142             # Provide a VIF tag for the pre-existing port. Since VIF tags are
+143             # stored in the virtual_interfaces table in the cell DB, we want to
+144             # make sure those survive the resize to another cell.
+145             networks = [{
+146                 'port': self.neutron.port_1['id'],
+147                 'tag': 'private'
+148             }]
+149         image_uuid = fake_image.get_valid_image_id()
+150         server = self._build_minimal_create_server_request(
+151             'test_cross_cell_resize',
+152             image_uuid=image_uuid,
+153             flavor_id=flavor['id'],
+154             networks=networks)
+155         # Put a tag on the server to make sure that survives the resize.
+156         server['tags'] = ['test']
+157         if volume_backed:
+158             bdms = [{
+159                 'boot_index': 0,
+160                 'uuid': nova_fixtures.CinderFixture.IMAGE_BACKED_VOL,
+161                 'source_type': 'volume',
+162                 'destination_type': 'volume',
+163                 'tag': 'root'
+164             }]
+165             server['block_device_mapping_v2'] = bdms
+166             # We don't need the imageRef for volume-backed servers.
+167             server.pop('imageRef', None)
+168 
+169         req = dict(server=server)
+170         if group_id:
+171             req['os:scheduler_hints'] = {'group': group_id}
+172         server = self.api.post_server(req)
+173         server = self._wait_for_state_change(server, 'ACTIVE')
+174         # For volume-backed make sure there is one attachment to start.
+175         if volume_backed:
+176             self.assertEqual(1, self._count_volume_attachments(server['id']),
+177                              self.cinder.volume_to_attachment)
+178         return server
+179 
+180     def stub_image_create(self):
+181         """Stubs the _FakeImageService.create method to track created images"""
+182         original_create = self.image_service.create
+183 
+184         def image_create_snooper(*args, **kwargs):
+185             image = original_create(*args, **kwargs)
+186             self.created_images.append(image['id'])
+187             return image
+188 
+189         _p = mock.patch.object(
+190             self.image_service, 'create', side_effect=image_create_snooper)
+191         _p.start()
+192         self.addCleanup(_p.stop)
+193 
+194     def _resize_and_validate(self, volume_backed=False, stopped=False,
+195                              target_host=None, server=None):
+196         """Creates (if a server is not provided) and resizes the server to
+197         another cell. Validates various aspects of the server and its related
+198         records (allocations, migrations, actions, VIF tags, etc).
+199 
+200         :param volume_backed: True if the server should be volume-backed, False
+201             if image-backed.
+202         :param stopped: True if the server should be stopped prior to resize,
+203             False if the server should be ACTIVE
+204         :param target_host: If not None, triggers a cold migration to the
+205             specified host.
+206         :param server: A pre-existing server to resize. If None this method
+207             creates the server.
+208         :returns: tuple of:
+209             - server response object
+210             - source compute node resource provider uuid
+211             - target compute node resource provider uuid
+212             - old flavor
+213             - new flavor
+214         """
+215         flavors = self.api.get_flavors()
+216         if server is None:
+217             # Create the server.
+218             old_flavor = flavors[0]
+219             server = self._create_server(
+220                 old_flavor, volume_backed=volume_backed)
+221         else:
+222             for flavor in flavors:
+223                 if flavor['name'] == server['flavor']['original_name']:
+224                     old_flavor = flavor
+225                     break
+226             else:
+227                 self.fail('Unable to find old flavor with name %s. Flavors: '
+228                           '%s', server['flavor']['original_name'], flavors)
+229         original_host = server['OS-EXT-SRV-ATTR:host']
+230         image_uuid = None if volume_backed else server['image']['id']
+231 
+232         # Our HostNameWeigher ensures the server starts in cell1, so we expect
+233         # the server AZ to be cell1 as well.
+234         self.assertEqual('cell1', server['OS-EXT-AZ:availability_zone'])
+235 
+236         if stopped:
+237             # Stop the server before resizing it.
+238             self.api.post_server_action(server['id'], {'os-stop': None})
+239             self._wait_for_state_change(server, 'SHUTOFF')
+240 
+241         # Before resizing make sure quota usage is only 1 for total instances.
+242         self.assert_quota_usage(expected_num_instances=1)
+243 
+244         if target_host:
+245             # Cold migrate the server to the target host.
+246             new_flavor = old_flavor  # flavor does not change for cold migrate
+247             body = {'migrate': {'host': target_host}}
+248             expected_host = target_host
+249         else:
+250             # Resize it which should migrate the server to the host in the
+251             # other cell.
+252             new_flavor = flavors[1]
+253             body = {'resize': {'flavorRef': new_flavor['id']}}
+254             expected_host = 'host1' if original_host == 'host2' else 'host2'
+255 
+256         self.stub_image_create()
+257 
+258         self.api.post_server_action(server['id'], body)
+259         # Wait for the server to be resized and then verify the host has
+260         # changed to be the host in the other cell.
+261         server = self._wait_for_state_change(server, 'VERIFY_RESIZE')
+262         self.assertEqual(expected_host, server['OS-EXT-SRV-ATTR:host'])
+263         # Assert that the instance is only listed one time from the API (to
+264         # make sure it's not listed out of both cells).
+265         # Note that we only get one because the DB API excludes hidden
+266         # instances by default (see instance_get_all_by_filters_sort).
+267         servers = self.api.get_servers()
+268         self.assertEqual(1, len(servers),
+269                          'Unexpected number of servers: %s' % servers)
+270         self.assertEqual(expected_host, servers[0]['OS-EXT-SRV-ATTR:host'])
+271 
+272         # And that there is only one migration record.
+273         migrations = self.api.api_get(
+274             '/os-migrations?instance_uuid=%s' % server['id']
+275         ).body['migrations']
+276         self.assertEqual(1, len(migrations),
+277                          'Unexpected number of migrations records: %s' %
+278                          migrations)
+279         migration = migrations[0]
+280         self.assertEqual('finished', migration['status'])
+281 
+282         # There should be at least two actions, one for create and one for the
+283         # resize. There will be a third action if the server was stopped. Use
+284         # assertGreaterEqual in case a test performed some actions on a
+285         # pre-created server before resizing it, like attaching a volume.
+286         actions = self.api.api_get(
+287             '/servers/%s/os-instance-actions' % server['id']
+288         ).body['instanceActions']
+289         expected_num_of_actions = 3 if stopped else 2
+290         self.assertGreaterEqual(len(actions), expected_num_of_actions, actions)
+291         # Each action should have events (make sure these were copied from
+292         # the source cell to the target cell).
+293         for action in actions:
+294             detail = self.api.api_get(
+295                 '/servers/%s/os-instance-actions/%s' % (
+296                     server['id'], action['request_id'])).body['instanceAction']
+297             self.assertNotEqual(0, len(detail['events']), detail)
+298 
+299         # The tag should still be present on the server.
+300         self.assertEqual(1, len(server['tags']),
+301                          'Server tags not found in target cell.')
+302         self.assertEqual('test', server['tags'][0])
+303 
+304         # Confirm the source node has allocations for the old flavor and the
+305         # target node has allocations for the new flavor.
+306         source_rp_uuid = self._get_provider_uuid_by_host(original_host)
+307         # The source node allocations should be on the migration record.
+308         source_allocations = self._get_allocations_by_provider_uuid(
+309             source_rp_uuid)[migration['uuid']]['resources']
+310         self.assertFlavorMatchesAllocation(
+311             old_flavor, source_allocations, volume_backed=volume_backed)
+312 
+313         target_rp_uuid = self._get_provider_uuid_by_host(expected_host)
+314         # The target node allocations should be on the instance record.
+315         target_allocations = self._get_allocations_by_provider_uuid(
+316             target_rp_uuid)[server['id']]['resources']
+317         self.assertFlavorMatchesAllocation(
+318             new_flavor, target_allocations, volume_backed=volume_backed)
+319 
+320         # The instance, in the target cell DB, should have the old and new
+321         # flavor stored with it with the values we expect at this point.
+322         target_cell_name = self.host_to_cell_mappings[expected_host]
+323         self.assertEqual(
+324             target_cell_name, server['OS-EXT-AZ:availability_zone'])
+325         target_cell = self.cell_mappings[target_cell_name]
+326         admin_context = nova_context.get_admin_context()
+327         with nova_context.target_cell(admin_context, target_cell) as cctxt:
+328             inst = objects.Instance.get_by_uuid(
+329                 cctxt, server['id'], expected_attrs=['flavor'])
+330             self.assertIsNotNone(
+331                 inst.old_flavor,
+332                 'instance.old_flavor not saved in target cell')
+333             self.assertIsNotNone(
+334                 inst.new_flavor,
+335                 'instance.new_flavor not saved in target cell')
+336             self.assertEqual(inst.flavor.flavorid, inst.new_flavor.flavorid)
+337             if target_host:  # cold migrate so flavor does not change
+338                 self.assertEqual(
+339                     inst.flavor.flavorid, inst.old_flavor.flavorid)
+340             else:
+341                 self.assertNotEqual(
+342                     inst.flavor.flavorid, inst.old_flavor.flavorid)
+343             self.assertEqual(old_flavor['id'], inst.old_flavor.flavorid)
+344             self.assertEqual(new_flavor['id'], inst.new_flavor.flavorid)
+345             # Assert the ComputeManager._set_instance_info fields
+346             # are correct after the resize.
+347             self.assert_instance_fields_match_flavor(inst, new_flavor)
+348             # The availability_zone field in the DB should also be updated.
+349             self.assertEqual(target_cell_name, inst.availability_zone)
+350 
+351         # A pre-created server might not have any ports attached.
+352         if server['addresses']:
+353             # Assert the VIF tag was carried through to the target cell DB.
+354             interface_attachments = self.api.get_port_interfaces(server['id'])
+355             self.assertEqual(1, len(interface_attachments))
+356             self.assertEqual('private', interface_attachments[0]['tag'])
+357 
+358         if volume_backed:
+359             # Assert the BDM tag was carried through to the target cell DB.
+360             volume_attachments = self.api.get_server_volumes(server['id'])
+361             self.assertEqual(1, len(volume_attachments))
+362             self.assertEqual('root', volume_attachments[0]['tag'])
+363 
+364         # Make sure the guest is no longer tracked on the source node.
+365         source_guest_uuids = (
+366             self.computes[original_host].manager.driver.list_instance_uuids())
+367         self.assertNotIn(server['id'], source_guest_uuids)
+368         # And the guest is on the target node hypervisor.
+369         target_guest_uuids = (
+370             self.computes[expected_host].manager.driver.list_instance_uuids())
+371         self.assertIn(server['id'], target_guest_uuids)
+372 
+373         # The source hypervisor continues to report usage in the hypervisors
+374         # API because even though the guest was destroyed there, the instance
+375         # resources are still claimed on that node in case the user reverts.
+376         self.assert_hypervisor_usage(source_rp_uuid, old_flavor, volume_backed)
+377         # The new flavor should show up with resource usage on the target host.
+378         self.assert_hypervisor_usage(target_rp_uuid, new_flavor, volume_backed)
+379 
+380         # While we have a copy of the instance in each cell database make sure
+381         # that quota usage is only reporting 1 (because one is hidden).
+382         self.assert_quota_usage(expected_num_instances=1)
+383 
+384         # For a volume-backed server, at this point there should be two volume
+385         # attachments for the instance: one tracked in the source cell and
+386         # one in the target cell.
+387         if volume_backed:
+388             self.assertEqual(2, self._count_volume_attachments(server['id']),
+389                              self.cinder.volume_to_attachment)
+390 
+391         # Assert the expected power state.
+392         expected_power_state = 4 if stopped else 1
+393         self.assertEqual(
+394             expected_power_state, server['OS-EXT-STS:power_state'],
+395             "Unexpected power state after resize.")
+396 
+397         # For an image-backed server, a snapshot image should have been created
+398         # and then deleted during the resize.
+399         if volume_backed:
+400             self.assertEqual('', server['image'])
+401             self.assertEqual(
+402                 0, len(self.created_images),
+403                 "Unexpected image create during volume-backed resize")
+404         else:
+405             # The original image for the server shown in the API should not
+406             # have changed even if a snapshot was used to create the guest
+407             # on the dest host.
+408             self.assertEqual(image_uuid, server['image']['id'])
+409             self.assertEqual(
+410                 1, len(self.created_images),
+411                 "Unexpected number of images created for image-backed resize")
+412             # Make sure the temporary snapshot image was deleted; we use the
+413             # compute images proxy API here which is deprecated so we force the
+414             # microversion to 2.1.
+415             with utils.temporary_mutation(self.api, microversion='2.1'):
+416                 self.api.api_get('/images/%s' % self.created_images[0],
+417                                  check_response_status=[404])
+418 
+419         return server, source_rp_uuid, target_rp_uuid, old_flavor, new_flavor
+420 
+421     def _attach_volume_to_server(self, server_id, volume_id):
+422         """Attaches the volume to the server and waits for the
+423         "instance.volume_attach.end" versioned notification.
+424         """
+425         body = {'volumeAttachment': {'volumeId': volume_id}}
+426         self.api.api_post(
+427             '/servers/%s/os-volume_attachments' % server_id, body)
+428         fake_notifier.wait_for_versioned_notifications(
+429             'instance.volume_attach.end')
+430 
+431     def _detach_volume_from_server(self, server_id, volume_id):
+432         """Detaches the volume from the server and waits for the
+433         "instance.volume_detach.end" versioned notification.
+434         """
+435         self.api.api_delete(
+436             '/servers/%s/os-volume_attachments/%s' % (server_id, volume_id))
+437         fake_notifier.wait_for_versioned_notifications(
+438             'instance.volume_detach.end')
+439 
+440     def assert_volume_is_attached(self, server_id, volume_id):
+441         """Asserts the volume is attached to the server."""
+442         server = self.api.get_server(server_id)
+443         attachments = server['os-extended-volumes:volumes_attached']
+444         attached_vol_ids = [attachment['id'] for attachment in attachments]
+445         self.assertIn(volume_id, attached_vol_ids,
+446                       'Attached volumes: %s' % attachments)
+447 
+448     def assert_volume_is_detached(self, server_id, volume_id):
+449         """Asserts the volume is detached from the server."""
+450         server = self.api.get_server(server_id)
+451         attachments = server['os-extended-volumes:volumes_attached']
+452         attached_vol_ids = [attachment['id'] for attachment in attachments]
+453         self.assertNotIn(volume_id, attached_vol_ids,
+454                          'Attached volumes: %s' % attachments)
+455 
+456     def assert_resize_confirm_notifications(self):
+457         # We should have gotten only two notifications:
+458         # 1. instance.resize_confirm.start
+459         # 2. instance.resize_confirm.end
+460         self.assertEqual(2, len(fake_notifier.VERSIONED_NOTIFICATIONS),
+461                          'Unexpected number of versioned notifications for '
+462                          'cross-cell resize confirm: %s' %
+463                          fake_notifier.VERSIONED_NOTIFICATIONS)
+464         start = fake_notifier.VERSIONED_NOTIFICATIONS[0]['event_type']
+465         self.assertEqual('instance.resize_confirm.start', start)
+466         end = fake_notifier.VERSIONED_NOTIFICATIONS[1]['event_type']
+467         self.assertEqual('instance.resize_confirm.end', end)
+468 
+469     def delete_server_and_assert_cleanup(self, server):
+470         """Deletes the server and makes various cleanup checks.
+471 
+472         - makes sure allocations from placement are gone
+473         - makes sure the instance record is gone from both cells
+474         - makes sure there are no leaked volume attachments
+475 
+476         :param server: dict of the server resource to delete
+477         """
+478         # Determine which cell the instance was in when the server was deleted
+479         # in the API so we can check hard vs soft delete in the DB.
+480         current_cell = self.host_to_cell_mappings[
+481             server['OS-EXT-SRV-ATTR:host']]
+482         # Delete the server and check that the allocations are gone from
+483         # the placement service.
+484         self._delete_and_check_allocations(server)
+485         # Make sure the instance record is gone from both cell databases.
+486         ctxt = nova_context.get_admin_context()
+487         for cell_name in self.host_to_cell_mappings.values():
+488             cell = self.cell_mappings[cell_name]
+489             with nova_context.target_cell(ctxt, cell) as cctxt:
+490                 # If this is the current cell the instance was in when it was
+491                 # deleted it should be soft-deleted (instance.deleted!=0),
+492                 # otherwise it should be hard-deleted and getting it with a
+493                 # read_deleted='yes' context should still raise.
+494                 read_deleted = 'no' if current_cell == cell_name else 'yes'
+495                 with utils.temporary_mutation(
+496                         cctxt, read_deleted=read_deleted):
+497                     self.assertRaises(exception.InstanceNotFound,
+498                                       objects.Instance.get_by_uuid,
+499                                       cctxt, server['id'])
+500         # Make sure there are no leaked volume attachments.
+501         attachment_count = self._count_volume_attachments(server['id'])
+502         self.assertEqual(0, attachment_count, 'Leaked volume attachments: %s' %
+503                          self.cinder.volume_to_attachment)
+504 
+505     def assert_resize_confirm_actions(self, server):
+506         actions = self.api.api_get(
+507             '/servers/%s/os-instance-actions' % server['id']
+508         ).body['instanceActions']
+509         actions_by_action = {action['action']: action for action in actions}
+510         self.assertIn(instance_actions.CONFIRM_RESIZE, actions_by_action)
+511         confirm_action = actions_by_action[instance_actions.CONFIRM_RESIZE]
+512         detail = self.api.api_get(
+513             '/servers/%s/os-instance-actions/%s' % (
+514                 server['id'], confirm_action['request_id'])
+515         ).body['instanceAction']
+516         events_by_name = {event['event']: event for event in detail['events']}
+517         self.assertEqual(2, len(detail['events']), detail)
+518         for event_name in ('conductor_confirm_snapshot_based_resize',
+519                            'compute_confirm_snapshot_based_resize_at_source'):
+520             self.assertIn(event_name, events_by_name)
+521             self.assertEqual('Success', events_by_name[event_name]['result'])
+522         self.assertEqual('Success', detail['events'][0]['result'])
+523 
+524     def test_resize_confirm_image_backed(self):
+525         """Creates an image-backed server in one cell and resizes it to the
+526         host in the other cell. The resize is confirmed.
+527         """
+528         server, source_rp_uuid, target_rp_uuid, _, new_flavor = (
+529             self._resize_and_validate())
+530 
+531         # Attach a fake volume to the server to make sure it survives confirm.
+532         self._attach_volume_to_server(server['id'], uuids.fake_volume_id)
+533 
+534         # Reset the fake notifier so we only check confirmation notifications.
+535         fake_notifier.reset()
+536 
+537         # Confirm the resize and check all the things. The instance and its
+538         # related records should be gone from the source cell database; the
+539         # migration should be confirmed; the allocations, held by the migration
+540         # record on the source compute node resource provider, should now be
+541         # gone; there should be a confirmResize instance action record with
+542         # a successful event.
+543         self.api.post_server_action(server['id'], {'confirmResize': None})
+544         self._wait_for_state_change(server, 'ACTIVE')
+545 
+546         self._assert_confirm(
+547             server, source_rp_uuid, target_rp_uuid, new_flavor)
+548 
+549         # Make sure the fake volume is still attached.
+550         self.assert_volume_is_attached(server['id'], uuids.fake_volume_id)
+551 
+552         # Explicitly delete the server and make sure it's gone from all cells.
+553         self.delete_server_and_assert_cleanup(server)
+554 
+555         # Run the DB archive code in all cells to make sure we did not mess
+556         # up some referential constraint.
+557         self._archive_cell_dbs()
+558 
+559     def _assert_confirm(self, server, source_rp_uuid, target_rp_uuid,
+560                         new_flavor):
+561         target_host = server['OS-EXT-SRV-ATTR:host']
+562         source_host = 'host1' if target_host == 'host2' else 'host2'
+563         # The migration should be confirmed.
+564         migrations = self.api.api_get(
+565             '/os-migrations?instance_uuid=%s' % server['id']
+566         ).body['migrations']
+567         self.assertEqual(1, len(migrations), migrations)
+568         migration = migrations[0]
+569         self.assertEqual('confirmed', migration['status'], migration)
+570 
+571         # The resource allocations held against the source node by the
+572         # migration record should be gone and the target node provider should
+573         # have allocations held by the instance.
+574         source_allocations = self._get_allocations_by_provider_uuid(
+575             source_rp_uuid)
+576         self.assertEqual({}, source_allocations)
+577         target_allocations = self._get_allocations_by_provider_uuid(
+578             target_rp_uuid)
+579         self.assertIn(server['id'], target_allocations)
+580         self.assertFlavorMatchesAllocation(
+581             new_flavor, target_allocations[server['id']]['resources'])
+582 
+583         self.assert_resize_confirm_actions(server)
+584 
+585         # Make sure the guest is on the target node hypervisor and not on the
+586         # source node hypervisor.
+587         source_guest_uuids = (
+588             self.computes[source_host].manager.driver.list_instance_uuids())
+589         self.assertNotIn(server['id'], source_guest_uuids,
+590                          'Guest is still running on the source hypervisor.')
+591         target_guest_uuids = (
+592             self.computes[target_host].manager.driver.list_instance_uuids())
+593         self.assertIn(server['id'], target_guest_uuids,
+594                       'Guest is not running on the target hypervisor.')
+595 
+596         # Assert the source host hypervisor usage is back to 0 and the target
+597         # is using the new flavor.
+598         self.assert_hypervisor_usage(
+599             target_rp_uuid, new_flavor, volume_backed=False)
+600         no_usage = {'vcpus': 0, 'disk': 0, 'ram': 0}
+601         self.assert_hypervisor_usage(
+602             source_rp_uuid, no_usage, volume_backed=False)
+603 
+604         # Run periodics and make sure the usage is still as expected.
+605         self._run_periodics()
+606         self.assert_hypervisor_usage(
+607             target_rp_uuid, new_flavor, volume_backed=False)
+608         self.assert_hypervisor_usage(
+609             source_rp_uuid, no_usage, volume_backed=False)
+610 
+611         # Make sure we got the expected notifications for the confirm action.
+612         self.assert_resize_confirm_notifications()
+613 
+614     def _archive_cell_dbs(self):
+615         ctxt = nova_context.get_admin_context()
+616         archived_instances_count = 0
+617         for cell in self.cell_mappings.values():
+618             with nova_context.target_cell(ctxt, cell) as cctxt:
+619                 results = db_api.archive_deleted_rows(
+620                     context=cctxt, max_rows=1000)[0]
+621                 archived_instances_count += results.get('instances', 0)
+622         # We expect to have archived at least one instance.
+623         self.assertGreaterEqual(archived_instances_count, 1,
+624                                 'No instances were archived from any cell.')
+625 
+626     def assert_resize_revert_notifications(self):
+627         # We should have gotten three notifications:
+628         # 1. instance.resize_revert.start (from target compute host)
+629         # 2. instance.exists (from target compute host)
+630         # 3. instance.resize_revert.end (from source compute host)
+631         self.assertEqual(3, len(fake_notifier.VERSIONED_NOTIFICATIONS),
+632                          'Unexpected number of versioned notifications for '
+633                          'cross-cell resize revert: %s' %
+634                          fake_notifier.VERSIONED_NOTIFICATIONS)
+635         start = fake_notifier.VERSIONED_NOTIFICATIONS[0]['event_type']
+636         self.assertEqual('instance.resize_revert.start', start)
+637         exists = fake_notifier.VERSIONED_NOTIFICATIONS[1]['event_type']
+638         self.assertEqual('instance.exists', exists)
+639         end = fake_notifier.VERSIONED_NOTIFICATIONS[2]['event_type']
+640         self.assertEqual('instance.resize_revert.end', end)
+641 
+642     def assert_resize_revert_actions(self, server, source_host, dest_host):
+643         actions = self.api.api_get(
+644             '/servers/%s/os-instance-actions' % server['id']
+645         ).body['instanceActions']
+646         # The revert instance action should have been copied from the target
+647         # cell to the source cell and "completed" there, i.e. an event
+648         # should show up under that revert action.
+649         actions_by_action = {action['action']: action for action in actions}
+650         self.assertIn(instance_actions.REVERT_RESIZE, actions_by_action)
+651         confirm_action = actions_by_action[instance_actions.REVERT_RESIZE]
+652         detail = self.api.api_get(
+653             '/servers/%s/os-instance-actions/%s' % (
+654                 server['id'], confirm_action['request_id'])
+655         ).body['instanceAction']
+656         events_by_name = {event['event']: event for event in detail['events']}
+657         # There are two events:
+658         # - conductor_revert_snapshot_based_resize which is copied from the
+659         #   target cell database record in conductor
+660         # - compute_revert_snapshot_based_resize_at_dest
+661         # - compute_finish_revert_snapshot_based_resize_at_source which is from
+662         #   the source compute service method
+663         self.assertEqual(3, len(events_by_name), detail)
+664 
+665         self.assertIn('conductor_revert_snapshot_based_resize', events_by_name)
+666         conductor_event = events_by_name[
+667             'conductor_revert_snapshot_based_resize']
+668         # The result is None because the actual update for this to set the
+669         # result=Success is made on the action event in the target cell
+670         # database and not reflected back in the source cell. Do we care?
+671         self.assertIsNone(conductor_event['result'])
+672 
+673         self.assertIn('compute_revert_snapshot_based_resize_at_dest',
+674                       events_by_name)
+675         finish_revert_at_dest_event = events_by_name[
+676             'compute_revert_snapshot_based_resize_at_dest']
+677         self.assertEqual(dest_host, finish_revert_at_dest_event['host'])
+678         self.assertEqual('Success', finish_revert_at_dest_event['result'])
+679 
+680         self.assertIn('compute_finish_revert_snapshot_based_resize_at_source',
+681                       events_by_name)
+682         finish_revert_at_source_event = events_by_name[
+683             'compute_finish_revert_snapshot_based_resize_at_source']
+684         self.assertEqual(source_host, finish_revert_at_source_event['host'])
+685         self.assertEqual('Success', finish_revert_at_source_event['result'])
+686 
+687     def test_resize_revert_volume_backed(self):
+688         """Tests a volume-backed resize to another cell where the resize
+689         is reverted back to the original source cell.
+690         """
+691         server, source_rp_uuid, target_rp_uuid, old_flavor, new_flavor = (
+692             self._resize_and_validate(volume_backed=True))
+693         target_host = server['OS-EXT-SRV-ATTR:host']
+694 
+695         # Attach a fake volume to the server to make sure it survives revert.
+696         self._attach_volume_to_server(server['id'], uuids.fake_volume_id)
+697 
+698         # Reset the fake notifier so we only check revert notifications.
+699         fake_notifier.reset()
+700 
+701         # Revert the resize. The server should be re-spawned in the source
+702         # cell and removed from the target cell. The allocations
+703         # should be gone from the target compute node resource provider, the
+704         # migration record should be reverted and there should be a revert
+705         # action.
+706         self.api.post_server_action(server['id'], {'revertResize': None})
+707         server = self._wait_for_state_change(server, 'ACTIVE')
+708         source_host = server['OS-EXT-SRV-ATTR:host']
+709 
+710         # The migration should be reverted. Wait for the
+711         # instance.resize_revert.end notification because the migration.status
+712         # is changed to "reverted" *after* the instance status is changed to
+713         # ACTIVE.
+714         fake_notifier.wait_for_versioned_notifications(
+715             'instance.resize_revert.end')
+716         migrations = self.api.api_get(
+717             '/os-migrations?instance_uuid=%s' % server['id']
+718         ).body['migrations']
+719         self.assertEqual(1, len(migrations), migrations)
+720         migration = migrations[0]
+721         self.assertEqual('reverted', migration['status'], migration)
+722 
+723         # The target allocations should be gone.
+724         target_allocations = self._get_allocations_by_provider_uuid(
+725             target_rp_uuid)
+726         self.assertEqual({}, target_allocations)
+727         # The source allocations should just be on the server and for the old
+728         # flavor.
+729         source_allocations = self._get_allocations_by_provider_uuid(
+730             source_rp_uuid)
+731         self.assertNotIn(migration['uuid'], source_allocations)
+732         self.assertIn(server['id'], source_allocations)
+733         source_allocations = source_allocations[server['id']]['resources']
+734         self.assertFlavorMatchesAllocation(
+735             old_flavor, source_allocations, volume_backed=True)
+736 
+737         self.assert_resize_revert_actions(server, source_host, target_host)
+738 
+739         # Make sure the guest is on the source node hypervisor and not on the
+740         # target node hypervisor.
+741         source_guest_uuids = (
+742             self.computes[source_host].manager.driver.list_instance_uuids())
+743         self.assertIn(server['id'], source_guest_uuids,
+744                       'Guest is not running on the source hypervisor.')
+745         target_guest_uuids = (
+746             self.computes[target_host].manager.driver.list_instance_uuids())
+747         self.assertNotIn(server['id'], target_guest_uuids,
+748                          'Guest is still running on the target hypervisor.')
+749 
+750         # Assert the target host hypervisor usage is back to 0 and the source
+751         # is back to using the old flavor.
+752         self.assert_hypervisor_usage(
+753             source_rp_uuid, old_flavor, volume_backed=True)
+754         no_usage = {'vcpus': 0, 'disk': 0, 'ram': 0}
+755         self.assert_hypervisor_usage(
+756             target_rp_uuid, no_usage, volume_backed=True)
+757 
+758         # Run periodics and make sure the usage is still as expected.
+759         self._run_periodics()
+760         self.assert_hypervisor_usage(
+761             source_rp_uuid, old_flavor, volume_backed=True)
+762         self.assert_hypervisor_usage(
+763             target_rp_uuid, no_usage, volume_backed=True)
+764 
+765         # Make sure the fake volume is still attached.
+766         self.assert_volume_is_attached(server['id'], uuids.fake_volume_id)
+767 
+768         # Make sure we got the expected notifications for the revert action.
+769         self.assert_resize_revert_notifications()
+770 
+771         # Explicitly delete the server and make sure it's gone from all cells.
+772         self.delete_server_and_assert_cleanup(server)
+773 
+774     def test_resize_revert_detach_volume_while_resized(self):
+775         """Test for resize revert where a volume is attached to the server
+776         before resize, then it is detached while resized, and then we revert
+777         and make sure it is still detached.
+778         """
+779         # Create the server up-front.
+780         server = self._create_server(self.api.get_flavors()[0])
+781         # Attach a random fake volume to the server.
+782         self._attach_volume_to_server(server['id'], uuids.fake_volume_id)
+783         # Resize the server.
+784         self._resize_and_validate(server=server)
+785         # Ensure the volume is still attached to the server in the target cell.
+786         self.assert_volume_is_attached(server['id'], uuids.fake_volume_id)
+787         # Detach the volume from the server in the target cell while the
+788         # server is in VERIFY_RESIZE status.
+789         self._detach_volume_from_server(server['id'], uuids.fake_volume_id)
+790         # Revert the resize and assert the volume is still detached from the
+791         # server after it has gone back to the source cell.
+792         self.api.post_server_action(server['id'], {'revertResize': None})
+793         server = self._wait_for_state_change(server, 'ACTIVE')
+794         self._wait_for_migration_status(server, ['reverted'])
+795         self.assert_volume_is_detached(server['id'], uuids.fake_volume_id)
+796         # Delete the server and make sure we did not leak anything.
+797         self.delete_server_and_assert_cleanup(server)
+798 
+799     def test_delete_while_in_verify_resize_status(self):
+800         """Tests that when deleting a server in VERIFY_RESIZE status, the
+801         data is cleaned from both the source and target cell.
+802         """
+803         server = self._resize_and_validate()[0]
+804         self.delete_server_and_assert_cleanup(server)
+805 
+806     def test_cold_migrate_target_host_in_other_cell(self):
+807         """Tests cold migrating to a target host in another cell. This is
+808         mostly just to ensure the API does not restrict the target host to
+809         the source cell when cross-cell resize is allowed by policy.
+810         """
+811         # _resize_and_validate creates the server on host1 which is in cell1.
+812         # To make things interesting, start a third host but in cell1 so we can
+813         # be sure the requested host from cell2 is honored.
+814         self._start_compute(
+815             'host3', cell_name=self.host_to_cell_mappings['host1'])
+816         self._resize_and_validate(target_host='host2')
+817 
+818     def test_cold_migrate_cross_cell_weigher_stays_in_source_cell(self):
+819         """Tests cross-cell cold migrate where the source cell has two hosts
+820         so the CrossCellWeigher picks the other host in the source cell and we
+821         do a traditional resize. Note that in this case, HostNameWeigher will
+822         actually weigh host2 (in cell2) higher than host3 (in cell1) but the
+823         CrossCellWeigher will weigh host2 much lower than host3 since host3 is
+824         in the same cell as the source host (host1).
+825         """
+826         # Create the server first (should go in host1).
+827         server = self._create_server(self.api.get_flavors()[0])
+828         # Start another compute host service in cell1.
+829         self._start_compute(
+830             'host3', cell_name=self.host_to_cell_mappings['host1'])
+831         # Cold migrate the server which should move the server to host3.
+832         self.admin_api.post_server_action(server['id'], {'migrate': None})
+833         server = self._wait_for_state_change(server, 'VERIFY_RESIZE')
+834         self.assertEqual('host3', server['OS-EXT-SRV-ATTR:host'])
+835 
+836     def test_resize_cross_cell_weigher_filtered_to_target_cell_by_spec(self):
+837         """Variant of test_cold_migrate_cross_cell_weigher_stays_in_source_cell
+838         but in this case the flavor used for the resize is restricted via
+839         aggregate metadata to host2 in cell2 so even though normally host3 in
+840         cell1 would be weigher higher the CrossCellWeigher is a no-op since
+841         host3 is filtered out.
+842         """
+843         # Create the server first (should go in host1).
+844         old_flavor = self.api.get_flavors()[0]
+845         server = self._create_server(old_flavor)
+846         # Start another compute host service in cell1.
+847         self._start_compute(
+848             'host3', cell_name=self.host_to_cell_mappings['host1'])
+849         # Set foo=bar metadata on the cell2 aggregate.
+850         self.admin_api.post_aggregate_action(
+851             self.cell_to_aggregate['cell2'],
+852             {'set_metadata': {'metadata': {'foo': 'bar'}}})
+853         # Create a flavor to use for the resize which has the foo=bar spec.
+854         new_flavor = {
+855             'id': uuids.new_flavor,
+856             'name': 'cell2-foo-bar-flavor',
+857             'vcpus': old_flavor['vcpus'],
+858             'ram': old_flavor['ram'],
+859             'disk': old_flavor['disk']
+860         }
+861         self.admin_api.post_flavor({'flavor': new_flavor})
+862         self.admin_api.post_extra_spec(new_flavor['id'],
+863                                        {'extra_specs': {'foo': 'bar'}})
+864         # Enable AggregateInstanceExtraSpecsFilter and restart the scheduler.
+865         enabled_filters = CONF.filter_scheduler.enabled_filters
+866         if 'AggregateInstanceExtraSpecsFilter' not in enabled_filters:
+867             enabled_filters.append('AggregateInstanceExtraSpecsFilter')
+868             self.flags(enabled_filters=enabled_filters,
+869                        group='filter_scheduler')
+870             self.scheduler_service.stop()
+871             self.scheduler_service = self.start_service('scheduler')
+872         # Now resize to the new flavor and it should go to host2 in cell2.
+873         self.admin_api.post_server_action(
+874             server['id'], {'resize': {'flavorRef': new_flavor['id']}})
+875         server = self._wait_for_state_change(server, 'VERIFY_RESIZE')
+876         self.assertEqual('host2', server['OS-EXT-SRV-ATTR:host'])
+877 
+878     # TODO(mriedem): Test a bunch of rollback scenarios.
+879 
+880     # TODO(mriedem): Test re-scheduling when the first host fails the
+881     # resize_claim and a subsequent alternative host works, and also the
+882     # case that all hosts fail the resize_claim.
+883 
+884     def test_anti_affinity_group(self):
+885         """Tests an anti-affinity group scenario where a server is moved across
+886         cells and then trying to move the other from the same group to the same
+887         host in the target cell should be rejected by the scheduler.
+888         """
+889         # Create an anti-affinity server group for our servers.
+890         body = {
+891             'server_group': {
+892                 'name': 'test_anti_affinity_group',
+893                 'policy': 'anti-affinity'
+894             }
+895         }
+896         group_id = self.api.api_post(
+897             '/os-server-groups', body).body['server_group']['id']
+898 
+899         # Create a server in the group in cell1 (should land on host1 due to
+900         # HostNameWeigher).
+901         flavor = self.api.get_flavors()[0]
+902         server1 = self._create_server(
+903             flavor, group_id=group_id, no_networking=True)
+904 
+905         # Start another compute host service in cell1.
+906         self._start_compute(
+907             'host3', cell_name=self.host_to_cell_mappings['host1'])
+908         # Create another server but we want it on host3 in cell1. We cannot
+909         # use the az forced host parameter because then we will not be able to
+910         # move the server across cells later. The HostNameWeigher will prefer
+911         # host2 in cell2 so we need to temporarily force host2 down.
+912         host2_service_uuid = self.computes['host2'].service_ref.uuid
+913         self.admin_api.put_service_force_down(
+914             host2_service_uuid, forced_down=True)
+915         server2 = self._create_server(
+916             flavor, group_id=group_id, no_networking=True)
+917         self.assertEqual('host3', server2['OS-EXT-SRV-ATTR:host'])
+918         # Remove the forced-down status of the host2 compute service so we can
+919         # migrate there.
+920         self.admin_api.put_service_force_down(
+921             host2_service_uuid, forced_down=False)
+922 
+923         # Now migrate server1 which should move it to host2 in cell2 otherwise
+924         # it would violate the anti-affinity policy since server2 is on host3
+925         # in cell1.
+926         self.admin_api.post_server_action(server1['id'], {'migrate': None})
+927         server1 = self._wait_for_state_change(server1, 'VERIFY_RESIZE')
+928         self.assertEqual('host2', server1['OS-EXT-SRV-ATTR:host'])
+929         self.admin_api.post_server_action(
+930             server1['id'], {'confirmResize': None})
+931         self._wait_for_state_change(server1, 'ACTIVE')
+932 
+933         # At this point we have:
+934         # server1: host2 in cell2
+935         # server2: host3 in cell1
+936         # The server group hosts should reflect that.
+937         ctxt = nova_context.get_admin_context()
+938         group = objects.InstanceGroup.get_by_uuid(ctxt, group_id)
+939         group_hosts = scheduler_utils._get_instance_group_hosts_all_cells(
+940             ctxt, group)
+941         self.assertEqual(['host2', 'host3'], sorted(group_hosts))
+942 
+943         # Try to migrate server2 to host2 in cell2 which should fail scheduling
+944         # because it violates the anti-affinity policy. Note that without
+945         # change I4b67ec9dd4ce846a704d0f75ad64c41e693de0fb in
+946         # ServerGroupAntiAffinityFilter this would fail because the scheduler
+947         # utils setup_instance_group only looks at the group hosts in the
+948         # source cell.
+949         self.admin_api.post_server_action(
+950             server2['id'], {'migrate': {'host': 'host2'}})
+951         self._wait_for_migration_status(server2, ['error'])
+952 
+953     def test_poll_unconfirmed_resizes_with_upcall(self):
+954         """Tests the _poll_unconfirmed_resizes periodic task with a cross-cell
+955         resize once the instance is in VERIFY_RESIZE status on the dest host.
+956         In this case _poll_unconfirmed_resizes works because an up-call is
+957         possible to the API DB.
+958         """
+959         server, source_rp_uuid, target_rp_uuid, _, new_flavor = (
+960             self._resize_and_validate())
+961         # At this point the server is in VERIFY_RESIZE status so enable the
+962         # _poll_unconfirmed_resizes periodic task and run it on the target
+963         # compute service.
+964         # Reset the fake notifier so we only check confirmation notifications.
+965         fake_notifier.reset()
+966         self.flags(resize_confirm_window=1)
+967         ctxt = nova_context.get_admin_context()
+968         # This works because the test environment is configured with the API DB
+969         # connection globally. If the compute service was running with a conf
+970         # that did not have access to the API DB this would fail.
+971         target_host = server['OS-EXT-SRV-ATTR:host']
+972         cell = self.cell_mappings[self.host_to_cell_mappings[target_host]]
+973         with nova_context.target_cell(ctxt, cell) as cctxt:
+974             self.computes[target_host].manager._poll_unconfirmed_resizes(cctxt)
+975         self._wait_for_state_change(server, 'ACTIVE')
+976         self._assert_confirm(
+977             server, source_rp_uuid, target_rp_uuid, new_flavor)
+978 
+979     def test_poll_unconfirmed_resizes_with_no_upcall(self):
+980         """Tests the _poll_unconfirmed_resizes periodic task with a cross-cell
+981         resize once the instance is in VERIFY_RESIZE status on the dest host.
+982         In this case _poll_unconfirmed_resizes fails because an up-call is
+983         not possible to the API DB.
+984         """
+985         server, source_rp_uuid, target_rp_uuid, _, new_flavor = (
+986             self._resize_and_validate())
+987         # At this point the server is in VERIFY_RESIZE status so enable the
+988         # _poll_unconfirmed_resizes periodic task and run it on the target
+989         # compute service.
+990         self.flags(resize_confirm_window=1)
+991         ctxt = nova_context.get_admin_context()
+992         target_host = server['OS-EXT-SRV-ATTR:host']
+993         cell = self.cell_mappings[self.host_to_cell_mappings[target_host]]
+994         nova_context.set_target_cell(ctxt, cell)
+995         # Simulate not being able to query the API DB by poisoning calls to
+996         # the instance_mappings table. Use the CastAsCall fixture so we can
+997         # trap and log errors for assertions in the test.
+998         with cast_as_call.CastAsCall(self):
+999             with mock.patch(
+1000                     'nova.objects.InstanceMapping.get_by_instance_uuid',
+1001                     side_effect=oslo_db_exc.CantStartEngineError) as get_im:
+1002                 self.computes[target_host].manager._poll_unconfirmed_resizes(
+1003                     ctxt)
+1004         get_im.assert_called()
+1005         log_output = self.stdlog.logger.output
+1006         self.assertIn('Error auto-confirming resize', log_output)
+1007         self.assertIn('CantStartEngineError', log_output)
+1008 
+1009     # TODO(mriedem): Perform a resize with at-capacity computes, meaning that
+1010     # when we revert we can only fit the instance with the old flavor back
+1011     # onto the source host in the source cell.
+1012 
+1013     def test_resize_confirm_from_stopped(self):
+1014         """Tests resizing and confirming a volume-backed server that was
+1015         initially stopped so it should remain stopped through the resize.
+1016         """
+1017         server = self._resize_and_validate(volume_backed=True, stopped=True)[0]
+1018         # Confirm the resize and assert the guest remains off.
+1019         self.api.post_server_action(server['id'], {'confirmResize': None})
+1020         server = self._wait_for_state_change(server, 'SHUTOFF')
+1021         self.assertEqual(4, server['OS-EXT-STS:power_state'],
+1022                          "Unexpected power state after confirmResize.")
+1023         self._wait_for_migration_status(server, ['confirmed'])
+1024 
+1025         # Now try cold-migrating back to cell1 to make sure there is no
+1026         # duplicate entry error in the DB.
+1027         self.api.post_server_action(server['id'], {'migrate': None})
+1028         server = self._wait_for_state_change(server, 'VERIFY_RESIZE')
+1029         # Should be back on host1 in cell1.
+1030         self.assertEqual('host1', server['OS-EXT-SRV-ATTR:host'])
+1031 
+1032     def test_resize_revert_from_stopped(self):
+1033         """Tests resizing and reverting an image-backed server that was
+1034         initially stopped so it should remain stopped through the revert.
+1035         """
+1036         server = self._resize_and_validate(stopped=True)[0]
+1037         # Revert the resize and assert the guest remains off.
+1038         self.api.post_server_action(server['id'], {'revertResize': None})
+1039         server = self._wait_for_state_change(server, 'SHUTOFF')
+1040         self.assertEqual(4, server['OS-EXT-STS:power_state'],
+1041                          "Unexpected power state after revertResize.")
+1042         self._wait_for_migration_status(server, ['reverted'])
+1043 
+1044         # Now try cold-migrating to cell2 to make sure there is no
+1045         # duplicate entry error in the DB.
+1046         self.api.post_server_action(server['id'], {'migrate': None})
+1047         server = self._wait_for_state_change(server, 'VERIFY_RESIZE')
+1048         # Should be on host2 in cell2.
+1049         self.assertEqual('host2', server['OS-EXT-SRV-ATTR:host'])
+1050 
+1051     def test_finish_snapshot_based_resize_at_dest_spawn_fails(self):
+1052         """Negative test where the driver spawn fails on the dest host during
+1053         finish_snapshot_based_resize_at_dest which triggers a rollback of the
+1054         instance data in the target cell. Furthermore, the test will hard
+1055         reboot the server in the source cell to recover it from ERROR status.
+1056         """
+1057         # Create a volume-backed server. This is more interesting for rollback
+1058         # testing to make sure the volume attachments in the target cell were
+1059         # cleaned up on failure.
+1060         flavors = self.api.get_flavors()
+1061         server = self._create_server(flavors[0], volume_backed=True)
+1062 
+1063         # Now mock out the spawn method on the destination host to fail
+1064         # during _finish_snapshot_based_resize_at_dest_spawn and then resize
+1065         # the server.
+1066         error = exception.HypervisorUnavailable(host='host2')
+1067         with mock.patch.object(self.computes['host2'].driver, 'spawn',
+1068                                side_effect=error):
+1069             flavor2 = flavors[1]['id']
+1070             body = {'resize': {'flavorRef': flavor2}}
+1071             self.api.post_server_action(server['id'], body)
+1072             # The server should go to ERROR state with a fault record and
+1073             # the API should still be showing the server from the source cell
+1074             # because the instance mapping was not updated.
+1075             server = self._wait_for_server_parameter(server,
+1076                 {'status': 'ERROR', 'OS-EXT-STS:task_state': None})
+1077 
+1078         # The migration should be in 'error' status.
+1079         self._wait_for_migration_status(server, ['error'])
+1080         # Assert a fault was recorded.
+1081         self.assertIn('fault', server)
+1082         self.assertIn('Connection to the hypervisor is broken',
+1083                       server['fault']['message'])
+1084         # The instance in the target cell DB should have been hard-deleted.
+1085         self._assert_instance_not_in_cell('cell2', server['id'])
+1086 
+1087         # Assert that there is only one volume attachment for the server, i.e.
+1088         # the one in the target cell was deleted.
+1089         self.assertEqual(1, self._count_volume_attachments(server['id']),
+1090                          self.cinder.volume_to_attachment)
+1091 
+1092         # Assert that migration-based allocations were properly reverted.
+1093         self._assert_allocation_revert_on_fail(server)
+1094 
+1095         # Now hard reboot the server in the source cell and it should go back
+1096         # to ACTIVE.
+1097         self.api.post_server_action(server['id'], {'reboot': {'type': 'HARD'}})
+1098         self._wait_for_state_change(server, 'ACTIVE')
+1099 
+1100         # Now retry the resize without the fault in the target host to make
+1101         # sure things are OK (no duplicate entry errors in the target DB).
+1102         self.api.post_server_action(server['id'], body)
+1103         self._wait_for_state_change(server, 'VERIFY_RESIZE')
+1104 
+1105     def _assert_instance_not_in_cell(self, cell_name, server_id):
+1106         cell = self.cell_mappings[cell_name]
+1107         ctxt = nova_context.get_admin_context(read_deleted='yes')
+1108         with nova_context.target_cell(ctxt, cell) as cctxt:
+1109             self.assertRaises(
+1110                 exception.InstanceNotFound,
+1111                 objects.Instance.get_by_uuid, cctxt, server_id)
+1112 
+1113     def _assert_allocation_revert_on_fail(self, server):
+1114         # Since this happens in MigrationTask.rollback in conductor, we need
+1115         # to wait for something which happens after that, which is the
+1116         # ComputeTaskManager._cold_migrate method sending the
+1117         # compute_task.migrate_server.error event.
+1118         fake_notifier.wait_for_versioned_notifications(
+1119             'compute_task.migrate_server.error')
+1120         mig_uuid = self.get_migration_uuid_for_instance(server['id'])
+1121         mig_allocs = self._get_allocations_by_server_uuid(mig_uuid)
+1122         self.assertEqual({}, mig_allocs)
+1123         source_rp_uuid = self._get_provider_uuid_by_host(
+1124             server['OS-EXT-SRV-ATTR:host'])
+1125         server_allocs = self._get_allocations_by_server_uuid(server['id'])
+1126         volume_backed = False if server['image'] else True
+1127         self.assertFlavorMatchesAllocation(
+1128             server['flavor'], server_allocs[source_rp_uuid]['resources'],
+1129             volume_backed=volume_backed)
+1130 
+1131     def test_prep_snapshot_based_resize_at_source_destroy_fails(self):
+1132         """Negative test where prep_snapshot_based_resize_at_source fails
+1133         destroying the guest for the non-volume backed server and asserts
+1134         resources are rolled back.
+1135         """
+1136         # Create a non-volume backed server for the snapshot flow.
+1137         flavors = self.api.get_flavors()
+1138         flavor1 = flavors[0]
+1139         server = self._create_server(flavor1)
+1140 
+1141         # Now mock out the snapshot method on the source host to fail
+1142         # during _prep_snapshot_based_resize_at_source and then resize
+1143         # the server.
+1144         source_host = server['OS-EXT-SRV-ATTR:host']
+1145         error = exception.HypervisorUnavailable(host=source_host)
+1146         with mock.patch.object(self.computes[source_host].driver, 'destroy',
+1147                                side_effect=error):
+1148             flavor2 = flavors[1]['id']
+1149             body = {'resize': {'flavorRef': flavor2}}
+1150             self.api.post_server_action(server['id'], body)
+1151             # The server should go to ERROR state with a fault record and
+1152             # the API should still be showing the server from the source cell
+1153             # because the instance mapping was not updated.
+1154             server = self._wait_for_server_parameter(server,
+1155                 {'status': 'ERROR', 'OS-EXT-STS:task_state': None})
+1156 
+1157         # The migration should be in 'error' status.
+1158         self._wait_for_migration_status(server, ['error'])
+1159         # Assert a fault was recorded.
+1160         self.assertIn('fault', server)
+1161         self.assertIn('Connection to the hypervisor is broken',
+1162                       server['fault']['message'])
+1163         # The instance in the target cell DB should have been hard-deleted.
+1164         self._assert_instance_not_in_cell('cell2', server['id'])
+1165         # Assert that migration-based allocations were properly reverted.
+1166         self._assert_allocation_revert_on_fail(server)
+1167 
+1168         # Now hard reboot the server in the source cell and it should go back
+1169         # to ACTIVE.
+1170         self.api.post_server_action(server['id'], {'reboot': {'type': 'HARD'}})
+1171         self._wait_for_state_change(server, 'ACTIVE')
+1172 
+1173         # Now retry the resize without the fault in the target host to make
+1174         # sure things are OK (no duplicate entry errors in the target DB).
+1175         self.api.post_server_action(server['id'], body)
+1176         self._wait_for_state_change(server, 'VERIFY_RESIZE')

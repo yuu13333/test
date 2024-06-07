@@ -1,0 +1,1583 @@
+Based on the given code from a commit, please generate supplementary code files according to the commit message.
+####commit message
+Always read-deleted=yes on lazy-load
+
+For some reason we were only reading deleted instances when loading generic
+fields and not things like flavor. That weird behavior isn't very helpful,
+so this makes us always read deleted for that case. Some of the fields, like
+tags, will short-circuit that and just immediately lazy-load an empty set.
+But for anything else, we should allow reading that data if it's still there.
+
+Change-Id: I8ec3a3a697e55941ee447d0b52d29785717e4bf0
+
+####code 
+1 #    Copyright 2013 IBM Corp.
+2 #
+3 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
+4 #    not use this file except in compliance with the License. You may obtain
+5 #    a copy of the License at
+6 #
+7 #         http://www.apache.org/licenses/LICENSE-2.0
+8 #
+9 #    Unless required by applicable law or agreed to in writing, software
+10 #    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+11 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+12 #    License for the specific language governing permissions and limitations
+13 #    under the License.
+14 
+15 import contextlib
+16 
+17 from oslo_config import cfg
+18 from oslo_db import exception as db_exc
+19 from oslo_log import log as logging
+20 from oslo_serialization import jsonutils
+21 from oslo_utils import timeutils
+22 from oslo_utils import versionutils
+23 from sqlalchemy import or_
+24 from sqlalchemy.sql import func
+25 from sqlalchemy.sql import null
+26 
+27 from nova import availability_zones as avail_zone
+28 from nova.cells import opts as cells_opts
+29 from nova.cells import rpcapi as cells_rpcapi
+30 from nova.cells import utils as cells_utils
+31 from nova.compute import task_states
+32 from nova.compute import vm_states
+33 from nova.db import api as db
+34 from nova.db.sqlalchemy import api as db_api
+35 from nova.db.sqlalchemy import models
+36 from nova import exception
+37 from nova.i18n import _
+38 from nova.network import model as network_model
+39 from nova import notifications
+40 from nova import objects
+41 from nova.objects import base
+42 from nova.objects import fields
+43 from nova import utils
+44 
+45 
+46 CONF = cfg.CONF
+47 LOG = logging.getLogger(__name__)
+48 
+49 
+50 # List of fields that can be joined in DB layer.
+51 _INSTANCE_OPTIONAL_JOINED_FIELDS = ['metadata', 'system_metadata',
+52                                     'info_cache', 'security_groups',
+53                                     'pci_devices', 'tags', 'services',
+54                                     'fault']
+55 # These are fields that are optional but don't translate to db columns
+56 _INSTANCE_OPTIONAL_NON_COLUMN_FIELDS = ['flavor', 'old_flavor',
+57                                         'new_flavor', 'ec2_ids']
+58 # These are fields that are optional and in instance_extra
+59 _INSTANCE_EXTRA_FIELDS = ['numa_topology', 'pci_requests',
+60                           'flavor', 'vcpu_model', 'migration_context',
+61                           'keypairs', 'device_metadata', 'trusted_certs']
+62 # These are fields that applied/drooped by migration_context
+63 _MIGRATION_CONTEXT_ATTRS = ['numa_topology', 'pci_requests',
+64                             'pci_devices']
+65 
+66 # These are fields that can be specified as expected_attrs
+67 INSTANCE_OPTIONAL_ATTRS = (_INSTANCE_OPTIONAL_JOINED_FIELDS +
+68                            _INSTANCE_OPTIONAL_NON_COLUMN_FIELDS +
+69                            _INSTANCE_EXTRA_FIELDS)
+70 # These are fields that most query calls load by default
+71 INSTANCE_DEFAULT_FIELDS = ['metadata', 'system_metadata',
+72                            'info_cache', 'security_groups']
+73 
+74 # Maximum count of tags to one instance
+75 MAX_TAG_COUNT = 50
+76 
+77 
+78 def _expected_cols(expected_attrs):
+79     """Return expected_attrs that are columns needing joining.
+80 
+81     NB: This function may modify expected_attrs if one
+82     requested attribute requires another.
+83     """
+84     if not expected_attrs:
+85         return expected_attrs
+86 
+87     simple_cols = [attr for attr in expected_attrs
+88                    if attr in _INSTANCE_OPTIONAL_JOINED_FIELDS]
+89 
+90     complex_cols = ['extra.%s' % field
+91                     for field in _INSTANCE_EXTRA_FIELDS
+92                     if field in expected_attrs]
+93     if complex_cols:
+94         simple_cols.append('extra')
+95     simple_cols = [x for x in simple_cols if x not in _INSTANCE_EXTRA_FIELDS]
+96     expected_cols = simple_cols + complex_cols
+97     # NOTE(pumaranikar): expected_cols list can contain duplicates since
+98     # caller appends column attributes to expected_attr without checking if
+99     # it is already present in the list or not. Hence, we remove duplicates
+100     # here, if any. The resultant list is sorted based on list index to
+101     # maintain the insertion order.
+102     return sorted(list(set(expected_cols)), key=expected_cols.index)
+103 
+104 
+105 _NO_DATA_SENTINEL = object()
+106 
+107 
+108 # TODO(berrange): Remove NovaObjectDictCompat
+109 @base.NovaObjectRegistry.register
+110 class Instance(base.NovaPersistentObject, base.NovaObject,
+111                base.NovaObjectDictCompat):
+112     # Version 2.0: Initial version
+113     # Version 2.1: Added services
+114     # Version 2.2: Added keypairs
+115     # Version 2.3: Added device_metadata
+116     # Version 2.4: Added trusted_certs
+117     VERSION = '2.4'
+118 
+119     fields = {
+120         'id': fields.IntegerField(),
+121 
+122         'user_id': fields.StringField(nullable=True),
+123         'project_id': fields.StringField(nullable=True),
+124 
+125         'image_ref': fields.StringField(nullable=True),
+126         'kernel_id': fields.StringField(nullable=True),
+127         'ramdisk_id': fields.StringField(nullable=True),
+128         'hostname': fields.StringField(nullable=True),
+129 
+130         'launch_index': fields.IntegerField(nullable=True),
+131         'key_name': fields.StringField(nullable=True),
+132         'key_data': fields.StringField(nullable=True),
+133 
+134         'power_state': fields.IntegerField(nullable=True),
+135         'vm_state': fields.StringField(nullable=True),
+136         'task_state': fields.StringField(nullable=True),
+137 
+138         'services': fields.ObjectField('ServiceList'),
+139 
+140         'memory_mb': fields.IntegerField(nullable=True),
+141         'vcpus': fields.IntegerField(nullable=True),
+142         'root_gb': fields.IntegerField(nullable=True),
+143         'ephemeral_gb': fields.IntegerField(nullable=True),
+144         'ephemeral_key_uuid': fields.UUIDField(nullable=True),
+145 
+146         'host': fields.StringField(nullable=True),
+147         'node': fields.StringField(nullable=True),
+148 
+149         'instance_type_id': fields.IntegerField(nullable=True),
+150 
+151         'user_data': fields.StringField(nullable=True),
+152 
+153         'reservation_id': fields.StringField(nullable=True),
+154 
+155         'launched_at': fields.DateTimeField(nullable=True),
+156         'terminated_at': fields.DateTimeField(nullable=True),
+157 
+158         'availability_zone': fields.StringField(nullable=True),
+159 
+160         'display_name': fields.StringField(nullable=True),
+161         'display_description': fields.StringField(nullable=True),
+162 
+163         'launched_on': fields.StringField(nullable=True),
+164 
+165         'locked': fields.BooleanField(default=False),
+166         'locked_by': fields.StringField(nullable=True),
+167 
+168         'os_type': fields.StringField(nullable=True),
+169         'architecture': fields.StringField(nullable=True),
+170         'vm_mode': fields.StringField(nullable=True),
+171         'uuid': fields.UUIDField(),
+172 
+173         'root_device_name': fields.StringField(nullable=True),
+174         'default_ephemeral_device': fields.StringField(nullable=True),
+175         'default_swap_device': fields.StringField(nullable=True),
+176         'config_drive': fields.StringField(nullable=True),
+177 
+178         'access_ip_v4': fields.IPV4AddressField(nullable=True),
+179         'access_ip_v6': fields.IPV6AddressField(nullable=True),
+180 
+181         'auto_disk_config': fields.BooleanField(default=False),
+182         'progress': fields.IntegerField(nullable=True),
+183 
+184         'shutdown_terminate': fields.BooleanField(default=False),
+185         'disable_terminate': fields.BooleanField(default=False),
+186 
+187         'cell_name': fields.StringField(nullable=True),
+188 
+189         'metadata': fields.DictOfStringsField(),
+190         'system_metadata': fields.DictOfNullableStringsField(),
+191 
+192         'info_cache': fields.ObjectField('InstanceInfoCache',
+193                                          nullable=True),
+194 
+195         'security_groups': fields.ObjectField('SecurityGroupList'),
+196 
+197         'fault': fields.ObjectField('InstanceFault', nullable=True),
+198 
+199         'cleaned': fields.BooleanField(default=False),
+200 
+201         'pci_devices': fields.ObjectField('PciDeviceList', nullable=True),
+202         'numa_topology': fields.ObjectField('InstanceNUMATopology',
+203                                             nullable=True),
+204         'pci_requests': fields.ObjectField('InstancePCIRequests',
+205                                            nullable=True),
+206         'device_metadata': fields.ObjectField('InstanceDeviceMetadata',
+207                                               nullable=True),
+208         'tags': fields.ObjectField('TagList'),
+209         'flavor': fields.ObjectField('Flavor'),
+210         'old_flavor': fields.ObjectField('Flavor', nullable=True),
+211         'new_flavor': fields.ObjectField('Flavor', nullable=True),
+212         'vcpu_model': fields.ObjectField('VirtCPUModel', nullable=True),
+213         'ec2_ids': fields.ObjectField('EC2Ids'),
+214         'migration_context': fields.ObjectField('MigrationContext',
+215                                                 nullable=True),
+216         'keypairs': fields.ObjectField('KeyPairList'),
+217         'trusted_certs': fields.ObjectField('TrustedCerts', nullable=True),
+218         }
+219 
+220     obj_extra_fields = ['name']
+221 
+222     def obj_make_compatible(self, primitive, target_version):
+223         super(Instance, self).obj_make_compatible(primitive, target_version)
+224         target_version = versionutils.convert_version_to_tuple(target_version)
+225         if target_version < (2, 4) and 'trusted_certs' in primitive:
+226             del primitive['trusted_certs']
+227         if target_version < (2, 3) and 'device_metadata' in primitive:
+228             del primitive['device_metadata']
+229         if target_version < (2, 2) and 'keypairs' in primitive:
+230             del primitive['keypairs']
+231         if target_version < (2, 1) and 'services' in primitive:
+232             del primitive['services']
+233 
+234     def __init__(self, *args, **kwargs):
+235         super(Instance, self).__init__(*args, **kwargs)
+236         self._reset_metadata_tracking()
+237 
+238     @property
+239     def image_meta(self):
+240         return objects.ImageMeta.from_instance(self)
+241 
+242     def _reset_metadata_tracking(self, fields=None):
+243         if fields is None or 'system_metadata' in fields:
+244             self._orig_system_metadata = (dict(self.system_metadata) if
+245                                           'system_metadata' in self else {})
+246         if fields is None or 'metadata' in fields:
+247             self._orig_metadata = (dict(self.metadata) if
+248                                    'metadata' in self else {})
+249 
+250     def obj_clone(self):
+251         """Create a copy of this instance object."""
+252         nobj = super(Instance, self).obj_clone()
+253         # Since the base object only does a deep copy of the defined fields,
+254         # need to make sure to also copy the additional tracking metadata
+255         # attributes so they don't show as changed and cause the metadata
+256         # to always be updated even when stale information.
+257         if hasattr(self, '_orig_metadata'):
+258             nobj._orig_metadata = dict(self._orig_metadata)
+259         if hasattr(self, '_orig_system_metadata'):
+260             nobj._orig_system_metadata = dict(self._orig_system_metadata)
+261         return nobj
+262 
+263     def obj_reset_changes(self, fields=None, recursive=False):
+264         super(Instance, self).obj_reset_changes(fields,
+265                                                 recursive=recursive)
+266         self._reset_metadata_tracking(fields=fields)
+267 
+268     def obj_what_changed(self):
+269         changes = super(Instance, self).obj_what_changed()
+270         if 'metadata' in self and self.metadata != self._orig_metadata:
+271             changes.add('metadata')
+272         if 'system_metadata' in self and (self.system_metadata !=
+273                                           self._orig_system_metadata):
+274             changes.add('system_metadata')
+275         return changes
+276 
+277     @classmethod
+278     def _obj_from_primitive(cls, context, objver, primitive):
+279         self = super(Instance, cls)._obj_from_primitive(context, objver,
+280                                                         primitive)
+281         self._reset_metadata_tracking()
+282         return self
+283 
+284     @property
+285     def name(self):
+286         try:
+287             base_name = CONF.instance_name_template % self.id
+288         except TypeError:
+289             # Support templates like "uuid-%(uuid)s", etc.
+290             info = {}
+291             # NOTE(russellb): Don't use self.iteritems() here, as it will
+292             # result in infinite recursion on the name property.
+293             for key in self.fields:
+294                 if key == 'name':
+295                     # NOTE(danms): prevent recursion
+296                     continue
+297                 elif not self.obj_attr_is_set(key):
+298                     # NOTE(danms): Don't trigger lazy-loads
+299                     continue
+300                 info[key] = self[key]
+301             try:
+302                 base_name = CONF.instance_name_template % info
+303             except KeyError:
+304                 base_name = self.uuid
+305         except (exception.ObjectActionError,
+306                 exception.OrphanedObjectError):
+307             # This indicates self.id was not set and/or could not be
+308             # lazy loaded.  What this means is the instance has not
+309             # been persisted to a db yet, which should indicate it has
+310             # not been scheduled yet. In this situation it will have a
+311             # blank name.
+312             if (self.vm_state == vm_states.BUILDING and
+313                     self.task_state == task_states.SCHEDULING):
+314                 base_name = ''
+315             else:
+316                 # If the vm/task states don't indicate that it's being booted
+317                 # then we have a bug here. Log an error and attempt to return
+318                 # the uuid which is what an error above would return.
+319                 LOG.error('Could not lazy-load instance.id while '
+320                           'attempting to generate the instance name.')
+321                 base_name = self.uuid
+322         return base_name
+323 
+324     def _flavor_from_db(self, db_flavor):
+325         """Load instance flavor information from instance_extra."""
+326 
+327         # Before we stored flavors in instance_extra, certain fields, defined
+328         # in nova.compute.flavors.system_metadata_flavor_props, were stored
+329         # in the instance.system_metadata for the embedded instance.flavor.
+330         # The "disabled" field wasn't one of those keys, however, so really
+331         # old instances that had their embedded flavor converted to the
+332         # serialized instance_extra form won't have the disabled attribute
+333         # set and we need to default those here so callers don't explode trying
+334         # to load instance.flavor.disabled.
+335         def _default_disabled(flavor):
+336             if 'disabled' not in flavor:
+337                 flavor.disabled = False
+338 
+339         flavor_info = jsonutils.loads(db_flavor)
+340 
+341         self.flavor = objects.Flavor.obj_from_primitive(flavor_info['cur'])
+342         _default_disabled(self.flavor)
+343         if flavor_info['old']:
+344             self.old_flavor = objects.Flavor.obj_from_primitive(
+345                 flavor_info['old'])
+346             _default_disabled(self.old_flavor)
+347         else:
+348             self.old_flavor = None
+349         if flavor_info['new']:
+350             self.new_flavor = objects.Flavor.obj_from_primitive(
+351                 flavor_info['new'])
+352             _default_disabled(self.new_flavor)
+353         else:
+354             self.new_flavor = None
+355         self.obj_reset_changes(['flavor', 'old_flavor', 'new_flavor'])
+356 
+357     @staticmethod
+358     def _from_db_object(context, instance, db_inst, expected_attrs=None):
+359         """Method to help with migration to objects.
+360 
+361         Converts a database entity to a formal object.
+362         """
+363         instance._context = context
+364         if expected_attrs is None:
+365             expected_attrs = []
+366         # Most of the field names match right now, so be quick
+367         for field in instance.fields:
+368             if field in INSTANCE_OPTIONAL_ATTRS:
+369                 continue
+370             elif field == 'deleted':
+371                 instance.deleted = db_inst['deleted'] == db_inst['id']
+372             elif field == 'cleaned':
+373                 instance.cleaned = db_inst['cleaned'] == 1
+374             else:
+375                 instance[field] = db_inst[field]
+376 
+377         if 'metadata' in expected_attrs:
+378             instance['metadata'] = utils.instance_meta(db_inst)
+379         if 'system_metadata' in expected_attrs:
+380             instance['system_metadata'] = utils.instance_sys_meta(db_inst)
+381         if 'fault' in expected_attrs:
+382             instance['fault'] = (
+383                 objects.InstanceFault.get_latest_for_instance(
+384                     context, instance.uuid))
+385         if 'ec2_ids' in expected_attrs:
+386             instance._load_ec2_ids()
+387         if 'info_cache' in expected_attrs:
+388             if db_inst.get('info_cache') is None:
+389                 instance.info_cache = None
+390             elif not instance.obj_attr_is_set('info_cache'):
+391                 # TODO(danms): If this ever happens on a backlevel instance
+392                 # passed to us by a backlevel service, things will break
+393                 instance.info_cache = objects.InstanceInfoCache(context)
+394             if instance.info_cache is not None:
+395                 instance.info_cache._from_db_object(context,
+396                                                     instance.info_cache,
+397                                                     db_inst['info_cache'])
+398 
+399         # TODO(danms): If we are updating these on a backlevel instance,
+400         # we'll end up sending back new versions of these objects (see
+401         # above note for new info_caches
+402         if 'pci_devices' in expected_attrs:
+403             pci_devices = base.obj_make_list(
+404                     context, objects.PciDeviceList(context),
+405                     objects.PciDevice, db_inst['pci_devices'])
+406             instance['pci_devices'] = pci_devices
+407         if 'security_groups' in expected_attrs:
+408             sec_groups = base.obj_make_list(
+409                     context, objects.SecurityGroupList(context),
+410                     objects.SecurityGroup, db_inst.get('security_groups', []))
+411             instance['security_groups'] = sec_groups
+412 
+413         if 'tags' in expected_attrs:
+414             tags = base.obj_make_list(
+415                 context, objects.TagList(context),
+416                 objects.Tag, db_inst['tags'])
+417             instance['tags'] = tags
+418 
+419         if 'services' in expected_attrs:
+420             services = base.obj_make_list(
+421                     context, objects.ServiceList(context),
+422                     objects.Service, db_inst['services'])
+423             instance['services'] = services
+424 
+425         instance._extra_attributes_from_db_object(instance, db_inst,
+426                                                   expected_attrs)
+427 
+428         instance.obj_reset_changes()
+429         return instance
+430 
+431     @staticmethod
+432     def _extra_attributes_from_db_object(instance, db_inst,
+433                                          expected_attrs=None):
+434         """Method to help with migration of extra attributes to objects.
+435         """
+436         if expected_attrs is None:
+437             expected_attrs = []
+438         # NOTE(danms): We can be called with a dict instead of a
+439         # SQLAlchemy object, so we have to be careful here
+440         if hasattr(db_inst, '__dict__'):
+441             have_extra = 'extra' in db_inst.__dict__ and db_inst['extra']
+442         else:
+443             have_extra = 'extra' in db_inst and db_inst['extra']
+444 
+445         if 'numa_topology' in expected_attrs:
+446             if have_extra:
+447                 instance._load_numa_topology(
+448                     db_inst['extra'].get('numa_topology'))
+449             else:
+450                 instance.numa_topology = None
+451         if 'pci_requests' in expected_attrs:
+452             if have_extra:
+453                 instance._load_pci_requests(
+454                     db_inst['extra'].get('pci_requests'))
+455             else:
+456                 instance.pci_requests = None
+457         if 'device_metadata' in expected_attrs:
+458             if have_extra:
+459                 instance._load_device_metadata(
+460                     db_inst['extra'].get('device_metadata'))
+461             else:
+462                 instance.device_metadata = None
+463         if 'vcpu_model' in expected_attrs:
+464             if have_extra:
+465                 instance._load_vcpu_model(
+466                     db_inst['extra'].get('vcpu_model'))
+467             else:
+468                 instance.vcpu_model = None
+469         if 'migration_context' in expected_attrs:
+470             if have_extra:
+471                 instance._load_migration_context(
+472                     db_inst['extra'].get('migration_context'))
+473             else:
+474                 instance.migration_context = None
+475         if 'keypairs' in expected_attrs:
+476             if have_extra:
+477                 instance._load_keypairs(db_inst['extra'].get('keypairs'))
+478         if 'trusted_certs' in expected_attrs:
+479             if have_extra:
+480                 instance._load_trusted_certs(
+481                     db_inst['extra'].get('trusted_certs'))
+482             else:
+483                 instance.trusted_certs = None
+484         if any([x in expected_attrs for x in ('flavor',
+485                                               'old_flavor',
+486                                               'new_flavor')]):
+487             if have_extra and db_inst['extra'].get('flavor'):
+488                 instance._flavor_from_db(db_inst['extra']['flavor'])
+489 
+490     @staticmethod
+491     @db.select_db_reader_mode
+492     def _db_instance_get_by_uuid(context, uuid, columns_to_join,
+493                                  use_slave=False):
+494         return db.instance_get_by_uuid(context, uuid,
+495                                        columns_to_join=columns_to_join)
+496 
+497     @base.remotable_classmethod
+498     def get_by_uuid(cls, context, uuid, expected_attrs=None, use_slave=False):
+499         if expected_attrs is None:
+500             expected_attrs = ['info_cache', 'security_groups']
+501         columns_to_join = _expected_cols(expected_attrs)
+502         db_inst = cls._db_instance_get_by_uuid(context, uuid, columns_to_join,
+503                                                use_slave=use_slave)
+504         return cls._from_db_object(context, cls(), db_inst,
+505                                    expected_attrs)
+506 
+507     @base.remotable_classmethod
+508     def get_by_id(cls, context, inst_id, expected_attrs=None):
+509         if expected_attrs is None:
+510             expected_attrs = ['info_cache', 'security_groups']
+511         columns_to_join = _expected_cols(expected_attrs)
+512         db_inst = db.instance_get(context, inst_id,
+513                                   columns_to_join=columns_to_join)
+514         return cls._from_db_object(context, cls(), db_inst,
+515                                    expected_attrs)
+516 
+517     @base.remotable
+518     def create(self):
+519         if self.obj_attr_is_set('id'):
+520             raise exception.ObjectActionError(action='create',
+521                                               reason='already created')
+522         if self.obj_attr_is_set('deleted') and self.deleted:
+523             raise exception.ObjectActionError(action='create',
+524                                               reason='already deleted')
+525         updates = self.obj_get_changes()
+526 
+527         # NOTE(danms): We know because of the check above that deleted
+528         # is either unset or false. Since we need to avoid passing False
+529         # down to the DB layer (which uses an integer), we can always
+530         # default it to zero here.
+531         updates['deleted'] = 0
+532 
+533         expected_attrs = [attr for attr in INSTANCE_DEFAULT_FIELDS
+534                           if attr in updates]
+535         if 'security_groups' in updates:
+536             updates['security_groups'] = [x.name for x in
+537                                           updates['security_groups']]
+538         if 'info_cache' in updates:
+539             updates['info_cache'] = {
+540                 'network_info': updates['info_cache'].network_info.json()
+541                 }
+542         updates['extra'] = {}
+543         numa_topology = updates.pop('numa_topology', None)
+544         expected_attrs.append('numa_topology')
+545         if numa_topology:
+546             updates['extra']['numa_topology'] = numa_topology._to_json()
+547         else:
+548             updates['extra']['numa_topology'] = None
+549         pci_requests = updates.pop('pci_requests', None)
+550         expected_attrs.append('pci_requests')
+551         if pci_requests:
+552             updates['extra']['pci_requests'] = (
+553                 pci_requests.to_json())
+554         else:
+555             updates['extra']['pci_requests'] = None
+556         device_metadata = updates.pop('device_metadata', None)
+557         expected_attrs.append('device_metadata')
+558         if device_metadata:
+559             updates['extra']['device_metadata'] = (
+560                 device_metadata._to_json())
+561         else:
+562             updates['extra']['device_metadata'] = None
+563         flavor = updates.pop('flavor', None)
+564         if flavor:
+565             expected_attrs.append('flavor')
+566             old = ((self.obj_attr_is_set('old_flavor') and
+567                     self.old_flavor) and
+568                    self.old_flavor.obj_to_primitive() or None)
+569             new = ((self.obj_attr_is_set('new_flavor') and
+570                     self.new_flavor) and
+571                    self.new_flavor.obj_to_primitive() or None)
+572             flavor_info = {
+573                 'cur': self.flavor.obj_to_primitive(),
+574                 'old': old,
+575                 'new': new,
+576             }
+577             self._nullify_flavor_description(flavor_info)
+578             updates['extra']['flavor'] = jsonutils.dumps(flavor_info)
+579         keypairs = updates.pop('keypairs', None)
+580         if keypairs is not None:
+581             expected_attrs.append('keypairs')
+582             updates['extra']['keypairs'] = jsonutils.dumps(
+583                 keypairs.obj_to_primitive())
+584         vcpu_model = updates.pop('vcpu_model', None)
+585         expected_attrs.append('vcpu_model')
+586         if vcpu_model:
+587             updates['extra']['vcpu_model'] = (
+588                 jsonutils.dumps(vcpu_model.obj_to_primitive()))
+589         else:
+590             updates['extra']['vcpu_model'] = None
+591         trusted_certs = updates.pop('trusted_certs', None)
+592         expected_attrs.append('trusted_certs')
+593         if trusted_certs:
+594             updates['extra']['trusted_certs'] = jsonutils.dumps(
+595                 trusted_certs.obj_to_primitive())
+596         else:
+597             updates['extra']['trusted_certs'] = None
+598         db_inst = db.instance_create(self._context, updates)
+599         self._from_db_object(self._context, self, db_inst, expected_attrs)
+600 
+601         # NOTE(danms): The EC2 ids are created on their first load. In order
+602         # to avoid them being missing and having to be loaded later, we
+603         # load them once here on create now that the instance record is
+604         # created.
+605         self._load_ec2_ids()
+606         self.obj_reset_changes(['ec2_ids'])
+607 
+608     @base.remotable
+609     def destroy(self):
+610         if not self.obj_attr_is_set('id'):
+611             raise exception.ObjectActionError(action='destroy',
+612                                               reason='already destroyed')
+613         if not self.obj_attr_is_set('uuid'):
+614             raise exception.ObjectActionError(action='destroy',
+615                                               reason='no uuid')
+616         if not self.obj_attr_is_set('host') or not self.host:
+617             # NOTE(danms): If our host is not set, avoid a race
+618             constraint = db.constraint(host=db.equal_any(None))
+619         else:
+620             constraint = None
+621 
+622         cell_type = cells_opts.get_cell_type()
+623         if cell_type is not None:
+624             stale_instance = self.obj_clone()
+625 
+626         try:
+627             db_inst = db.instance_destroy(self._context, self.uuid,
+628                                           constraint=constraint)
+629             self._from_db_object(self._context, self, db_inst)
+630         except exception.ConstraintNotMet:
+631             raise exception.ObjectActionError(action='destroy',
+632                                               reason='host changed')
+633         if cell_type == 'compute':
+634             cells_api = cells_rpcapi.CellsAPI()
+635             cells_api.instance_destroy_at_top(self._context, stale_instance)
+636         delattr(self, base.get_attrname('id'))
+637 
+638     def _save_info_cache(self, context):
+639         if self.info_cache:
+640             with self.info_cache.obj_alternate_context(context):
+641                 self.info_cache.save()
+642 
+643     def _save_security_groups(self, context):
+644         security_groups = self.security_groups or []
+645         for secgroup in security_groups:
+646             with secgroup.obj_alternate_context(context):
+647                 secgroup.save()
+648         self.security_groups.obj_reset_changes()
+649 
+650     def _save_fault(self, context):
+651         # NOTE(danms): I don't think we need to worry about this, do we?
+652         pass
+653 
+654     def _save_pci_requests(self, context):
+655         # TODO(danms): Unfortunately, extra.pci_requests is not a serialized
+656         # PciRequests object (!), so we have to handle it specially here.
+657         # That should definitely be fixed!
+658         self._extra_values_to_save['pci_requests'] = (
+659             self.pci_requests.to_json())
+660 
+661     def _save_pci_devices(self, context):
+662         # NOTE(yjiang5): All devices held by PCI tracker, only PCI tracker
+663         # permitted to update the DB. all change to devices from here will
+664         # be dropped.
+665         pass
+666 
+667     def _save_tags(self, context):
+668         # NOTE(gibi): tags are not saved through the instance
+669         pass
+670 
+671     @staticmethod
+672     def _nullify_flavor_description(flavor_info):
+673         """Helper method to nullify descriptions from a set of primitive
+674         flavors.
+675 
+676         Note that we don't remove the flavor description since that would
+677         make the versioned notification FlavorPayload have to handle the field
+678         not being set on the embedded instance.flavor.
+679 
+680         :param dict: dict of primitive flavor objects where the values are the
+681             flavors which get persisted in the instance_extra.flavor table.
+682         """
+683         for flavor in flavor_info.values():
+684             if flavor and 'description' in flavor['nova_object.data']:
+685                 flavor['nova_object.data']['description'] = None
+686 
+687     def _save_flavor(self, context):
+688         if not any([x in self.obj_what_changed() for x in
+689                     ('flavor', 'old_flavor', 'new_flavor')]):
+690             return
+691         flavor_info = {
+692             'cur': self.flavor.obj_to_primitive(),
+693             'old': (self.old_flavor and
+694                     self.old_flavor.obj_to_primitive() or None),
+695             'new': (self.new_flavor and
+696                     self.new_flavor.obj_to_primitive() or None),
+697         }
+698         self._nullify_flavor_description(flavor_info)
+699         self._extra_values_to_save['flavor'] = jsonutils.dumps(flavor_info)
+700         self.obj_reset_changes(['flavor', 'old_flavor', 'new_flavor'])
+701 
+702     def _save_old_flavor(self, context):
+703         if 'old_flavor' in self.obj_what_changed():
+704             self._save_flavor(context)
+705 
+706     def _save_new_flavor(self, context):
+707         if 'new_flavor' in self.obj_what_changed():
+708             self._save_flavor(context)
+709 
+710     def _save_ec2_ids(self, context):
+711         # NOTE(hanlind): Read-only so no need to save this.
+712         pass
+713 
+714     def _save_keypairs(self, context):
+715         # NOTE(danms): Read-only so no need to save this.
+716         pass
+717 
+718     def _save_extra_generic(self, field):
+719         if field in self.obj_what_changed():
+720             obj = getattr(self, field)
+721             value = None
+722             if obj is not None:
+723                 value = jsonutils.dumps(obj.obj_to_primitive())
+724             self._extra_values_to_save[field] = value
+725 
+726     @base.remotable
+727     def save(self, expected_vm_state=None,
+728              expected_task_state=None, admin_state_reset=False):
+729         """Save updates to this instance
+730 
+731         Column-wise updates will be made based on the result of
+732         self.obj_what_changed(). If expected_task_state is provided,
+733         it will be checked against the in-database copy of the
+734         instance before updates are made.
+735 
+736         :param expected_vm_state: Optional tuple of valid vm states
+737                                   for the instance to be in
+738         :param expected_task_state: Optional tuple of valid task states
+739                                     for the instance to be in
+740         :param admin_state_reset: True if admin API is forcing setting
+741                                   of task_state/vm_state
+742         """
+743         # Store this on the class because _cell_name_blocks_sync is useless
+744         # after the db update call below.
+745         self._sync_cells = not self._cell_name_blocks_sync()
+746 
+747         context = self._context
+748         cell_type = cells_opts.get_cell_type()
+749 
+750         if cell_type is not None:
+751             # NOTE(comstud): We need to stash a copy of ourselves
+752             # before any updates are applied.  When we call the save
+753             # methods on nested objects, we will lose any changes to
+754             # them.  But we need to make sure child cells can tell
+755             # what is changed.
+756             #
+757             # We also need to nuke any updates to vm_state and task_state
+758             # unless admin_state_reset is True.  compute cells are
+759             # authoritative for their view of vm_state and task_state.
+760             stale_instance = self.obj_clone()
+761 
+762         cells_update_from_api = (cell_type == 'api' and self.cell_name and
+763                                  self._sync_cells)
+764 
+765         if cells_update_from_api:
+766             def _handle_cell_update_from_api():
+767                 cells_api = cells_rpcapi.CellsAPI()
+768                 cells_api.instance_update_from_api(context, stale_instance,
+769                             expected_vm_state,
+770                             expected_task_state,
+771                             admin_state_reset)
+772 
+773         self._extra_values_to_save = {}
+774         updates = {}
+775         changes = self.obj_what_changed()
+776 
+777         for field in self.fields:
+778             # NOTE(danms): For object fields, we construct and call a
+779             # helper method like self._save_$attrname()
+780             if (self.obj_attr_is_set(field) and
+781                     isinstance(self.fields[field], fields.ObjectField)):
+782                 try:
+783                     getattr(self, '_save_%s' % field)(context)
+784                 except AttributeError:
+785                     if field in _INSTANCE_EXTRA_FIELDS:
+786                         self._save_extra_generic(field)
+787                         continue
+788                     LOG.exception('No save handler for %s', field,
+789                                   instance=self)
+790                 except db_exc.DBReferenceError as exp:
+791                     if exp.key != 'instance_uuid':
+792                         raise
+793                     # NOTE(melwitt): This will happen if we instance.save()
+794                     # before an instance.create() and FK constraint fails.
+795                     # In practice, this occurs in cells during a delete of
+796                     # an unscheduled instance. Otherwise, it could happen
+797                     # as a result of bug.
+798                     raise exception.InstanceNotFound(instance_id=self.uuid)
+799             elif field in changes:
+800                 if (field == 'cell_name' and self[field] is not None and
+801                         self[field].startswith(cells_utils.BLOCK_SYNC_FLAG)):
+802                     updates[field] = self[field].replace(
+803                             cells_utils.BLOCK_SYNC_FLAG, '', 1)
+804                 else:
+805                     updates[field] = self[field]
+806 
+807         if self._extra_values_to_save:
+808             db.instance_extra_update_by_uuid(context, self.uuid,
+809                                              self._extra_values_to_save)
+810 
+811         if not updates:
+812             if cells_update_from_api:
+813                 _handle_cell_update_from_api()
+814             return
+815 
+816         # Cleaned needs to be turned back into an int here
+817         if 'cleaned' in updates:
+818             if updates['cleaned']:
+819                 updates['cleaned'] = 1
+820             else:
+821                 updates['cleaned'] = 0
+822 
+823         if expected_task_state is not None:
+824             updates['expected_task_state'] = expected_task_state
+825         if expected_vm_state is not None:
+826             updates['expected_vm_state'] = expected_vm_state
+827 
+828         expected_attrs = [attr for attr in _INSTANCE_OPTIONAL_JOINED_FIELDS
+829                                if self.obj_attr_is_set(attr)]
+830         if 'pci_devices' in expected_attrs:
+831             # NOTE(danms): We don't refresh pci_devices on save right now
+832             expected_attrs.remove('pci_devices')
+833 
+834         # NOTE(alaski): We need to pull system_metadata for the
+835         # notification.send_update() below.  If we don't there's a KeyError
+836         # when it tries to extract the flavor.
+837         if 'system_metadata' not in expected_attrs:
+838             expected_attrs.append('system_metadata')
+839         old_ref, inst_ref = db.instance_update_and_get_original(
+840                 context, self.uuid, updates,
+841                 columns_to_join=_expected_cols(expected_attrs))
+842         self._from_db_object(context, self, inst_ref,
+843                              expected_attrs=expected_attrs)
+844 
+845         if cells_update_from_api:
+846             _handle_cell_update_from_api()
+847         elif cell_type == 'compute':
+848             if self._sync_cells:
+849                 cells_api = cells_rpcapi.CellsAPI()
+850                 cells_api.instance_update_at_top(context, stale_instance)
+851 
+852         def _notify():
+853             # NOTE(danms): We have to be super careful here not to trigger
+854             # any lazy-loads that will unmigrate or unbackport something. So,
+855             # make a copy of the instance for notifications first.
+856             new_ref = self.obj_clone()
+857 
+858             notifications.send_update(context, old_ref, new_ref)
+859 
+860         # NOTE(alaski): If cell synchronization is blocked it means we have
+861         # already run this block of code in either the parent or child of this
+862         # cell.  Therefore this notification has already been sent.
+863         if not self._sync_cells:
+864             _notify = lambda: None  # noqa: F811
+865 
+866         _notify()
+867 
+868         self.obj_reset_changes()
+869 
+870     @base.remotable
+871     def refresh(self, use_slave=False):
+872         extra = [field for field in INSTANCE_OPTIONAL_ATTRS
+873                        if self.obj_attr_is_set(field)]
+874         current = self.__class__.get_by_uuid(self._context, uuid=self.uuid,
+875                                              expected_attrs=extra,
+876                                              use_slave=use_slave)
+877         # NOTE(danms): We orphan the instance copy so we do not unexpectedly
+878         # trigger a lazy-load (which would mean we failed to calculate the
+879         # expected_attrs properly)
+880         current._context = None
+881 
+882         for field in self.fields:
+883             if field not in self:
+884                 continue
+885             if field not in current:
+886                 # If the field isn't in current we should not
+887                 # touch it, triggering a likely-recursive lazy load.
+888                 # Log it so we can see it happening though, as it
+889                 # probably isn't expected in most cases.
+890                 LOG.debug('Field %s is set but not in refreshed '
+891                           'instance, skipping', field)
+892                 continue
+893             if field == 'info_cache':
+894                 self.info_cache.refresh()
+895             elif self[field] != current[field]:
+896                 self[field] = current[field]
+897         self.obj_reset_changes()
+898 
+899     def _load_generic(self, attrname):
+900         instance = self.__class__.get_by_uuid(self._context,
+901                                               uuid=self.uuid,
+902                                               expected_attrs=[attrname])
+903 
+904         if attrname not in instance:
+905             # NOTE(danms): Never allow us to recursively-load
+906             raise exception.ObjectActionError(
+907                 action='obj_load_attr',
+908                 reason=_('loading %s requires recursion') % attrname)
+909 
+910         # NOTE(danms): load anything we don't already have from the
+911         # instance we got from the database to make the most of the
+912         # performance hit.
+913         for field in self.fields:
+914             if field in instance and field not in self:
+915                 setattr(self, field, getattr(instance, field))
+916 
+917     def _load_fault(self):
+918         self.fault = objects.InstanceFault.get_latest_for_instance(
+919             self._context, self.uuid)
+920 
+921     def _load_numa_topology(self, db_topology=_NO_DATA_SENTINEL):
+922         if db_topology is None:
+923             self.numa_topology = None
+924         elif db_topology is not _NO_DATA_SENTINEL:
+925             self.numa_topology = \
+926                 objects.InstanceNUMATopology.obj_from_db_obj(self.uuid,
+927                                                              db_topology)
+928         else:
+929             try:
+930                 self.numa_topology = \
+931                     objects.InstanceNUMATopology.get_by_instance_uuid(
+932                         self._context, self.uuid)
+933             except exception.NumaTopologyNotFound:
+934                 self.numa_topology = None
+935 
+936     def _load_pci_requests(self, db_requests=_NO_DATA_SENTINEL):
+937         if db_requests is not _NO_DATA_SENTINEL:
+938             self.pci_requests = objects.InstancePCIRequests.obj_from_db(
+939                 self._context, self.uuid, db_requests)
+940         else:
+941             self.pci_requests = \
+942                 objects.InstancePCIRequests.get_by_instance_uuid(
+943                     self._context, self.uuid)
+944 
+945     def _load_device_metadata(self, db_dev_meta=_NO_DATA_SENTINEL):
+946         if db_dev_meta is None:
+947             self.device_metadata = None
+948         elif db_dev_meta is not _NO_DATA_SENTINEL:
+949             self.device_metadata = \
+950                 objects.InstanceDeviceMetadata.obj_from_db(
+951                 self._context, db_dev_meta)
+952         else:
+953             self.device_metadata = \
+954                 objects.InstanceDeviceMetadata.get_by_instance_uuid(
+955                     self._context, self.uuid)
+956 
+957     def _load_flavor(self):
+958         instance = self.__class__.get_by_uuid(
+959             self._context, uuid=self.uuid,
+960             expected_attrs=['flavor'])
+961 
+962         # NOTE(danms): Orphan the instance to make sure we don't lazy-load
+963         # anything below
+964         instance._context = None
+965         self.flavor = instance.flavor
+966         self.old_flavor = instance.old_flavor
+967         self.new_flavor = instance.new_flavor
+968 
+969     def _load_vcpu_model(self, db_vcpu_model=_NO_DATA_SENTINEL):
+970         if db_vcpu_model is None:
+971             self.vcpu_model = None
+972         elif db_vcpu_model is _NO_DATA_SENTINEL:
+973             self.vcpu_model = objects.VirtCPUModel.get_by_instance_uuid(
+974                 self._context, self.uuid)
+975         else:
+976             db_vcpu_model = jsonutils.loads(db_vcpu_model)
+977             self.vcpu_model = objects.VirtCPUModel.obj_from_primitive(
+978                 db_vcpu_model)
+979 
+980     def _load_ec2_ids(self):
+981         self.ec2_ids = objects.EC2Ids.get_by_instance(self._context, self)
+982 
+983     def _load_security_groups(self):
+984         self.security_groups = objects.SecurityGroupList.get_by_instance(
+985             self._context, self)
+986 
+987     def _load_pci_devices(self):
+988         self.pci_devices = objects.PciDeviceList.get_by_instance_uuid(
+989             self._context, self.uuid)
+990 
+991     def _load_migration_context(self, db_context=_NO_DATA_SENTINEL):
+992         if db_context is _NO_DATA_SENTINEL:
+993             try:
+994                 self.migration_context = (
+995                     objects.MigrationContext.get_by_instance_uuid(
+996                         self._context, self.uuid))
+997             except exception.MigrationContextNotFound:
+998                 self.migration_context = None
+999         elif db_context is None:
+1000             self.migration_context = None
+1001         else:
+1002             self.migration_context = objects.MigrationContext.obj_from_db_obj(
+1003                 db_context)
+1004 
+1005     def _load_keypairs(self, db_keypairs=_NO_DATA_SENTINEL):
+1006         if db_keypairs is _NO_DATA_SENTINEL:
+1007             inst = objects.Instance.get_by_uuid(self._context, self.uuid,
+1008                                                 expected_attrs=['keypairs'])
+1009             if 'keypairs' in inst:
+1010                 self.keypairs = inst.keypairs
+1011                 self.keypairs.obj_reset_changes(recursive=True)
+1012                 self.obj_reset_changes(['keypairs'])
+1013             else:
+1014                 self.keypairs = objects.KeyPairList(objects=[])
+1015                 # NOTE(danms): We leave the keypairs attribute dirty in hopes
+1016                 # someone else will save it for us
+1017         elif db_keypairs:
+1018             self.keypairs = objects.KeyPairList.obj_from_primitive(
+1019                 jsonutils.loads(db_keypairs))
+1020             self.obj_reset_changes(['keypairs'])
+1021 
+1022     def _load_tags(self):
+1023         self.tags = objects.TagList.get_by_resource_id(
+1024             self._context, self.uuid)
+1025 
+1026     def _load_trusted_certs(self, db_trusted_certs=_NO_DATA_SENTINEL):
+1027         if db_trusted_certs is None:
+1028             self.trusted_certs = None
+1029         elif db_trusted_certs is _NO_DATA_SENTINEL:
+1030             self.trusted_certs = objects.TrustedCerts.get_by_instance_uuid(
+1031                 self._context, self.uuid)
+1032         else:
+1033             self.trusted_certs = objects.TrustedCerts.obj_from_primitive(
+1034                 jsonutils.loads(db_trusted_certs))
+1035 
+1036     def apply_migration_context(self):
+1037         if self.migration_context:
+1038             self._set_migration_context_to_instance(prefix='new_')
+1039         else:
+1040             LOG.debug("Trying to apply a migration context that does not "
+1041                       "seem to be set for this instance", instance=self)
+1042 
+1043     def revert_migration_context(self):
+1044         if self.migration_context:
+1045             self._set_migration_context_to_instance(prefix='old_')
+1046         else:
+1047             LOG.debug("Trying to revert a migration context that does not "
+1048                       "seem to be set for this instance", instance=self)
+1049 
+1050     def _set_migration_context_to_instance(self, prefix):
+1051         for inst_attr_name in _MIGRATION_CONTEXT_ATTRS:
+1052             setattr(self, inst_attr_name, None)
+1053             attr_name = prefix + inst_attr_name
+1054             if attr_name in self.migration_context:
+1055                 attr_value = getattr(
+1056                     self.migration_context, attr_name)
+1057                 setattr(self, inst_attr_name, attr_value)
+1058 
+1059     @contextlib.contextmanager
+1060     def mutated_migration_context(self):
+1061         """Context manager to temporarily apply the migration context.
+1062 
+1063         Calling .save() from within the context manager means that the mutated
+1064         context will be saved which can cause incorrect resource tracking, and
+1065         should be avoided.
+1066         """
+1067         # First check to see if we even have a migration context set and if not
+1068         # we can exit early without lazy-loading other attributes.
+1069         if 'migration_context' in self and self.migration_context is None:
+1070             yield
+1071             return
+1072 
+1073         current_values = {}
+1074         for attr_name in _MIGRATION_CONTEXT_ATTRS:
+1075             current_values[attr_name] = getattr(self, attr_name)
+1076         self.apply_migration_context()
+1077         try:
+1078             yield
+1079         finally:
+1080             for attr_name in _MIGRATION_CONTEXT_ATTRS:
+1081                 setattr(self, attr_name, current_values[attr_name])
+1082 
+1083     @base.remotable
+1084     def drop_migration_context(self):
+1085         if self.migration_context:
+1086             db.instance_extra_update_by_uuid(self._context, self.uuid,
+1087                                              {'migration_context': None})
+1088             self.migration_context = None
+1089 
+1090     def clear_numa_topology(self):
+1091         numa_topology = self.numa_topology
+1092         if numa_topology is not None:
+1093             self.numa_topology = numa_topology.clear_host_pinning()
+1094 
+1095     def obj_load_attr(self, attrname):
+1096         # NOTE(danms): We can't lazy-load anything without a context and a uuid
+1097         if not self._context:
+1098             raise exception.OrphanedObjectError(method='obj_load_attr',
+1099                                                 objtype=self.obj_name())
+1100         if 'uuid' not in self:
+1101             raise exception.ObjectActionError(
+1102                 action='obj_load_attr',
+1103                 reason=_('attribute %s not lazy-loadable') % attrname)
+1104 
+1105         LOG.debug("Lazy-loading '%(attr)s' on %(name)s uuid %(uuid)s",
+1106                   {'attr': attrname,
+1107                    'name': self.obj_name(),
+1108                    'uuid': self.uuid,
+1109                    })
+1110 
+1111         with utils.temporary_mutation(self._context, read_deleted='yes'):
+1112             self._obj_load_attr(attrname)
+1113 
+1114     def _obj_load_attr(self, attrname):
+1115         """Internal method for loading attributes from instances.
+1116 
+1117         NOTE: Do not use this directly.
+1118 
+1119         This method contains the implementation of lazy-loading attributes
+1120         from Instance object, minus some massaging of the context and
+1121         error-checking. This should always be called with the object-local
+1122         context set for reading deleted instances and with uuid set. All
+1123         of the code below depends on those two things. Thus, this should
+1124         only be called from obj_load_attr() itself.
+1125 
+1126         :param attrname: The name of the attribute to be loaded
+1127         """
+1128 
+1129         # NOTE(danms): We handle some fields differently here so that we
+1130         # can be more efficient
+1131         if attrname == 'fault':
+1132             self._load_fault()
+1133         elif attrname == 'numa_topology':
+1134             self._load_numa_topology()
+1135         elif attrname == 'device_metadata':
+1136             self._load_device_metadata()
+1137         elif attrname == 'pci_requests':
+1138             self._load_pci_requests()
+1139         elif attrname == 'vcpu_model':
+1140             self._load_vcpu_model()
+1141         elif attrname == 'ec2_ids':
+1142             self._load_ec2_ids()
+1143         elif attrname == 'migration_context':
+1144             self._load_migration_context()
+1145         elif attrname == 'keypairs':
+1146             # NOTE(danms): Let keypairs control its own destiny for
+1147             # resetting changes.
+1148             return self._load_keypairs()
+1149         elif attrname == 'trusted_certs':
+1150             return self._load_trusted_certs()
+1151         elif attrname == 'security_groups':
+1152             self._load_security_groups()
+1153         elif attrname == 'pci_devices':
+1154             self._load_pci_devices()
+1155         elif 'flavor' in attrname:
+1156             self._load_flavor()
+1157         elif attrname == 'services' and self.deleted:
+1158             # NOTE(mriedem): The join in the data model for instances.services
+1159             # filters on instances.deleted == 0, so if the instance is deleted
+1160             # don't attempt to even load services since we'll fail.
+1161             self.services = objects.ServiceList(self._context)
+1162         elif attrname == 'tags':
+1163             if self.deleted:
+1164                 # NOTE(mriedem): Same story as services, the DB API query
+1165                 # in instance_tag_get_by_instance_uuid will fail if the
+1166                 # instance has been deleted so just return an empty tag list.
+1167                 self.tags = objects.TagList(self._context)
+1168             else:
+1169                 self._load_tags()
+1170         elif attrname in self.fields and attrname != 'id':
+1171             # NOTE(danms): We've never let 'id' be lazy-loaded, and use its
+1172             # absence as a sentinel that it hasn't been created in the database
+1173             # yet, so refuse to do so here.
+1174             self._load_generic(attrname)
+1175         else:
+1176             # NOTE(danms): This is historically what we did for
+1177             # something not in a field that was force-loaded. So, just
+1178             # do this for consistency.
+1179             raise exception.ObjectActionError(
+1180                 action='obj_load_attr',
+1181                 reason=_('attribute %s not lazy-loadable') % attrname)
+1182 
+1183         self.obj_reset_changes([attrname])
+1184 
+1185     def get_flavor(self, namespace=None):
+1186         prefix = ('%s_' % namespace) if namespace is not None else ''
+1187         attr = '%sflavor' % prefix
+1188         try:
+1189             return getattr(self, attr)
+1190         except exception.FlavorNotFound:
+1191             # NOTE(danms): This only happens in the case where we don't
+1192             # have flavor information in instance_extra, and doing
+1193             # this triggers a lookup based on our instance_type_id for
+1194             # (very) legacy instances. That legacy code expects a None here,
+1195             # so emulate it for this helper, even though the actual attribute
+1196             # is not nullable.
+1197             return None
+1198 
+1199     @base.remotable
+1200     def delete_metadata_key(self, key):
+1201         """Optimized metadata delete method.
+1202 
+1203         This provides a more efficient way to delete a single metadata
+1204         key, instead of just calling instance.save(). This should be called
+1205         with the key still present in self.metadata, which it will update
+1206         after completion.
+1207         """
+1208         db.instance_metadata_delete(self._context, self.uuid, key)
+1209         md_was_changed = 'metadata' in self.obj_what_changed()
+1210         del self.metadata[key]
+1211         self._orig_metadata.pop(key, None)
+1212         notifications.send_update(self._context, self, self)
+1213         if not md_was_changed:
+1214             self.obj_reset_changes(['metadata'])
+1215 
+1216     def _cell_name_blocks_sync(self):
+1217         if (self.obj_attr_is_set('cell_name') and
+1218                 self.cell_name is not None and
+1219                 self.cell_name.startswith(cells_utils.BLOCK_SYNC_FLAG)):
+1220             return True
+1221         return False
+1222 
+1223     def _normalize_cell_name(self):
+1224         """Undo skip_cell_sync()'s cell_name modification if applied"""
+1225 
+1226         if not self.obj_attr_is_set('cell_name') or self.cell_name is None:
+1227             return
+1228         cn_changed = 'cell_name' in self.obj_what_changed()
+1229         if self.cell_name.startswith(cells_utils.BLOCK_SYNC_FLAG):
+1230             self.cell_name = self.cell_name.replace(
+1231                     cells_utils.BLOCK_SYNC_FLAG, '', 1)
+1232             # cell_name is not normally an empty string, this means it was None
+1233             # or unset before cells_utils.BLOCK_SYNC_FLAG was applied.
+1234             if len(self.cell_name) == 0:
+1235                 self.cell_name = None
+1236         if not cn_changed:
+1237             self.obj_reset_changes(['cell_name'])
+1238 
+1239     @contextlib.contextmanager
+1240     def skip_cells_sync(self):
+1241         """Context manager to save an instance without syncing cells.
+1242 
+1243         Temporarily disables the cells syncing logic, if enabled.  This should
+1244         only be used when saving an instance that has been passed down/up from
+1245         another cell in order to avoid passing it back to the originator to be
+1246         re-saved.
+1247         """
+1248         cn_changed = 'cell_name' in self.obj_what_changed()
+1249         if not self.obj_attr_is_set('cell_name') or self.cell_name is None:
+1250             self.cell_name = ''
+1251         self.cell_name = '%s%s' % (cells_utils.BLOCK_SYNC_FLAG, self.cell_name)
+1252         if not cn_changed:
+1253             self.obj_reset_changes(['cell_name'])
+1254         try:
+1255             yield
+1256         finally:
+1257             self._normalize_cell_name()
+1258 
+1259     def get_network_info(self):
+1260         if self.info_cache is None:
+1261             return network_model.NetworkInfo.hydrate([])
+1262         return self.info_cache.network_info
+1263 
+1264     def get_bdms(self):
+1265         return objects.BlockDeviceMappingList.get_by_instance_uuid(
+1266             self._context, self.uuid)
+1267 
+1268 
+1269 def _make_instance_list(context, inst_list, db_inst_list, expected_attrs):
+1270     get_fault = expected_attrs and 'fault' in expected_attrs
+1271     inst_faults = {}
+1272     if get_fault:
+1273         # Build an instance_uuid:latest-fault mapping
+1274         expected_attrs.remove('fault')
+1275         instance_uuids = [inst['uuid'] for inst in db_inst_list]
+1276         faults = objects.InstanceFaultList.get_by_instance_uuids(
+1277             context, instance_uuids)
+1278         for fault in faults:
+1279             if fault.instance_uuid not in inst_faults:
+1280                 inst_faults[fault.instance_uuid] = fault
+1281 
+1282     inst_cls = objects.Instance
+1283 
+1284     inst_list.objects = []
+1285     for db_inst in db_inst_list:
+1286         inst_obj = inst_cls._from_db_object(
+1287                 context, inst_cls(context), db_inst,
+1288                 expected_attrs=expected_attrs)
+1289         if get_fault:
+1290             inst_obj.fault = inst_faults.get(inst_obj.uuid, None)
+1291         inst_list.objects.append(inst_obj)
+1292     inst_list.obj_reset_changes()
+1293     return inst_list
+1294 
+1295 
+1296 @db_api.pick_context_manager_writer
+1297 def populate_missing_availability_zones(context, count):
+1298     # instances without host have no reasonable AZ to set
+1299     not_empty_host = models.Instance.host != None  # noqa E711
+1300     instances = (context.session.query(models.Instance).
+1301         filter(not_empty_host).
+1302         filter_by(availability_zone=None).limit(count).all())
+1303     count_all = len(instances)
+1304     count_hit = 0
+1305     for instance in instances:
+1306         az = avail_zone.get_instance_availability_zone(context, instance)
+1307         instance.availability_zone = az
+1308         instance.save(context.session)
+1309         count_hit += 1
+1310     return count_all, count_hit
+1311 
+1312 
+1313 @base.NovaObjectRegistry.register
+1314 class InstanceList(base.ObjectListBase, base.NovaObject):
+1315     # Version 2.0: Initial Version
+1316     # Version 2.1: Add get_uuids_by_host()
+1317     # Version 2.2: Pagination for get_active_by_window_joined()
+1318     # Version 2.3: Add get_count_by_vm_state()
+1319     # Version 2.4: Add get_counts()
+1320     VERSION = '2.4'
+1321 
+1322     fields = {
+1323         'objects': fields.ListOfObjectsField('Instance'),
+1324     }
+1325 
+1326     @classmethod
+1327     @db.select_db_reader_mode
+1328     def _get_by_filters_impl(cls, context, filters,
+1329                        sort_key='created_at', sort_dir='desc', limit=None,
+1330                        marker=None, expected_attrs=None, use_slave=False,
+1331                        sort_keys=None, sort_dirs=None):
+1332         if sort_keys or sort_dirs:
+1333             db_inst_list = db.instance_get_all_by_filters_sort(
+1334                 context, filters, limit=limit, marker=marker,
+1335                 columns_to_join=_expected_cols(expected_attrs),
+1336                 sort_keys=sort_keys, sort_dirs=sort_dirs)
+1337         else:
+1338             db_inst_list = db.instance_get_all_by_filters(
+1339                 context, filters, sort_key, sort_dir, limit=limit,
+1340                 marker=marker, columns_to_join=_expected_cols(expected_attrs))
+1341         return db_inst_list
+1342 
+1343     @base.remotable_classmethod
+1344     def get_by_filters(cls, context, filters,
+1345                        sort_key='created_at', sort_dir='desc', limit=None,
+1346                        marker=None, expected_attrs=None, use_slave=False,
+1347                        sort_keys=None, sort_dirs=None):
+1348         db_inst_list = cls._get_by_filters_impl(
+1349             context, filters, sort_key=sort_key, sort_dir=sort_dir,
+1350             limit=limit, marker=marker, expected_attrs=expected_attrs,
+1351             use_slave=use_slave, sort_keys=sort_keys, sort_dirs=sort_dirs)
+1352         # NOTE(melwitt): _make_instance_list could result in joined objects'
+1353         # (from expected_attrs) _from_db_object methods being called during
+1354         # Instance._from_db_object, each of which might choose to perform
+1355         # database writes. So, we call this outside of _get_by_filters_impl to
+1356         # avoid being nested inside a 'reader' database transaction context.
+1357         return _make_instance_list(context, cls(), db_inst_list,
+1358                                    expected_attrs)
+1359 
+1360     @staticmethod
+1361     @db.select_db_reader_mode
+1362     def _db_instance_get_all_by_host(context, host, columns_to_join,
+1363                                      use_slave=False):
+1364         return db.instance_get_all_by_host(context, host,
+1365                                            columns_to_join=columns_to_join)
+1366 
+1367     @base.remotable_classmethod
+1368     def get_by_host(cls, context, host, expected_attrs=None, use_slave=False):
+1369         db_inst_list = cls._db_instance_get_all_by_host(
+1370             context, host, columns_to_join=_expected_cols(expected_attrs),
+1371             use_slave=use_slave)
+1372         return _make_instance_list(context, cls(), db_inst_list,
+1373                                    expected_attrs)
+1374 
+1375     @base.remotable_classmethod
+1376     def get_by_host_and_node(cls, context, host, node, expected_attrs=None):
+1377         db_inst_list = db.instance_get_all_by_host_and_node(
+1378             context, host, node,
+1379             columns_to_join=_expected_cols(expected_attrs))
+1380         return _make_instance_list(context, cls(), db_inst_list,
+1381                                    expected_attrs)
+1382 
+1383     @base.remotable_classmethod
+1384     def get_by_host_and_not_type(cls, context, host, type_id=None,
+1385                                  expected_attrs=None):
+1386         db_inst_list = db.instance_get_all_by_host_and_not_type(
+1387             context, host, type_id=type_id)
+1388         return _make_instance_list(context, cls(), db_inst_list,
+1389                                    expected_attrs)
+1390 
+1391     @base.remotable_classmethod
+1392     def get_all(cls, context, expected_attrs=None):
+1393         """Returns all instances on all nodes."""
+1394         db_instances = db.instance_get_all(
+1395                 context, columns_to_join=_expected_cols(expected_attrs))
+1396         return _make_instance_list(context, cls(), db_instances,
+1397                                    expected_attrs)
+1398 
+1399     @base.remotable_classmethod
+1400     def get_hung_in_rebooting(cls, context, reboot_window,
+1401                               expected_attrs=None):
+1402         db_inst_list = db.instance_get_all_hung_in_rebooting(context,
+1403                                                              reboot_window)
+1404         return _make_instance_list(context, cls(), db_inst_list,
+1405                                    expected_attrs)
+1406 
+1407     @staticmethod
+1408     @db.select_db_reader_mode
+1409     def _db_instance_get_active_by_window_joined(
+1410             context, begin, end, project_id, host, columns_to_join,
+1411             use_slave=False, limit=None, marker=None):
+1412         return db.instance_get_active_by_window_joined(
+1413             context, begin, end, project_id, host,
+1414             columns_to_join=columns_to_join, limit=limit, marker=marker)
+1415 
+1416     @base.remotable_classmethod
+1417     def _get_active_by_window_joined(cls, context, begin, end=None,
+1418                                     project_id=None, host=None,
+1419                                     expected_attrs=None, use_slave=False,
+1420                                     limit=None, marker=None):
+1421         # NOTE(mriedem): We need to convert the begin/end timestamp strings
+1422         # to timezone-aware datetime objects for the DB API call.
+1423         begin = timeutils.parse_isotime(begin)
+1424         end = timeutils.parse_isotime(end) if end else None
+1425         db_inst_list = cls._db_instance_get_active_by_window_joined(
+1426             context, begin, end, project_id, host,
+1427             columns_to_join=_expected_cols(expected_attrs),
+1428             use_slave=use_slave, limit=limit, marker=marker)
+1429         return _make_instance_list(context, cls(), db_inst_list,
+1430                                    expected_attrs)
+1431 
+1432     @classmethod
+1433     def get_active_by_window_joined(cls, context, begin, end=None,
+1434                                     project_id=None, host=None,
+1435                                     expected_attrs=None, use_slave=False,
+1436                                     limit=None, marker=None):
+1437         """Get instances and joins active during a certain time window.
+1438 
+1439         :param:context: nova request context
+1440         :param:begin: datetime for the start of the time window
+1441         :param:end: datetime for the end of the time window
+1442         :param:project_id: used to filter instances by project
+1443         :param:host: used to filter instances on a given compute host
+1444         :param:expected_attrs: list of related fields that can be joined
+1445         in the database layer when querying for instances
+1446         :param use_slave if True, ship this query off to a DB slave
+1447         :param limit: maximum number of instances to return per page
+1448         :param marker: last instance uuid from the previous page
+1449         :returns: InstanceList
+1450 
+1451         """
+1452         # NOTE(mriedem): We have to convert the datetime objects to string
+1453         # primitives for the remote call.
+1454         begin = utils.isotime(begin)
+1455         end = utils.isotime(end) if end else None
+1456         return cls._get_active_by_window_joined(context, begin, end,
+1457                                                 project_id, host,
+1458                                                 expected_attrs,
+1459                                                 use_slave=use_slave,
+1460                                                 limit=limit, marker=marker)
+1461 
+1462     @base.remotable_classmethod
+1463     def get_by_security_group_id(cls, context, security_group_id):
+1464         db_secgroup = db.security_group_get(
+1465             context, security_group_id,
+1466             columns_to_join=['instances.info_cache',
+1467                              'instances.system_metadata'])
+1468         return _make_instance_list(context, cls(), db_secgroup['instances'],
+1469                                    ['info_cache', 'system_metadata'])
+1470 
+1471     @classmethod
+1472     def get_by_security_group(cls, context, security_group):
+1473         return cls.get_by_security_group_id(context, security_group.id)
+1474 
+1475     @base.remotable_classmethod
+1476     def get_by_grantee_security_group_ids(cls, context, security_group_ids):
+1477         db_instances = db.instance_get_all_by_grantee_security_groups(
+1478             context, security_group_ids)
+1479         return _make_instance_list(context, cls(), db_instances, [])
+1480 
+1481     def fill_faults(self):
+1482         """Batch query the database for our instances' faults.
+1483 
+1484         :returns: A list of instance uuids for which faults were found.
+1485         """
+1486         uuids = [inst.uuid for inst in self]
+1487         faults = objects.InstanceFaultList.get_latest_by_instance_uuids(
+1488             self._context, uuids)
+1489         faults_by_uuid = {}
+1490         for fault in faults:
+1491             faults_by_uuid[fault.instance_uuid] = fault
+1492 
+1493         for instance in self:
+1494             if instance.uuid in faults_by_uuid:
+1495                 instance.fault = faults_by_uuid[instance.uuid]
+1496             else:
+1497                 # NOTE(danms): Otherwise the caller will cause a lazy-load
+1498                 # when checking it, and we know there are none
+1499                 instance.fault = None
+1500             instance.obj_reset_changes(['fault'])
+1501 
+1502         return faults_by_uuid.keys()
+1503 
+1504     @base.remotable_classmethod
+1505     def get_uuids_by_host(cls, context, host):
+1506         return db.instance_get_all_uuids_by_host(context, host)
+1507 
+1508     @staticmethod
+1509     @db_api.pick_context_manager_reader
+1510     def _get_count_by_vm_state_in_db(context, project_id, user_id, vm_state):
+1511         return context.session.query(models.Instance.id).\
+1512             filter_by(deleted=0).\
+1513             filter_by(project_id=project_id).\
+1514             filter_by(user_id=user_id).\
+1515             filter_by(vm_state=vm_state).\
+1516             count()
+1517 
+1518     @base.remotable_classmethod
+1519     def get_count_by_vm_state(cls, context, project_id, user_id, vm_state):
+1520         return cls._get_count_by_vm_state_in_db(context, project_id, user_id,
+1521                                                 vm_state)
+1522 
+1523     @staticmethod
+1524     @db_api.pick_context_manager_reader
+1525     def _get_counts_in_db(context, project_id, user_id=None):
+1526         # NOTE(melwitt): Copied from nova/db/sqlalchemy/api.py:
+1527         # It would be better to have vm_state not be nullable
+1528         # but until then we test it explicitly as a workaround.
+1529         not_soft_deleted = or_(
+1530             models.Instance.vm_state != vm_states.SOFT_DELETED,
+1531             models.Instance.vm_state == null()
+1532             )
+1533         project_query = context.session.query(
+1534             func.count(models.Instance.id),
+1535             func.sum(models.Instance.vcpus),
+1536             func.sum(models.Instance.memory_mb)).\
+1537             filter_by(deleted=0).\
+1538             filter(not_soft_deleted).\
+1539             filter_by(project_id=project_id)
+1540 
+1541         project_result = project_query.first()
+1542         fields = ('instances', 'cores', 'ram')
+1543         project_counts = {field: int(project_result[idx] or 0)
+1544                           for idx, field in enumerate(fields)}
+1545         counts = {'project': project_counts}
+1546         if user_id:
+1547             user_result = project_query.filter_by(user_id=user_id).first()
+1548             user_counts = {field: int(user_result[idx] or 0)
+1549                            for idx, field in enumerate(fields)}
+1550             counts['user'] = user_counts
+1551         return counts
+1552 
+1553     @base.remotable_classmethod
+1554     def get_counts(cls, context, project_id, user_id=None):
+1555         """Get the counts of Instance objects in the database.
+1556 
+1557         :param context: The request context for database access
+1558         :param project_id: The project_id to count across
+1559         :param user_id: The user_id to count across
+1560         :returns: A dict containing the project-scoped counts and user-scoped
+1561                   counts if user_id is specified. For example:
+1562 
+1563                     {'project': {'instances': <count across project>,
+1564                                  'cores': <count across project>,
+1565                                  'ram': <count across project},
+1566                      'user': {'instances': <count across user>,
+1567                               'cores': <count across user>,
+1568                               'ram': <count across user>}}
+1569         """
+1570         return cls._get_counts_in_db(context, project_id, user_id=user_id)

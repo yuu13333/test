@@ -1,0 +1,171 @@
+Please review the code below for security defects using the CWE (Common Weakness Enumeration) as a reference standard. If any are found, please describe the security defect in detail and indicate the corresponding line number of code and solution. If none are detected, state: 'No security defects are detected in the code'.
+
+1 # Copyright (c) 2014 OpenStack Foundation.
+2 # All Rights Reserved.
+3 #
+4 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
+5 #    not use this file except in compliance with the License. You may obtain
+6 #    a copy of the License at
+7 #
+8 #         http://www.apache.org/licenses/LICENSE-2.0
+9 #
+10 #    Unless required by applicable law or agreed to in writing, software
+11 #    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+12 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+13 #    License for the specific language governing permissions and limitations
+14 #    under the License.
+15 
+16 import os
+17 
+18 import eventlet
+19 from oslo_config import cfg
+20 from oslo_log import log as logging
+21 import webob
+22 
+23 from neutron._i18n import _, _LI
+24 from neutron.agent.linux import keepalived
+25 from neutron.agent.linux import utils as agent_utils
+26 from neutron.common import utils as common_utils
+27 from neutron.notifiers import batch_notifier
+28 
+29 LOG = logging.getLogger(__name__)
+30 
+31 KEEPALIVED_STATE_CHANGE_SERVER_BACKLOG = 4096
+32 
+33 OPTS = [
+34     cfg.StrOpt('ha_confs_path',
+35                default='$state_path/ha_confs',
+36                help=_('Location to store keepalived/conntrackd '
+37                       'config files')),
+38     cfg.StrOpt('ha_vrrp_auth_type',
+39                default='PASS',
+40                choices=keepalived.VALID_AUTH_TYPES,
+41                help=_('VRRP authentication type')),
+42     cfg.StrOpt('ha_vrrp_auth_password',
+43                help=_('VRRP authentication password'),
+44                secret=True),
+45     cfg.IntOpt('ha_vrrp_advert_int',
+46                default=2,
+47                help=_('The advertisement interval in seconds')),
+48 ]
+49 
+50 
+51 class KeepalivedStateChangeHandler(object):
+52     def __init__(self, agent):
+53         self.agent = agent
+54 
+55     @webob.dec.wsgify(RequestClass=webob.Request)
+56     def __call__(self, req):
+57         router_id = req.headers['X-Neutron-Router-Id']
+58         state = req.headers['X-Neutron-State']
+59         self.enqueue(router_id, state)
+60 
+61     def enqueue(self, router_id, state):
+62         LOG.debug('Handling notification for router '
+63                   '%(router_id)s, state %(state)s', {'router_id': router_id,
+64                                                      'state': state})
+65         self.agent.enqueue_state_change(router_id, state)
+66 
+67 
+68 class L3AgentKeepalivedStateChangeServer(object):
+69     def __init__(self, agent, conf):
+70         self.agent = agent
+71         self.conf = conf
+72 
+73         agent_utils.ensure_directory_exists_without_file(
+74             self.get_keepalived_state_change_socket_path(self.conf))
+75 
+76     @classmethod
+77     def get_keepalived_state_change_socket_path(cls, conf):
+78         return os.path.join(conf.state_path, 'keepalived-state-change')
+79 
+80     def run(self):
+81         server = agent_utils.UnixDomainWSGIServer(
+82             'neutron-keepalived-state-change')
+83         server.start(KeepalivedStateChangeHandler(self.agent),
+84                      self.get_keepalived_state_change_socket_path(self.conf),
+85                      workers=0,
+86                      backlog=KEEPALIVED_STATE_CHANGE_SERVER_BACKLOG)
+87         server.wait()
+88 
+89 
+90 class AgentMixin(object):
+91     def __init__(self, host):
+92         self._init_ha_conf_path()
+93         super(AgentMixin, self).__init__(host)
+94         # BatchNotifier queue is needed to ensure that the HA router
+95         # state change sequence is under the proper order.
+96         self.state_change_notifier = batch_notifier.BatchNotifier(
+97             self.conf.ha_vrrp_advert_int, self.notify_server)
+98         eventlet.spawn(self._start_keepalived_notifications_server)
+99 
+100     def _start_keepalived_notifications_server(self):
+101         state_change_server = (
+102             L3AgentKeepalivedStateChangeServer(self, self.conf))
+103         state_change_server.run()
+104 
+105     def enqueue_state_change(self, router_id, state):
+106         LOG.info(_LI('Router %(router_id)s transitioned to %(state)s'),
+107                  {'router_id': router_id,
+108                   'state': state})
+109 
+110         try:
+111             ri = self.router_info[router_id]
+112         except KeyError:
+113             LOG.info(_LI('Router %s is not managed by this agent. It was '
+114                          'possibly deleted concurrently.'), router_id)
+115             return
+116 
+117         self._configure_ipv6_ra_on_ext_gw_port_if_necessary(ri, state)
+118         if self.conf.enable_metadata_proxy:
+119             self._update_metadata_proxy(ri, router_id, state)
+120         self._update_radvd_daemon(ri, state)
+121         self.state_change_notifier.queue_event((router_id, state))
+122 
+123     def _configure_ipv6_ra_on_ext_gw_port_if_necessary(self, ri, state):
+124         # If ipv6 is enabled on the platform, ipv6_gateway config flag is
+125         # not set and external_network associated to the router does not
+126         # include any IPv6 subnet, enable the gateway interface to accept
+127         # Router Advts from upstream router for default route.
+128         ex_gw_port_id = ri.ex_gw_port and ri.ex_gw_port['id']
+129         if state == 'master' and ex_gw_port_id:
+130             interface_name = ri.get_external_device_name(ex_gw_port_id)
+131             if ri.router.get('distributed', False):
+132                 namespace = ri.ha_namespace
+133             else:
+134                 namespace = ri.ns_name
+135             ri._enable_ra_on_gw(ri.ex_gw_port, namespace, interface_name)
+136 
+137     def _update_metadata_proxy(self, ri, router_id, state):
+138         if state == 'master':
+139             LOG.debug('Spawning metadata proxy for router %s', router_id)
+140             self.metadata_driver.spawn_monitored_metadata_proxy(
+141                 self.process_monitor, ri.ns_name, self.conf.metadata_port,
+142                 self.conf, router_id=ri.router_id)
+143         else:
+144             LOG.debug('Closing metadata proxy for router %s', router_id)
+145             self.metadata_driver.destroy_monitored_metadata_proxy(
+146                 self.process_monitor, ri.router_id, self.conf)
+147 
+148     def _update_radvd_daemon(self, ri, state):
+149         # Radvd has to be spawned only on the Master HA Router. If there are
+150         # any state transitions, we enable/disable radvd accordingly.
+151         if state == 'master':
+152             ri.enable_radvd()
+153         else:
+154             ri.disable_radvd()
+155 
+156     def notify_server(self, batched_events):
+157         translation_map = {'master': 'active',
+158                            'backup': 'standby',
+159                            'fault': 'standby'}
+160         translated_states = dict((router_id, translation_map[state]) for
+161                                  router_id, state in batched_events)
+162         LOG.debug('Updating server with HA routers states %s',
+163                   translated_states)
+164         self.plugin_rpc.update_ha_routers_states(
+165             self.context, translated_states)
+166 
+167     def _init_ha_conf_path(self):
+168         ha_full_path = os.path.dirname("/%s/" % self.conf.ha_confs_path)
+169         common_utils.ensure_dir(ha_full_path)

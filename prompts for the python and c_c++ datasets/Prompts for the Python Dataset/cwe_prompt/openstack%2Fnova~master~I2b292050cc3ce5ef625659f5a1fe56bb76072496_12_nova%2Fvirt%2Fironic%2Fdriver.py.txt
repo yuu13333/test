@@ -1,0 +1,2223 @@
+Please review the code below for security defects using the CWE (Common Weakness Enumeration) as a reference standard. If any are found, please describe the security defect in detail and indicate the corresponding line number of code and solution. If none are detected, state: 'No security defects are detected in the code'.
+
+1 # Copyright 2014 Red Hat, Inc.
+2 # Copyright 2013 Hewlett-Packard Development Company, L.P.
+3 # All Rights Reserved.
+4 #
+5 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
+6 #    not use this file except in compliance with the License. You may obtain
+7 #    a copy of the License at
+8 #
+9 #         http://www.apache.org/licenses/LICENSE-2.0
+10 #
+11 #    Unless required by applicable law or agreed to in writing, software
+12 #    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+13 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+14 #    License for the specific language governing permissions and limitations
+15 #    under the License.
+16 
+17 """
+18 A driver wrapping the Ironic API, such that Nova may provision
+19 bare metal resources.
+20 """
+21 import base64
+22 from distutils import version
+23 import gzip
+24 import shutil
+25 import tempfile
+26 import time
+27 
+28 from oslo_log import log as logging
+29 from oslo_serialization import jsonutils
+30 from oslo_service import loopingcall
+31 from oslo_utils import excutils
+32 from oslo_utils import importutils
+33 import six
+34 import six.moves.urllib.parse as urlparse
+35 from tooz import hashring as hash_ring
+36 
+37 from nova.api.metadata import base as instance_metadata
+38 from nova import block_device
+39 from nova.compute import power_state
+40 from nova.compute import task_states
+41 from nova.compute import vm_states
+42 import nova.conf
+43 from nova.console import type as console_type
+44 from nova import context as nova_context
+45 from nova import exception
+46 from nova.i18n import _
+47 from nova import objects
+48 from nova.objects import external_event as external_event_obj
+49 from nova.objects import fields as obj_fields
+50 from nova import servicegroup
+51 from nova import utils
+52 from nova.virt import configdrive
+53 from nova.virt import driver as virt_driver
+54 from nova.virt import firewall
+55 from nova.virt import hardware
+56 from nova.virt.ironic import client_wrapper
+57 from nova.virt.ironic import ironic_states
+58 from nova.virt.ironic import patcher
+59 from nova.virt import netutils
+60 
+61 
+62 ironic = None
+63 
+64 LOG = logging.getLogger(__name__)
+65 
+66 
+67 CONF = nova.conf.CONF
+68 
+69 _POWER_STATE_MAP = {
+70     ironic_states.POWER_ON: power_state.RUNNING,
+71     ironic_states.NOSTATE: power_state.NOSTATE,
+72     ironic_states.POWER_OFF: power_state.SHUTDOWN,
+73 }
+74 
+75 _UNPROVISION_STATES = (ironic_states.ACTIVE, ironic_states.DEPLOYFAIL,
+76                        ironic_states.ERROR, ironic_states.DEPLOYWAIT,
+77                        ironic_states.DEPLOYING, ironic_states.RESCUE,
+78                        ironic_states.RESCUING, ironic_states.RESCUEWAIT,
+79                        ironic_states.RESCUEFAIL, ironic_states.UNRESCUING,
+80                        ironic_states.UNRESCUEFAIL)
+81 
+82 _NODE_FIELDS = ('uuid', 'power_state', 'target_power_state', 'provision_state',
+83                 'target_provision_state', 'last_error', 'maintenance',
+84                 'properties', 'instance_uuid', 'traits', 'resource_class')
+85 
+86 # Console state checking interval in seconds
+87 _CONSOLE_STATE_CHECKING_INTERVAL = 1
+88 
+89 # Number of hash ring partitions per service
+90 # 5 should be fine for most deployments, as an experimental feature.
+91 _HASH_RING_PARTITIONS = 2 ** 5
+92 
+93 
+94 def map_power_state(state):
+95     try:
+96         return _POWER_STATE_MAP[state]
+97     except KeyError:
+98         LOG.warning("Power state %s not found.", state)
+99         return power_state.NOSTATE
+100 
+101 
+102 def _get_nodes_supported_instances(cpu_arch=None):
+103     """Return supported instances for a node."""
+104     if not cpu_arch:
+105         return []
+106     return [(cpu_arch,
+107              obj_fields.HVType.BAREMETAL,
+108              obj_fields.VMMode.HVM)]
+109 
+110 
+111 def _log_ironic_polling(what, node, instance):
+112     power_state = (None if node.power_state is None else
+113                    '"%s"' % node.power_state)
+114     tgt_power_state = (None if node.target_power_state is None else
+115                        '"%s"' % node.target_power_state)
+116     prov_state = (None if node.provision_state is None else
+117                   '"%s"' % node.provision_state)
+118     tgt_prov_state = (None if node.target_provision_state is None else
+119                       '"%s"' % node.target_provision_state)
+120     LOG.debug('Still waiting for ironic node %(node)s to %(what)s: '
+121               'power_state=%(power_state)s, '
+122               'target_power_state=%(tgt_power_state)s, '
+123               'provision_state=%(prov_state)s, '
+124               'target_provision_state=%(tgt_prov_state)s',
+125               dict(what=what,
+126                    node=node.uuid,
+127                    power_state=power_state,
+128                    tgt_power_state=tgt_power_state,
+129                    prov_state=prov_state,
+130                    tgt_prov_state=tgt_prov_state),
+131               instance=instance)
+132 
+133 
+134 def _check_peer_list():
+135     # these configs are mutable; need to check at runtime and init
+136     if CONF.ironic.partition_key is not None:
+137         peer_list = set(CONF.ironic.peer_list)
+138         if not peer_list:
+139             LOG.error('FATAL: Peer list is not configured in the '
+140                       '[ironic]/peer_list option; cannot map '
+141                       'ironic nodes to compute services.')
+142             raise exception.InvalidPeerList(host=CONF.host)
+143         if CONF.host not in peer_list:
+144             LOG.error('FATAL: Peer list does not contain this '
+145                       'compute service hostname (%s); add it to '
+146                       'the [ironic]/peer_list option.', CONF.host)
+147             raise exception.InvalidPeerList(host=CONF.host)
+148         if set([CONF.host]) == peer_list:
+149             LOG.warning('This compute service (%s) is the only service '
+150                         'present in the [ironic]/peer_list option. '
+151                         'Are you sure this should not include more '
+152                         'hosts?', CONF.host)
+153 
+154 
+155 class IronicDriver(virt_driver.ComputeDriver):
+156     """Hypervisor driver for Ironic - bare metal provisioning."""
+157 
+158     capabilities = {"has_imagecache": False,
+159                     "supports_evacuate": False,
+160                     "supports_migrate_to_same_host": False,
+161                     "supports_attach_interface": True,
+162                     "supports_multiattach": False,
+163                     "supports_trusted_certs": False,
+164 
+165                     # Image type support flags
+166                     "supports_image_type_aki": False,
+167                     "supports_image_type_ami": False,
+168                     "supports_image_type_ari": False,
+169                     "supports_image_type_iso": False,
+170                     "supports_image_type_qcow2": True,
+171                     "supports_image_type_raw": True,
+172                     "supports_image_type_vdi": False,
+173                     "supports_image_type_vhd": False,
+174                     "supports_image_type_vhdx": False,
+175                     "supports_image_type_vmdk": False,
+176                     }
+177 
+178     # This driver is capable of rebalancing nodes between computes.
+179     rebalances_nodes = True
+180 
+181     def __init__(self, virtapi, read_only=False):
+182         super(IronicDriver, self).__init__(virtapi)
+183         global ironic
+184         if ironic is None:
+185             ironic = importutils.import_module('ironicclient')
+186             # NOTE(deva): work around a lack of symbols in the current version.
+187             if not hasattr(ironic, 'exc'):
+188                 ironic.exc = importutils.import_module('ironicclient.exc')
+189             if not hasattr(ironic, 'client'):
+190                 ironic.client = importutils.import_module(
+191                                                     'ironicclient.client')
+192 
+193         self.firewall_driver = firewall.load_driver(
+194             default='nova.virt.firewall.NoopFirewallDriver')
+195         self.node_cache = {}
+196         self.node_cache_time = 0
+197         self.servicegroup_api = servicegroup.API()
+198 
+199         self.ironicclient = client_wrapper.IronicClientWrapper()
+200 
+201         # This is needed for the instance flavor migration in Pike, and should
+202         # be removed in Queens. Since this will run several times in the life
+203         # of the driver, track the instances that have already been migrated.
+204         self._migrated_instance_uuids = set()
+205 
+206     def _get_node(self, node_uuid):
+207         """Get a node by its UUID.
+208 
+209            Some methods pass in variables named nodename, but are
+210            actually UUID's.
+211         """
+212         return self.ironicclient.call('node.get', node_uuid,
+213                                       fields=_NODE_FIELDS)
+214 
+215     def _validate_instance_and_node(self, instance):
+216         """Get the node associated with the instance.
+217 
+218         Check with the Ironic service that this instance is associated with a
+219         node, and return the node.
+220         """
+221         try:
+222             return self.ironicclient.call('node.get_by_instance_uuid',
+223                                           instance.uuid, fields=_NODE_FIELDS)
+224         except ironic.exc.NotFound:
+225             raise exception.InstanceNotFound(instance_id=instance.uuid)
+226 
+227     def _node_resources_unavailable(self, node_obj):
+228         """Determine whether the node's resources are in an acceptable state.
+229 
+230         Determines whether the node's resources should be presented
+231         to Nova for use based on the current power, provision and maintenance
+232         state. This is called after _node_resources_used, so any node that
+233         is not used and not in AVAILABLE should be considered in a 'bad' state,
+234         and unavailable for scheduling. Returns True if unacceptable.
+235         """
+236         bad_power_states = [
+237             ironic_states.ERROR, ironic_states.NOSTATE]
+238         # keep NOSTATE around for compatibility
+239         good_provision_states = [
+240             ironic_states.AVAILABLE, ironic_states.NOSTATE]
+241         return (node_obj.maintenance or
+242                 node_obj.power_state in bad_power_states or
+243                 node_obj.provision_state not in good_provision_states)
+244 
+245     def _node_resources_used(self, node_obj):
+246         """Determine whether the node's resources are currently used.
+247 
+248         Determines whether the node's resources should be considered used
+249         or not. A node is used when it is either in the process of putting
+250         a new instance on the node, has an instance on the node, or is in
+251         the process of cleaning up from a deleted instance. Returns True if
+252         used.
+253 
+254         If we report resources as consumed for a node that does not have an
+255         instance on it, the resource tracker will notice there's no instances
+256         consuming resources and try to correct us. So only nodes with an
+257         instance attached should report as consumed here.
+258         """
+259         return node_obj.instance_uuid is not None
+260 
+261     def _parse_node_properties(self, node):
+262         """Helper method to parse the node's properties."""
+263         properties = {}
+264 
+265         for prop in ('cpus', 'memory_mb', 'local_gb'):
+266             try:
+267                 properties[prop] = int(node.properties.get(prop, 0))
+268             except (TypeError, ValueError):
+269                 LOG.warning('Node %(uuid)s has a malformed "%(prop)s". '
+270                             'It should be an integer.',
+271                             {'uuid': node.uuid, 'prop': prop})
+272                 properties[prop] = 0
+273 
+274         raw_cpu_arch = node.properties.get('cpu_arch', None)
+275         try:
+276             cpu_arch = obj_fields.Architecture.canonicalize(raw_cpu_arch)
+277         except exception.InvalidArchitectureName:
+278             cpu_arch = None
+279         if not cpu_arch:
+280             LOG.warning("cpu_arch not defined for node '%s'", node.uuid)
+281 
+282         properties['cpu_arch'] = cpu_arch
+283         properties['raw_cpu_arch'] = raw_cpu_arch
+284         properties['capabilities'] = node.properties.get('capabilities')
+285         return properties
+286 
+287     def _node_resource(self, node):
+288         """Helper method to create resource dict from node stats."""
+289         properties = self._parse_node_properties(node)
+290 
+291         raw_cpu_arch = properties['raw_cpu_arch']
+292         cpu_arch = properties['cpu_arch']
+293 
+294         nodes_extra_specs = {}
+295 
+296         # NOTE(deva): In Havana and Icehouse, the flavor was required to link
+297         # to an arch-specific deploy kernel and ramdisk pair, and so the flavor
+298         # also had to have extra_specs['cpu_arch'], which was matched against
+299         # the ironic node.properties['cpu_arch'].
+300         # With Juno, the deploy image(s) may be referenced directly by the
+301         # node.driver_info, and a flavor no longer needs to contain any of
+302         # these three extra specs, though the cpu_arch may still be used
+303         # in a heterogeneous environment, if so desired.
+304         # NOTE(dprince): we use the raw cpu_arch here because extra_specs
+305         # filters aren't canonicalized
+306         nodes_extra_specs['cpu_arch'] = raw_cpu_arch
+307 
+308         # NOTE(gilliard): To assist with more precise scheduling, if the
+309         # node.properties contains a key 'capabilities', we expect the value
+310         # to be of the form "k1:v1,k2:v2,etc.." which we add directly as
+311         # key/value pairs into the node_extra_specs to be used by the
+312         # ComputeCapabilitiesFilter
+313         capabilities = properties['capabilities']
+314         if capabilities:
+315             for capability in str(capabilities).split(','):
+316                 parts = capability.split(':')
+317                 if len(parts) == 2 and parts[0] and parts[1]:
+318                     nodes_extra_specs[parts[0].strip()] = parts[1]
+319                 else:
+320                     LOG.warning("Ignoring malformed capability '%s'. "
+321                                 "Format should be 'key:val'.", capability)
+322 
+323         vcpus = vcpus_used = 0
+324         memory_mb = memory_mb_used = 0
+325         local_gb = local_gb_used = 0
+326 
+327         dic = {
+328             'uuid': str(node.uuid),
+329             'hypervisor_hostname': str(node.uuid),
+330             'hypervisor_type': self._get_hypervisor_type(),
+331             'hypervisor_version': self._get_hypervisor_version(),
+332             'resource_class': node.resource_class,
+333             # The Ironic driver manages multiple hosts, so there are
+334             # likely many different CPU models in use. As such it is
+335             # impossible to provide any meaningful info on the CPU
+336             # model of the "host"
+337             'cpu_info': None,
+338             'vcpus': vcpus,
+339             'vcpus_used': vcpus_used,
+340             'local_gb': local_gb,
+341             'local_gb_used': local_gb_used,
+342             'disk_available_least': local_gb - local_gb_used,
+343             'memory_mb': memory_mb,
+344             'memory_mb_used': memory_mb_used,
+345             'supported_instances': _get_nodes_supported_instances(cpu_arch),
+346             'stats': nodes_extra_specs,
+347             'numa_topology': None,
+348         }
+349         return dic
+350 
+351     def _start_firewall(self, instance, network_info):
+352         self.firewall_driver.setup_basic_filtering(instance, network_info)
+353         self.firewall_driver.prepare_instance_filter(instance, network_info)
+354         self.firewall_driver.apply_instance_filter(instance, network_info)
+355 
+356     def _stop_firewall(self, instance, network_info):
+357         self.firewall_driver.unfilter_instance(instance, network_info)
+358 
+359     def _set_instance_uuid(self, node, instance):
+360 
+361         patch = [{'path': '/instance_uuid', 'op': 'add',
+362                   'value': instance.uuid}]
+363         try:
+364             # NOTE(TheJulia): Assert an instance UUID to lock the node
+365             # from other deployment attempts while configuration is
+366             # being set.
+367             self.ironicclient.call('node.update', node.uuid, patch,
+368                                    retry_on_conflict=False)
+369         except ironic.exc.BadRequest:
+370             msg = (_("Failed to reserve node %(node)s "
+371                      "when provisioning the instance %(instance)s")
+372                    % {'node': node.uuid, 'instance': instance.uuid})
+373             LOG.error(msg)
+374             raise exception.InstanceDeployFailure(msg)
+375 
+376     def prepare_for_spawn(self, instance):
+377         LOG.debug('Preparing to spawn instance %s.', instance.uuid)
+378         node_uuid = instance.get('node')
+379         if not node_uuid:
+380             raise ironic.exc.BadRequest(
+381                 _("Ironic node uuid not supplied to "
+382                   "driver for instance %s.") % instance.uuid)
+383         node = self._get_node(node_uuid)
+384         self._set_instance_uuid(node, instance)
+385 
+386     def failed_spawn_cleanup(self, instance):
+387         LOG.debug('Failed spawn cleanup called for instance',
+388                   instance=instance)
+389         try:
+390             node = self._validate_instance_and_node(instance)
+391         except exception.InstanceNotFound:
+392             LOG.warning('Attempt to clean-up from failed spawn of '
+393                         'instance %s failed due to no instance_uuid '
+394                         'present on the node.', instance.uuid)
+395             return
+396         self._cleanup_deploy(node, instance)
+397 
+398     def _add_instance_info_to_node(self, node, instance, image_meta, flavor,
+399                                    preserve_ephemeral=None,
+400                                    block_device_info=None):
+401 
+402         root_bdm = block_device.get_root_bdm(
+403             virt_driver.block_device_info_get_mapping(block_device_info))
+404         boot_from_volume = root_bdm is not None
+405         patch = patcher.create(node).get_deploy_patch(instance,
+406                                                       image_meta,
+407                                                       flavor,
+408                                                       preserve_ephemeral,
+409                                                       boot_from_volume)
+410 
+411         try:
+412             # FIXME(lucasagomes): The "retry_on_conflict" parameter was added
+413             # to basically causes the deployment to fail faster in case the
+414             # node picked by the scheduler is already associated with another
+415             # instance due bug #1341420.
+416             self.ironicclient.call('node.update', node.uuid, patch,
+417                                    retry_on_conflict=False)
+418         except ironic.exc.BadRequest:
+419             msg = (_("Failed to add deploy parameters on node %(node)s "
+420                      "when provisioning the instance %(instance)s")
+421                    % {'node': node.uuid, 'instance': instance.uuid})
+422             LOG.error(msg)
+423             raise exception.InstanceDeployFailure(msg)
+424 
+425     def _remove_instance_info_from_node(self, node, instance):
+426         patch = [{'path': '/instance_info', 'op': 'remove'},
+427                  {'path': '/instance_uuid', 'op': 'remove'}]
+428         try:
+429             self.ironicclient.call('node.update', node.uuid, patch)
+430         except ironic.exc.BadRequest as e:
+431             LOG.warning("Failed to remove deploy parameters from node "
+432                         "%(node)s when unprovisioning the instance "
+433                         "%(instance)s: %(reason)s",
+434                         {'node': node.uuid, 'instance': instance.uuid,
+435                          'reason': six.text_type(e)})
+436 
+437     def _add_volume_target_info(self, context, instance, block_device_info):
+438         bdms = virt_driver.block_device_info_get_mapping(block_device_info)
+439 
+440         for bdm in bdms:
+441             if not bdm.is_volume:
+442                 continue
+443 
+444             connection_info = jsonutils.loads(bdm._bdm_obj.connection_info)
+445             target_properties = connection_info['data']
+446             driver_volume_type = connection_info['driver_volume_type']
+447 
+448             try:
+449                 self.ironicclient.call('volume_target.create',
+450                                        node_uuid=instance.node,
+451                                        volume_type=driver_volume_type,
+452                                        properties=target_properties,
+453                                        boot_index=bdm._bdm_obj.boot_index,
+454                                        volume_id=bdm._bdm_obj.volume_id)
+455             except (ironic.exc.BadRequest, ironic.exc.Conflict):
+456                 msg = (_("Failed to add volume target information of "
+457                          "volume %(volume)s on node %(node)s when "
+458                          "provisioning the instance")
+459                        % {'volume': bdm._bdm_obj.volume_id,
+460                           'node': instance.node})
+461                 LOG.error(msg, instance=instance)
+462                 raise exception.InstanceDeployFailure(msg)
+463 
+464     def _cleanup_volume_target_info(self, instance):
+465         targets = self.ironicclient.call('node.list_volume_targets',
+466                                          instance.node, detail=True)
+467         for target in targets:
+468             volume_target_id = target.uuid
+469             try:
+470                 self.ironicclient.call('volume_target.delete',
+471                                        volume_target_id)
+472             except ironic.exc.NotFound:
+473                 LOG.debug("Volume target information %(target)s of volume "
+474                           "%(volume)s is already removed from node %(node)s",
+475                           {'target': volume_target_id,
+476                            'volume': target.volume_id,
+477                            'node': instance.node},
+478                           instance=instance)
+479             except ironic.exc.ClientException as e:
+480                 LOG.warning("Failed to remove volume target information "
+481                             "%(target)s of volume %(volume)s from node "
+482                             "%(node)s when unprovisioning the instance: "
+483                             "%(reason)s",
+484                             {'target': volume_target_id,
+485                              'volume': target.volume_id,
+486                              'node': instance.node,
+487                              'reason': e},
+488                             instance=instance)
+489 
+490     def _cleanup_deploy(self, node, instance, network_info=None,
+491                         remove_instance_info=True):
+492         self._cleanup_volume_target_info(instance)
+493         self._unplug_vifs(node, instance, network_info)
+494         self._stop_firewall(instance, network_info)
+495         if remove_instance_info:
+496             self._remove_instance_info_from_node(node, instance)
+497 
+498     def _wait_for_active(self, instance):
+499         """Wait for the node to be marked as ACTIVE in Ironic."""
+500         instance.refresh()
+501         if (instance.task_state == task_states.DELETING or
+502             instance.vm_state in (vm_states.ERROR, vm_states.DELETED)):
+503             raise exception.InstanceDeployFailure(
+504                 _("Instance %s provisioning was aborted") % instance.uuid)
+505 
+506         node = self._validate_instance_and_node(instance)
+507         if node.provision_state == ironic_states.ACTIVE:
+508             # job is done
+509             LOG.debug("Ironic node %(node)s is now ACTIVE",
+510                       dict(node=node.uuid), instance=instance)
+511             raise loopingcall.LoopingCallDone()
+512 
+513         if node.target_provision_state in (ironic_states.DELETED,
+514                                            ironic_states.AVAILABLE):
+515             # ironic is trying to delete it now
+516             raise exception.InstanceNotFound(instance_id=instance.uuid)
+517 
+518         if node.provision_state in (ironic_states.NOSTATE,
+519                                     ironic_states.AVAILABLE):
+520             # ironic already deleted it
+521             raise exception.InstanceNotFound(instance_id=instance.uuid)
+522 
+523         if node.provision_state == ironic_states.DEPLOYFAIL:
+524             # ironic failed to deploy
+525             msg = (_("Failed to provision instance %(inst)s: %(reason)s")
+526                    % {'inst': instance.uuid, 'reason': node.last_error})
+527             raise exception.InstanceDeployFailure(msg)
+528 
+529         _log_ironic_polling('become ACTIVE', node, instance)
+530 
+531     def _wait_for_power_state(self, instance, message):
+532         """Wait for the node to complete a power state change."""
+533         node = self._validate_instance_and_node(instance)
+534 
+535         if node.target_power_state == ironic_states.NOSTATE:
+536             raise loopingcall.LoopingCallDone()
+537 
+538         _log_ironic_polling(message, node, instance)
+539 
+540     def init_host(self, host):
+541         """Initialize anything that is necessary for the driver to function.
+542 
+543         :param host: the hostname of the compute host.
+544 
+545         """
+546         self._refresh_hash_ring(nova_context.get_admin_context())
+547 
+548     @staticmethod
+549     def _pike_flavor_migration_for_node(ctx, node_rc, instance_uuid):
+550         normalized_rc = utils.normalize_rc_name(node_rc)
+551         instance = objects.Instance.get_by_uuid(ctx, instance_uuid,
+552                                                 expected_attrs=["flavor"])
+553         specs = instance.flavor.extra_specs
+554         resource_key = "resources:%s" % normalized_rc
+555         if resource_key in specs:
+556             # The compute must have been restarted, and the instance.flavor
+557             # has already been migrated
+558             return False
+559         specs[resource_key] = "1"
+560         instance.save()
+561         return True
+562 
+563     def _pike_flavor_migration(self, node_uuids):
+564         """This code is needed in Pike to prevent problems where an operator
+565         has already adjusted their flavors to add the custom resource class to
+566         extra_specs. Since existing ironic instances will not have this in
+567         their extra_specs, they will only have allocations against
+568         VCPU/RAM/disk. By adding just the custom RC to the existing flavor
+569         extra_specs, the periodic call to update_available_resources() will add
+570         an allocation against the custom resource class, and prevent placement
+571         from thinking that that node is available. This code can be removed in
+572         Queens, and will need to be updated to also alter extra_specs to
+573         zero-out the old-style standard resource classes of VCPU, MEMORY_MB,
+574         and DISK_GB.
+575         """
+576         ctx = nova_context.get_admin_context()
+577 
+578         for node_uuid in node_uuids:
+579             node = self._node_from_cache(node_uuid)
+580             if not node:
+581                 continue
+582             node_rc = node.resource_class
+583             if not node_rc:
+584                 LOG.warning("Node %(node)s does not have its resource_class "
+585                         "set.", {"node": node.uuid})
+586                 continue
+587             if node.instance_uuid in self._migrated_instance_uuids:
+588                 continue
+589             self._pike_flavor_migration_for_node(ctx, node_rc,
+590                                                  node.instance_uuid)
+591             self._migrated_instance_uuids.add(node.instance_uuid)
+592             LOG.debug("The flavor extra_specs for Ironic instance %(inst)s "
+593                       "have been updated for custom resource class '%(rc)s'.",
+594                       {"inst": node.instance_uuid, "rc": node_rc})
+595         return
+596 
+597     def _get_hypervisor_type(self):
+598         """Get hypervisor type."""
+599         return 'ironic'
+600 
+601     def _get_hypervisor_version(self):
+602         """Returns the version of the Ironic API service endpoint."""
+603         return client_wrapper.IRONIC_API_VERSION[0]
+604 
+605     def instance_exists(self, instance):
+606         """Checks the existence of an instance.
+607 
+608         Checks the existence of an instance. This is an override of the
+609         base method for efficiency.
+610 
+611         :param instance: The instance object.
+612         :returns: True if the instance exists. False if not.
+613 
+614         """
+615         try:
+616             self._validate_instance_and_node(instance)
+617             return True
+618         except exception.InstanceNotFound:
+619             return False
+620 
+621     def _get_node_list(self, **kwargs):
+622         """Helper function to return the list of nodes.
+623 
+624         If unable to connect ironic server, an empty list is returned.
+625 
+626         :returns: a list of raw node from ironic
+627         :raises: VirtDriverNotReady
+628 
+629         """
+630         node_list = []
+631         try:
+632             node_list = self.ironicclient.call("node.list", **kwargs)
+633         except exception.NovaException as e:
+634             LOG.error("Failed to get the list of nodes from the Ironic "
+635                       "inventory. Error: %s", e)
+636             raise exception.VirtDriverNotReady()
+637         except Exception as e:
+638             LOG.error("An unknown error has occurred when trying to get the "
+639                       "list of nodes from the Ironic inventory. Error: %s", e)
+640             raise exception.VirtDriverNotReady()
+641         return node_list
+642 
+643     def list_instances(self):
+644         """Return the names of all the instances provisioned.
+645 
+646         :returns: a list of instance names.
+647         :raises: VirtDriverNotReady
+648 
+649         """
+650         # NOTE(lucasagomes): limit == 0 is an indicator to continue
+651         # pagination until there're no more values to be returned.
+652         node_list = self._get_node_list(associated=True,
+653                                         fields=['instance_uuid'], limit=0)
+654         context = nova_context.get_admin_context()
+655         return [objects.Instance.get_by_uuid(context,
+656                                              i.instance_uuid).name
+657                 for i in node_list]
+658 
+659     def list_instance_uuids(self):
+660         """Return the UUIDs of all the instances provisioned.
+661 
+662         :returns: a list of instance UUIDs.
+663         :raises: VirtDriverNotReady
+664 
+665         """
+666         # NOTE(lucasagomes): limit == 0 is an indicator to continue
+667         # pagination until there're no more values to be returned.
+668         node_list = self._get_node_list(associated=True,
+669                                         fields=['instance_uuid'], limit=0)
+670         return list(n.instance_uuid for n in node_list)
+671 
+672     def node_is_available(self, nodename):
+673         """Confirms a Nova hypervisor node exists in the Ironic inventory.
+674 
+675         :param nodename: The UUID of the node. Parameter is called nodename
+676                          even though it is a UUID to keep method signature
+677                          the same as inherited class.
+678         :returns: True if the node exists, False if not.
+679 
+680         """
+681         # NOTE(comstud): We can cheat and use caching here. This method
+682         # just needs to return True for nodes that exist. It doesn't
+683         # matter if the data is stale. Sure, it's possible that removing
+684         # node from Ironic will cause this method to return True until
+685         # the next call to 'get_available_nodes', but there shouldn't
+686         # be much harm. There's already somewhat of a race.
+687         if not self.node_cache:
+688             # Empty cache, try to populate it.
+689             self._refresh_cache()
+690 
+691         # nodename is the ironic node's UUID.
+692         if nodename in self.node_cache:
+693             return True
+694 
+695         # NOTE(comstud): Fallback and check Ironic. This case should be
+696         # rare.
+697         try:
+698             # nodename is the ironic node's UUID.
+699             self._get_node(nodename)
+700             return True
+701         except ironic.exc.NotFound:
+702             return False
+703 
+704     def _refresh_hash_ring(self, ctxt):
+705         peer_list = None
+706         # NOTE(jroll) if this is set, we need to limit the set of other
+707         # compute services in the hash ring to hosts that are currently up
+708         # and specified in the peer_list config option, as there's no way
+709         # to check which partition_key other compute services are using.
+710         if CONF.ironic.partition_key is not None:
+711             try:
+712                 # NOTE(jroll) first we need to make sure the Ironic API can
+713                 # filter by conductor_group. If it cannot, limiting to
+714                 # peer_list could end up with a node being managed by multiple
+715                 # compute services.
+716                 self._can_send_version(min_version='1.46')
+717 
+718                 peer_list = set(CONF.ironic.peer_list)
+719                 # these configs are mutable; need to check at runtime and init.
+720                 # luckily, we run this method from init_host.
+721                 _check_peer_list()
+722                 LOG.debug('Limiting peer list to %s', peer_list)
+723             except exception.IronicAPIVersionNotAvailable:
+724                 pass
+725 
+726         # TODO(jroll) optimize this to limit to the peer_list
+727         service_list = objects.ServiceList.get_all_computes_by_hv_type(
+728             ctxt, self._get_hypervisor_type())
+729         services = set()
+730         for svc in service_list:
+731             # NOTE(jroll) if peer_list is None, we aren't partitioning by
+732             # conductor group, so we check all compute services for liveness.
+733             # if we have a peer_list, don't check liveness for compute
+734             # services that aren't in the list.
+735             if peer_list is None or svc.host in peer_list:
+736                 is_up = self.servicegroup_api.service_is_up(svc)
+737                 if is_up:
+738                     services.add(svc.host)
+739         # NOTE(jroll): always make sure this service is in the list, because
+740         # only services that have something registered in the compute_nodes
+741         # table will be here so far, and we might be brand new.
+742         services.add(CONF.host)
+743 
+744         self.hash_ring = hash_ring.HashRing(services,
+745                                             partitions=_HASH_RING_PARTITIONS)
+746 
+747     def _refresh_cache(self):
+748         # NOTE(lucasagomes): limit == 0 is an indicator to continue
+749         # pagination until there're no more values to be returned.
+750         ctxt = nova_context.get_admin_context()
+751         self._refresh_hash_ring(ctxt)
+752         instances = objects.InstanceList.get_uuids_by_host(ctxt, CONF.host)
+753         node_cache = {}
+754 
+755         def _get_node_list(**kwargs):
+756             return self._get_node_list(fields=_NODE_FIELDS, limit=0, **kwargs)
+757 
+758         # NOTE(jroll) if partition_key is set, we need to limit nodes that
+759         # can be managed to nodes that have a matching conductor_group
+760         # attribute. If the API isn't new enough to support conductor groups,
+761         # we fall back to managing all nodes. If it is new enough, we can
+762         # filter it in the API.
+763         partition_key = CONF.ironic.partition_key
+764         if partition_key is not None:
+765             try:
+766                 self._can_send_version(min_version='1.46')
+767                 nodes = _get_node_list(conductor_group=partition_key)
+768                 LOG.debug('Limiting manageable ironic nodes to conductor '
+769                           'group %s', partition_key)
+770             except exception.IronicAPIVersionNotAvailable:
+771                 LOG.error('Required Ironic API version 1.46 is not '
+772                           'available to filter nodes by conductor group. '
+773                           'All nodes will be eligible to be managed by '
+774                           'this compute service.')
+775                 nodes = _get_node_list()
+776         else:
+777             nodes = _get_node_list()
+778 
+779         for node in nodes:
+780             # NOTE(jroll): we always manage the nodes for instances we manage
+781             if node.instance_uuid in instances:
+782                 node_cache[node.uuid] = node
+783 
+784             # NOTE(jroll): check if the node matches us in the hash ring, and
+785             # does not have an instance_uuid (which would imply the node has
+786             # an instance managed by another compute service).
+787             # Note that this means nodes with an instance that was deleted in
+788             # nova while the service was down, and not yet reaped, will not be
+789             # reported until the periodic task cleans it up.
+790             elif (node.instance_uuid is None and
+791                   CONF.host in
+792                   self.hash_ring.get_nodes(node.uuid.encode('utf-8'))):
+793                 node_cache[node.uuid] = node
+794 
+795         self.node_cache = node_cache
+796         self.node_cache_time = time.time()
+797         # For Pike, we need to ensure that all instances have their flavor
+798         # migrated to include the resource_class. Since there could be many,
+799         # many instances controlled by this host, spawn this asynchronously so
+800         # as not to block this service.
+801         node_uuids = [node.uuid for node in self.node_cache.values()
+802                       if node.instance_uuid and
+803                       node.instance_uuid not in self._migrated_instance_uuids]
+804         if node_uuids:
+805             # No need to run unless something has changed
+806             utils.spawn_n(self._pike_flavor_migration, node_uuids)
+807 
+808     def get_available_nodes(self, refresh=False):
+809         """Returns the UUIDs of Ironic nodes managed by this compute service.
+810 
+811         We use consistent hashing to distribute Ironic nodes between all
+812         available compute services. The subset of nodes managed by a given
+813         compute service is determined by the following rules:
+814 
+815         * any node with an instance managed by the compute service
+816         * any node that is mapped to the compute service on the hash ring
+817         * no nodes with instances managed by another compute service
+818 
+819         The ring is rebalanced as nova-compute services are brought up and
+820         down. Note that this rebalance does not happen at the same time for
+821         all compute services, so a node may be managed by multiple compute
+822         services for a small amount of time.
+823 
+824         :param refresh: Boolean value; If True run update first. Ignored by
+825                         this driver.
+826         :returns: a list of UUIDs
+827 
+828         """
+829         # NOTE(jroll) we refresh the cache every time this is called
+830         #             because it needs to happen in the resource tracker
+831         #             periodic task. This task doesn't pass refresh=True,
+832         #             unfortunately.
+833         self._refresh_cache()
+834 
+835         node_uuids = list(self.node_cache.keys())
+836         LOG.debug("Returning %(num_nodes)s available node(s)",
+837                   dict(num_nodes=len(node_uuids)))
+838 
+839         return node_uuids
+840 
+841     def update_provider_tree(self, provider_tree, nodename, allocations=None):
+842         """Update a ProviderTree object with current resource provider and
+843         inventory information.
+844 
+845         :param nova.compute.provider_tree.ProviderTree provider_tree:
+846             A nova.compute.provider_tree.ProviderTree object representing all
+847             the providers in the tree associated with the compute node, and any
+848             sharing providers (those with the ``MISC_SHARES_VIA_AGGREGATE``
+849             trait) associated via aggregate with any of those providers (but
+850             not *their* tree- or aggregate-associated providers), as currently
+851             known by placement.
+852         :param nodename:
+853             String name of the compute node (i.e.
+854             ComputeNode.hypervisor_hostname) for which the caller is requesting
+855             updated provider information.
+856         :param allocations:
+857             Dict of allocation data of the form:
+858               { $CONSUMER_UUID: {
+859                     # The shape of each "allocations" dict below is identical
+860                     # to the return from GET /allocations/{consumer_uuid}
+861                     "allocations": {
+862                         $RP_UUID: {
+863                             "generation": $RP_GEN,
+864                             "resources": {
+865                                 $RESOURCE_CLASS: $AMOUNT,
+866                                 ...
+867                             },
+868                         },
+869                         ...
+870                     },
+871                     "project_id": $PROJ_ID,
+872                     "user_id": $USER_ID,
+873                     "consumer_generation": $CONSUMER_GEN,
+874                 },
+875                 ...
+876               }
+877             If None, and the method determines that any inventory needs to be
+878             moved (from one provider to another and/or to a different resource
+879             class), the ReshapeNeeded exception must be raised. Otherwise, this
+880             dict must be edited in place to indicate the desired final state of
+881             allocations.
+882         :raises ReshapeNeeded: If allocations is None and any inventory needs
+883             to be moved from one provider to another and/or to a different
+884             resource class.
+885         """
+886         # nodename is the ironic node's UUID.
+887         node = self._node_from_cache(nodename)
+888         reserved = False
+889         if (not self._node_resources_used(node) and
+890                 self._node_resources_unavailable(node)):
+891             LOG.debug('Node %(node)s is not ready for a deployment, '
+892                       'reporting resources as reserved for it. Node\'s '
+893                       'provision state is %(prov)s, power state is '
+894                       '%(power)s and maintenance is %(maint)s.',
+895                       {'node': node.uuid, 'prov': node.provision_state,
+896                        'power': node.power_state, 'maint': node.maintenance})
+897             reserved = True
+898 
+899         info = self._node_resource(node)
+900         result = {}
+901 
+902         rc_name = info.get('resource_class')
+903         if rc_name is None:
+904             raise exception.NoResourceClass(node=nodename)
+905 
+906         norm_name = utils.normalize_rc_name(rc_name)
+907         if norm_name is not None:
+908             result[norm_name] = {
+909                 'total': 1,
+910                 'reserved': int(reserved),
+911                 'min_unit': 1,
+912                 'max_unit': 1,
+913                 'step_size': 1,
+914                 'allocation_ratio': 1.0,
+915             }
+916 
+917         provider_tree.update_inventory(nodename, result)
+918         # TODO(efried): *Unset* (remove_traits) if "owned" by ironic virt but
+919         # not set on the node object, and *set* (add_traits) only those both
+920         # owned by ironic virt and set on the node object.
+921         provider_tree.update_traits(nodename, node.traits)
+922 
+923     def get_available_resource(self, nodename):
+924         """Retrieve resource information.
+925 
+926         This method is called when nova-compute launches, and
+927         as part of a periodic task that records the results in the DB.
+928 
+929         :param nodename: the UUID of the node.
+930         :returns: a dictionary describing resources.
+931 
+932         """
+933         # NOTE(comstud): We can cheat and use caching here. This method is
+934         # only called from a periodic task and right after the above
+935         # get_available_nodes() call is called.
+936         if not self.node_cache:
+937             # Well, it's also called from init_host(), so if we have empty
+938             # cache, let's try to populate it.
+939             self._refresh_cache()
+940 
+941         # nodename is the ironic node's UUID.
+942         node = self._node_from_cache(nodename)
+943         return self._node_resource(node)
+944 
+945     def _node_from_cache(self, node_uuid):
+946         """Returns a node from the cache, retrieving the node from Ironic API
+947         if the node doesn't yet exist in the cache.
+948         """
+949         # NOTE(vdrok): node_cache might also be modified during instance
+950         # _unprovision call, hence this function is synchronized
+951         @utils.synchronized('ironic-node-%s' % node_uuid)
+952         def _sync_node_from_cache():
+953             cache_age = time.time() - self.node_cache_time
+954             if node_uuid in self.node_cache:
+955                 LOG.debug("Using cache for node %(node)s, age: %(age)s",
+956                           {'node': node_uuid, 'age': cache_age})
+957                 return self.node_cache[node_uuid]
+958             else:
+959                 LOG.debug("Node %(node)s not found in cache, age: %(age)s",
+960                           {'node': node_uuid, 'age': cache_age})
+961                 node = self._get_node(node_uuid)
+962                 self.node_cache[node_uuid] = node
+963                 return node
+964         return _sync_node_from_cache()
+965 
+966     def get_info(self, instance, use_cache=True):
+967         """Get the current state and resource usage for this instance.
+968 
+969         If the instance is not found this method returns (a dictionary
+970         with) NOSTATE and all resources == 0.
+971 
+972         :param instance: the instance object.
+973         :param use_cache: boolean to indicate if the driver should be allowed
+974                           to use cached data to return instance status.
+975                           If false, pull fresh data from ironic.
+976         :returns: an InstanceInfo object
+977         """
+978         def _fetch_from_ironic(self, instance):
+979             try:
+980                 node = self._validate_instance_and_node(instance)
+981                 return hardware.InstanceInfo(
+982                     state=map_power_state(node.power_state))
+983             except exception.InstanceNotFound:
+984                 return hardware.InstanceInfo(
+985                     state=map_power_state(ironic_states.NOSTATE))
+986 
+987         if not use_cache:
+988             return _fetch_from_ironic(self, instance)
+989 
+990         # we should already have a cache for our nodes, refreshed on every
+991         # RT loop. but if we don't have a cache, generate it.
+992         if not self.node_cache:
+993             self._refresh_cache()
+994 
+995         for node in self.node_cache.values():
+996             if instance.uuid == node.instance_uuid:
+997                 break
+998         else:
+999             # if we can't find the instance, fall back to ironic
+1000             return _fetch_from_ironic(self, instance)
+1001 
+1002         return hardware.InstanceInfo(state=map_power_state(node.power_state))
+1003 
+1004     def deallocate_networks_on_reschedule(self, instance):
+1005         """Does the driver want networks deallocated on reschedule?
+1006 
+1007         :param instance: the instance object.
+1008         :returns: Boolean value. If True deallocate networks on reschedule.
+1009         """
+1010         return True
+1011 
+1012     def _get_network_metadata(self, node, network_info):
+1013         """Gets a more complete representation of the instance network info.
+1014 
+1015         This data is exposed as network_data.json in the metadata service and
+1016         the config drive.
+1017 
+1018         :param node: The node object.
+1019         :param network_info: Instance network information.
+1020         """
+1021         base_metadata = netutils.get_network_metadata(network_info)
+1022 
+1023         # TODO(vdrok): change to doing a single "detailed vif list" call,
+1024         # when added to ironic API, response to that will contain all
+1025         # necessary information. Then we will be able to avoid looking at
+1026         # internal_info/extra fields.
+1027         ports = self.ironicclient.call("node.list_ports",
+1028                                        node.uuid, detail=True)
+1029         portgroups = self.ironicclient.call("portgroup.list", node=node.uuid,
+1030                                             detail=True)
+1031         vif_id_to_objects = {'ports': {}, 'portgroups': {}}
+1032         for collection, name in ((ports, 'ports'), (portgroups, 'portgroups')):
+1033             for p in collection:
+1034                 vif_id = (p.internal_info.get('tenant_vif_port_id') or
+1035                           p.extra.get('vif_port_id'))
+1036                 if vif_id:
+1037                     vif_id_to_objects[name][vif_id] = p
+1038 
+1039         additional_links = []
+1040         for link in base_metadata['links']:
+1041             vif_id = link['vif_id']
+1042             if vif_id in vif_id_to_objects['portgroups']:
+1043                 pg = vif_id_to_objects['portgroups'][vif_id]
+1044                 pg_ports = [p for p in ports if p.portgroup_uuid == pg.uuid]
+1045                 link.update({'type': 'bond', 'bond_mode': pg.mode,
+1046                              'bond_links': []})
+1047                 # If address is set on the portgroup, an (ironic) vif-attach
+1048                 # call has already updated neutron with the port address;
+1049                 # reflect it here. Otherwise, an address generated by neutron
+1050                 # will be used instead (code is elsewhere to handle this case).
+1051                 if pg.address:
+1052                     link.update({'ethernet_mac_address': pg.address})
+1053                 for prop in pg.properties:
+1054                     # These properties are the bonding driver options described
+1055                     # at https://www.kernel.org/doc/Documentation/networking/bonding.txt  # noqa
+1056                     # cloud-init checks the same way, parameter name has to
+1057                     # start with bond
+1058                     key = prop if prop.startswith('bond') else 'bond_%s' % prop
+1059                     link[key] = pg.properties[prop]
+1060                 for port in pg_ports:
+1061                     # This won't cause any duplicates to be added. A port
+1062                     # cannot be in more than one port group for the same
+1063                     # node.
+1064                     additional_links.append({
+1065                         'id': port.uuid,
+1066                         'type': 'phy', 'ethernet_mac_address': port.address,
+1067                     })
+1068                     link['bond_links'].append(port.uuid)
+1069             elif vif_id in vif_id_to_objects['ports']:
+1070                 p = vif_id_to_objects['ports'][vif_id]
+1071                 # Ironic updates neutron port's address during attachment
+1072                 link.update({'ethernet_mac_address': p.address,
+1073                              'type': 'phy'})
+1074 
+1075         base_metadata['links'].extend(additional_links)
+1076         return base_metadata
+1077 
+1078     def _generate_configdrive(self, context, instance, node, network_info,
+1079                               extra_md=None, files=None):
+1080         """Generate a config drive.
+1081 
+1082         :param instance: The instance object.
+1083         :param node: The node object.
+1084         :param network_info: Instance network information.
+1085         :param extra_md: Optional, extra metadata to be added to the
+1086                          configdrive.
+1087         :param files: Optional, a list of paths to files to be added to
+1088                       the configdrive.
+1089 
+1090         """
+1091         if not extra_md:
+1092             extra_md = {}
+1093 
+1094         i_meta = instance_metadata.InstanceMetadata(instance,
+1095             content=files, extra_md=extra_md, network_info=network_info,
+1096             network_metadata=self._get_network_metadata(node, network_info),
+1097             request_context=context)
+1098 
+1099         with tempfile.NamedTemporaryFile() as uncompressed:
+1100             with configdrive.ConfigDriveBuilder(instance_md=i_meta) as cdb:
+1101                 cdb.make_drive(uncompressed.name)
+1102 
+1103             with tempfile.NamedTemporaryFile() as compressed:
+1104                 # compress config drive
+1105                 with gzip.GzipFile(fileobj=compressed, mode='wb') as gzipped:
+1106                     uncompressed.seek(0)
+1107                     shutil.copyfileobj(uncompressed, gzipped)
+1108 
+1109                 # base64 encode config drive
+1110                 compressed.seek(0)
+1111                 return base64.b64encode(compressed.read())
+1112 
+1113     def spawn(self, context, instance, image_meta, injected_files,
+1114               admin_password, allocations, network_info=None,
+1115               block_device_info=None):
+1116         """Deploy an instance.
+1117 
+1118         :param context: The security context.
+1119         :param instance: The instance object.
+1120         :param image_meta: Image dict returned by nova.image.glance
+1121             that defines the image from which to boot this instance.
+1122         :param injected_files: User files to inject into instance.
+1123         :param admin_password: Administrator password to set in
+1124             instance.
+1125         :param allocations: Information about resources allocated to the
+1126                             instance via placement, of the form returned by
+1127                             SchedulerReportClient.get_allocations_for_consumer.
+1128                             Ignored by this driver.
+1129         :param network_info: Instance network information.
+1130         :param block_device_info: Instance block device
+1131             information.
+1132         """
+1133         LOG.debug('Spawn called for instance', instance=instance)
+1134 
+1135         # The compute manager is meant to know the node uuid, so missing uuid
+1136         # is a significant issue. It may mean we've been passed the wrong data.
+1137         node_uuid = instance.get('node')
+1138         if not node_uuid:
+1139             raise ironic.exc.BadRequest(
+1140                 _("Ironic node uuid not supplied to "
+1141                   "driver for instance %s.") % instance.uuid)
+1142 
+1143         node = self._get_node(node_uuid)
+1144         flavor = instance.flavor
+1145 
+1146         self._add_instance_info_to_node(node, instance, image_meta, flavor,
+1147                                         block_device_info=block_device_info)
+1148 
+1149         try:
+1150             self._add_volume_target_info(context, instance, block_device_info)
+1151         except Exception:
+1152             with excutils.save_and_reraise_exception():
+1153                 LOG.error("Error preparing deploy for instance "
+1154                           "on baremetal node %(node)s.",
+1155                           {'node': node_uuid},
+1156                           instance=instance)
+1157                 self._cleanup_deploy(node, instance, network_info)
+1158 
+1159         # NOTE(Shrews): The default ephemeral device needs to be set for
+1160         # services (like cloud-init) that depend on it being returned by the
+1161         # metadata server. Addresses bug https://launchpad.net/bugs/1324286.
+1162         if flavor.ephemeral_gb:
+1163             instance.default_ephemeral_device = '/dev/sda1'
+1164             instance.save()
+1165 
+1166         # validate we are ready to do the deploy
+1167         validate_chk = self.ironicclient.call("node.validate", node_uuid)
+1168         if (not validate_chk.deploy.get('result') or
+1169                 not validate_chk.power.get('result') or
+1170                 not validate_chk.storage.get('result')):
+1171             # something is wrong. undo what we have done
+1172             self._cleanup_deploy(node, instance, network_info)
+1173             raise exception.ValidationError(_(
+1174                 "Ironic node: %(id)s failed to validate."
+1175                 " (deploy: %(deploy)s, power: %(power)s,"
+1176                 " storage: %(storage)s)")
+1177                 % {'id': node.uuid,
+1178                    'deploy': validate_chk.deploy,
+1179                    'power': validate_chk.power,
+1180                    'storage': validate_chk.storage})
+1181 
+1182         # prepare for the deploy
+1183         try:
+1184             self._start_firewall(instance, network_info)
+1185         except Exception:
+1186             with excutils.save_and_reraise_exception():
+1187                 LOG.error("Error preparing deploy for instance "
+1188                           "%(instance)s on baremetal node %(node)s.",
+1189                           {'instance': instance.uuid,
+1190                            'node': node_uuid})
+1191                 self._cleanup_deploy(node, instance, network_info)
+1192 
+1193         # Config drive
+1194         configdrive_value = None
+1195         if configdrive.required_by(instance):
+1196             extra_md = {}
+1197             if admin_password:
+1198                 extra_md['admin_pass'] = admin_password
+1199 
+1200             try:
+1201                 configdrive_value = self._generate_configdrive(
+1202                     context, instance, node, network_info, extra_md=extra_md,
+1203                     files=injected_files)
+1204             except Exception as e:
+1205                 with excutils.save_and_reraise_exception():
+1206                     msg = ("Failed to build configdrive: %s" %
+1207                            six.text_type(e))
+1208                     LOG.error(msg, instance=instance)
+1209                     self._cleanup_deploy(node, instance, network_info)
+1210 
+1211             LOG.info("Config drive for instance %(instance)s on "
+1212                      "baremetal node %(node)s created.",
+1213                      {'instance': instance['uuid'], 'node': node_uuid})
+1214 
+1215         # trigger the node deploy
+1216         try:
+1217             self.ironicclient.call("node.set_provision_state", node_uuid,
+1218                                    ironic_states.ACTIVE,
+1219                                    configdrive=configdrive_value)
+1220         except Exception as e:
+1221             with excutils.save_and_reraise_exception():
+1222                 LOG.error("Failed to request Ironic to provision instance "
+1223                           "%(inst)s: %(reason)s",
+1224                           {'inst': instance.uuid,
+1225                            'reason': six.text_type(e)})
+1226                 self._cleanup_deploy(node, instance, network_info)
+1227 
+1228         timer = loopingcall.FixedIntervalLoopingCall(self._wait_for_active,
+1229                                                      instance)
+1230         try:
+1231             timer.start(interval=CONF.ironic.api_retry_interval).wait()
+1232             LOG.info('Successfully provisioned Ironic node %s',
+1233                      node.uuid, instance=instance)
+1234         except Exception:
+1235             with excutils.save_and_reraise_exception():
+1236                 LOG.error("Error deploying instance %(instance)s on "
+1237                           "baremetal node %(node)s.",
+1238                           {'instance': instance.uuid,
+1239                            'node': node_uuid})
+1240 
+1241     def _unprovision(self, instance, node):
+1242         """This method is called from destroy() to unprovision
+1243         already provisioned node after required checks.
+1244         """
+1245         try:
+1246             self.ironicclient.call("node.set_provision_state", node.uuid,
+1247                                    "deleted")
+1248         except Exception as e:
+1249             # if the node is already in a deprovisioned state, continue
+1250             # This should be fixed in Ironic.
+1251             # TODO(deva): This exception should be added to
+1252             #             python-ironicclient and matched directly,
+1253             #             rather than via __name__.
+1254             if getattr(e, '__name__', None) != 'InstanceDeployFailure':
+1255                 raise
+1256 
+1257         # using a dict because this is modified in the local method
+1258         data = {'tries': 0}
+1259 
+1260         def _wait_for_provision_state():
+1261             try:
+1262                 node = self._validate_instance_and_node(instance)
+1263             except exception.InstanceNotFound:
+1264                 LOG.debug("Instance already removed from Ironic",
+1265                           instance=instance)
+1266                 raise loopingcall.LoopingCallDone()
+1267             if node.provision_state in (ironic_states.NOSTATE,
+1268                                         ironic_states.CLEANING,
+1269                                         ironic_states.CLEANWAIT,
+1270                                         ironic_states.CLEANFAIL,
+1271                                         ironic_states.AVAILABLE):
+1272                 # From a user standpoint, the node is unprovisioned. If a node
+1273                 # gets into CLEANFAIL state, it must be fixed in Ironic, but we
+1274                 # can consider the instance unprovisioned.
+1275                 LOG.debug("Ironic node %(node)s is in state %(state)s, "
+1276                           "instance is now unprovisioned.",
+1277                           dict(node=node.uuid, state=node.provision_state),
+1278                           instance=instance)
+1279                 raise loopingcall.LoopingCallDone()
+1280 
+1281             if data['tries'] >= CONF.ironic.api_max_retries + 1:
+1282                 msg = (_("Error destroying the instance on node %(node)s. "
+1283                          "Provision state still '%(state)s'.")
+1284                        % {'state': node.provision_state,
+1285                           'node': node.uuid})
+1286                 LOG.error(msg)
+1287                 raise exception.NovaException(msg)
+1288             else:
+1289                 data['tries'] += 1
+1290 
+1291             _log_ironic_polling('unprovision', node, instance)
+1292 
+1293         # wait for the state transition to finish
+1294         timer = loopingcall.FixedIntervalLoopingCall(_wait_for_provision_state)
+1295         timer.start(interval=CONF.ironic.api_retry_interval).wait()
+1296 
+1297         # NOTE(vdrok): synchronize this function so that get_available_resource
+1298         # has up-to-date view of node_cache.
+1299         @utils.synchronized('ironic-node-%s' % node.uuid)
+1300         def _sync_remove_cache_entry():
+1301             # NOTE(vdrok): Force the cache update, so that
+1302             # update_usages resource tracker call that will happen next
+1303             # has the up-to-date node view.
+1304             self.node_cache.pop(node.uuid, None)
+1305             LOG.debug('Removed node %(uuid)s from node cache.',
+1306                       {'uuid': node.uuid})
+1307         _sync_remove_cache_entry()
+1308 
+1309     def destroy(self, context, instance, network_info,
+1310                 block_device_info=None, destroy_disks=True):
+1311         """Destroy the specified instance, if it can be found.
+1312 
+1313         :param context: The security context.
+1314         :param instance: The instance object.
+1315         :param network_info: Instance network information.
+1316         :param block_device_info: Instance block device
+1317             information. Ignored by this driver.
+1318         :param destroy_disks: Indicates if disks should be
+1319             destroyed. Ignored by this driver.
+1320         """
+1321         LOG.debug('Destroy called for instance', instance=instance)
+1322         try:
+1323             node = self._validate_instance_and_node(instance)
+1324         except exception.InstanceNotFound:
+1325             LOG.warning("Destroy called on non-existing instance %s.",
+1326                         instance.uuid)
+1327             # NOTE(deva): if nova.compute.ComputeManager._delete_instance()
+1328             #             is called on a non-existing instance, the only way
+1329             #             to delete it is to return from this method
+1330             #             without raising any exceptions.
+1331             return
+1332 
+1333         try:
+1334             if node.provision_state in _UNPROVISION_STATES:
+1335                 self._unprovision(instance, node)
+1336             else:
+1337                 # NOTE(hshiina): if spawn() fails before ironic starts
+1338                 #                provisioning, instance information should be
+1339                 #                removed from ironic node.
+1340                 self._remove_instance_info_from_node(node, instance)
+1341         finally:
+1342             # NOTE(mgoddard): We don't need to remove instance info at this
+1343             # point since we will have already done it. The destroy will only
+1344             # succeed if this method returns without error, so we will end up
+1345             # removing the instance info eventually.
+1346             self._cleanup_deploy(node, instance, network_info,
+1347                                  remove_instance_info=False)
+1348 
+1349         LOG.info('Successfully unprovisioned Ironic node %s',
+1350                  node.uuid, instance=instance)
+1351 
+1352     def reboot(self, context, instance, network_info, reboot_type,
+1353                block_device_info=None, bad_volumes_callback=None):
+1354         """Reboot the specified instance.
+1355 
+1356         NOTE: Unlike the libvirt driver, this method does not delete
+1357               and recreate the instance; it preserves local state.
+1358 
+1359         :param context: The security context.
+1360         :param instance: The instance object.
+1361         :param network_info: Instance network information. Ignored by
+1362             this driver.
+1363         :param reboot_type: Either a HARD or SOFT reboot.
+1364         :param block_device_info: Info pertaining to attached volumes.
+1365             Ignored by this driver.
+1366         :param bad_volumes_callback: Function to handle any bad volumes
+1367             encountered. Ignored by this driver.
+1368 
+1369         """
+1370         LOG.debug('Reboot(type %s) called for instance',
+1371                   reboot_type, instance=instance)
+1372         node = self._validate_instance_and_node(instance)
+1373 
+1374         hard = True
+1375         if reboot_type == 'SOFT':
+1376             try:
+1377                 self.ironicclient.call("node.set_power_state", node.uuid,
+1378                                        'reboot', soft=True)
+1379                 hard = False
+1380             except ironic.exc.BadRequest as exc:
+1381                 LOG.info('Soft reboot is not supported by ironic hardware '
+1382                          'driver. Falling back to hard reboot: %s',
+1383                          exc,
+1384                          instance=instance)
+1385 
+1386         if hard:
+1387             self.ironicclient.call("node.set_power_state", node.uuid, 'reboot')
+1388 
+1389         timer = loopingcall.FixedIntervalLoopingCall(
+1390                     self._wait_for_power_state, instance, 'reboot')
+1391         timer.start(interval=CONF.ironic.api_retry_interval).wait()
+1392         LOG.info('Successfully rebooted(type %(type)s) Ironic node %(node)s',
+1393                  {'type': ('HARD' if hard else 'SOFT'),
+1394                   'node': node.uuid},
+1395                  instance=instance)
+1396 
+1397     def power_off(self, instance, timeout=0, retry_interval=0):
+1398         """Power off the specified instance.
+1399 
+1400         NOTE: Unlike the libvirt driver, this method does not delete
+1401               and recreate the instance; it preserves local state.
+1402 
+1403         :param instance: The instance object.
+1404         :param timeout: time to wait for node to shutdown. If it is set,
+1405             soft power off is attempted before hard power off.
+1406         :param retry_interval: How often to signal node while waiting
+1407             for it to shutdown. Ignored by this driver. Retrying depends on
+1408             Ironic hardware driver.
+1409         """
+1410         LOG.debug('Power off called for instance', instance=instance)
+1411         node = self._validate_instance_and_node(instance)
+1412 
+1413         if timeout:
+1414             try:
+1415                 self.ironicclient.call("node.set_power_state", node.uuid,
+1416                                        'off', soft=True, timeout=timeout)
+1417 
+1418                 timer = loopingcall.FixedIntervalLoopingCall(
+1419                     self._wait_for_power_state, instance, 'soft power off')
+1420                 timer.start(interval=CONF.ironic.api_retry_interval).wait()
+1421                 node = self._validate_instance_and_node(instance)
+1422                 if node.power_state == ironic_states.POWER_OFF:
+1423                     LOG.info('Successfully soft powered off Ironic node %s',
+1424                              node.uuid, instance=instance)
+1425                     return
+1426                 LOG.info("Failed to soft power off instance "
+1427                          "%(instance)s on baremetal node %(node)s "
+1428                          "within the required timeout %(timeout)d "
+1429                          "seconds due to error: %(reason)s. "
+1430                          "Attempting hard power off.",
+1431                          {'instance': instance.uuid,
+1432                           'timeout': timeout,
+1433                           'node': node.uuid,
+1434                           'reason': node.last_error},
+1435                          instance=instance)
+1436             except ironic.exc.ClientException as e:
+1437                 LOG.info("Failed to soft power off instance "
+1438                          "%(instance)s on baremetal node %(node)s "
+1439                          "due to error: %(reason)s. "
+1440                          "Attempting hard power off.",
+1441                          {'instance': instance.uuid,
+1442                           'node': node.uuid,
+1443                           'reason': e},
+1444                          instance=instance)
+1445 
+1446         self.ironicclient.call("node.set_power_state", node.uuid, 'off')
+1447         timer = loopingcall.FixedIntervalLoopingCall(
+1448                     self._wait_for_power_state, instance, 'power off')
+1449         timer.start(interval=CONF.ironic.api_retry_interval).wait()
+1450         LOG.info('Successfully hard powered off Ironic node %s',
+1451                  node.uuid, instance=instance)
+1452 
+1453     def power_on(self, context, instance, network_info,
+1454                  block_device_info=None):
+1455         """Power on the specified instance.
+1456 
+1457         NOTE: Unlike the libvirt driver, this method does not delete
+1458               and recreate the instance; it preserves local state.
+1459 
+1460         :param context: The security context.
+1461         :param instance: The instance object.
+1462         :param network_info: Instance network information. Ignored by
+1463             this driver.
+1464         :param block_device_info: Instance block device
+1465             information. Ignored by this driver.
+1466 
+1467         """
+1468         LOG.debug('Power on called for instance', instance=instance)
+1469         node = self._validate_instance_and_node(instance)
+1470         self.ironicclient.call("node.set_power_state", node.uuid, 'on')
+1471 
+1472         timer = loopingcall.FixedIntervalLoopingCall(
+1473                     self._wait_for_power_state, instance, 'power on')
+1474         timer.start(interval=CONF.ironic.api_retry_interval).wait()
+1475         LOG.info('Successfully powered on Ironic node %s',
+1476                  node.uuid, instance=instance)
+1477 
+1478     def power_update_event(self, instance, target_power_state):
+1479         """Update power, vm and task states of the specified instance in
+1480         the nova DB.
+1481         """
+1482         LOG.info('Power update called for instance with '
+1483                  'target power state %s.', target_power_state,
+1484                  instance=instance)
+1485         if target_power_state == external_event_obj.POWER_ON:
+1486             instance.power_state = power_state.RUNNING
+1487             instance.vm_state = vm_states.ACTIVE
+1488             instance.task_state = None
+1489             instance.save(expected_task_state=task_states.POWERING_ON)
+1490         else:
+1491             instance.power_state = power_state.SHUTDOWN
+1492             instance.vm_state = vm_states.STOPPED
+1493             instance.task_state = None
+1494             instance.save(expected_task_state=task_states.POWERING_OFF)
+1495 
+1496     def trigger_crash_dump(self, instance):
+1497         """Trigger crash dump mechanism on the given instance.
+1498 
+1499         Stalling instances can be triggered to dump the crash data. How the
+1500         guest OS reacts in details, depends on the configuration of it.
+1501 
+1502         :param instance: The instance where the crash dump should be triggered.
+1503 
+1504         :return: None
+1505         """
+1506         LOG.debug('Trigger crash dump called for instance', instance=instance)
+1507         node = self._validate_instance_and_node(instance)
+1508 
+1509         self.ironicclient.call("node.inject_nmi", node.uuid)
+1510 
+1511         LOG.info('Successfully triggered crash dump into Ironic node %s',
+1512                  node.uuid, instance=instance)
+1513 
+1514     def refresh_security_group_rules(self, security_group_id):
+1515         """Refresh security group rules from data store.
+1516 
+1517         Invoked when security group rules are updated.
+1518 
+1519         :param security_group_id: The security group id.
+1520 
+1521         """
+1522         self.firewall_driver.refresh_security_group_rules(security_group_id)
+1523 
+1524     def refresh_instance_security_rules(self, instance):
+1525         """Refresh security group rules from data store.
+1526 
+1527         Gets called when an instance gets added to or removed from
+1528         the security group the instance is a member of or if the
+1529         group gains or loses a rule.
+1530 
+1531         :param instance: The instance object.
+1532 
+1533         """
+1534         self.firewall_driver.refresh_instance_security_rules(instance)
+1535 
+1536     def ensure_filtering_rules_for_instance(self, instance, network_info):
+1537         """Set up filtering rules.
+1538 
+1539         :param instance: The instance object.
+1540         :param network_info: Instance network information.
+1541 
+1542         """
+1543         self.firewall_driver.setup_basic_filtering(instance, network_info)
+1544         self.firewall_driver.prepare_instance_filter(instance, network_info)
+1545 
+1546     def unfilter_instance(self, instance, network_info):
+1547         """Stop filtering instance.
+1548 
+1549         :param instance: The instance object.
+1550         :param network_info: Instance network information.
+1551 
+1552         """
+1553         self.firewall_driver.unfilter_instance(instance, network_info)
+1554 
+1555     def _plug_vif(self, node, port_id):
+1556         last_attempt = 5
+1557         for attempt in range(0, last_attempt + 1):
+1558             try:
+1559                 self.ironicclient.call("node.vif_attach", node.uuid,
+1560                                        port_id, retry_on_conflict=False)
+1561             except ironic.exc.BadRequest as e:
+1562                 # NOTE(danms): If we race with ironic startup, there
+1563                 # will be no ironic-conductor running, which will
+1564                 # give us a failure to do this plug operation. So,
+1565                 # be graceful in that case and wait/retry.
+1566                 # NOTE(mdbooth): This will be fixed in ironic by
+1567                 # change I2c21baae. This will ensure ironic returns a 503 here,
+1568                 # which will cause ironicclient to automatically retry for us.
+1569                 # We can remove this workaround once we are confident that we
+1570                 # are only running against ironic containing this fix.
+1571                 if ('No conductor' in six.text_type(e) and
+1572                         attempt < last_attempt):
+1573                     LOG.warning('No ironic conductor is running; '
+1574                                 'waiting...')
+1575                     time.sleep(10)
+1576                     continue
+1577 
+1578                 msg = (_("Cannot attach VIF %(vif)s to the node %(node)s "
+1579                          "due to error: %(err)s") % {
+1580                              'vif': port_id,
+1581                              'node': node.uuid, 'err': e})
+1582                 LOG.error(msg)
+1583                 raise exception.VirtualInterfacePlugException(msg)
+1584             except ironic.exc.Conflict:
+1585                 # NOTE (vsaienko) Return since the VIF is already attached.
+1586                 return
+1587 
+1588             # Success, so don't retry
+1589             return
+1590 
+1591     def _plug_vifs(self, node, instance, network_info):
+1592         # NOTE(PhilDay): Accessing network_info will block if the thread
+1593         # it wraps hasn't finished, so do this ahead of time so that we
+1594         # don't block while holding the logging lock.
+1595         network_info_str = str(network_info)
+1596         LOG.debug("plug: instance_uuid=%(uuid)s vif=%(network_info)s",
+1597                   {'uuid': instance.uuid,
+1598                    'network_info': network_info_str})
+1599         for vif in network_info:
+1600             port_id = six.text_type(vif['id'])
+1601             self._plug_vif(node, port_id)
+1602 
+1603     def _unplug_vifs(self, node, instance, network_info):
+1604         # NOTE(PhilDay): Accessing network_info will block if the thread
+1605         # it wraps hasn't finished, so do this ahead of time so that we
+1606         # don't block while holding the logging lock.
+1607         network_info_str = str(network_info)
+1608         LOG.debug("unplug: instance_uuid=%(uuid)s vif=%(network_info)s",
+1609                   {'uuid': instance.uuid,
+1610                    'network_info': network_info_str})
+1611         if not network_info:
+1612             return
+1613         for vif in network_info:
+1614             port_id = six.text_type(vif['id'])
+1615             try:
+1616                 self.ironicclient.call("node.vif_detach", node.uuid,
+1617                                        port_id)
+1618             except ironic.exc.BadRequest:
+1619                 LOG.debug("VIF %(vif)s isn't attached to Ironic node %(node)s",
+1620                           {'vif': port_id, 'node': node.uuid})
+1621 
+1622     def plug_vifs(self, instance, network_info):
+1623         """Plug VIFs into networks.
+1624 
+1625         :param instance: The instance object.
+1626         :param network_info: Instance network information.
+1627 
+1628         """
+1629         # instance.node is the ironic node's UUID.
+1630         node = self._get_node(instance.node)
+1631         self._plug_vifs(node, instance, network_info)
+1632 
+1633     def unplug_vifs(self, instance, network_info):
+1634         """Unplug VIFs from networks.
+1635 
+1636         :param instance: The instance object.
+1637         :param network_info: Instance network information.
+1638 
+1639         """
+1640         # instance.node is the ironic node's UUID.
+1641         node = self._get_node(instance.node)
+1642         self._unplug_vifs(node, instance, network_info)
+1643 
+1644     def attach_interface(self, context, instance, image_meta, vif):
+1645         """Use hotplug to add a network interface to a running instance.
+1646         The counter action to this is :func:`detach_interface`.
+1647 
+1648         :param context: The request context.
+1649         :param nova.objects.instance.Instance instance:
+1650             The instance which will get an additional network interface.
+1651         :param nova.objects.ImageMeta image_meta:
+1652             The metadata of the image of the instance.
+1653         :param nova.network.model.VIF vif:
+1654             The object which has the information about the interface to attach.
+1655         :raise nova.exception.NovaException: If the attach fails.
+1656         :returns: None
+1657         """
+1658         # NOTE(vdrok): instance info cache gets updated by the network-changed
+1659         # event from neutron or by _heal_instance_info_cache periodic task. In
+1660         # both cases, this is done asynchronously, so the cache may not be up
+1661         # to date immediately after attachment.
+1662         self.plug_vifs(instance, [vif])
+1663 
+1664     def detach_interface(self, context, instance, vif):
+1665         """Use hotunplug to remove a network interface from a running instance.
+1666         The counter action to this is :func:`attach_interface`.
+1667 
+1668         :param context: The request context.
+1669         :param nova.objects.instance.Instance instance:
+1670             The instance which gets a network interface removed.
+1671         :param nova.network.model.VIF vif:
+1672             The object which has the information about the interface to detach.
+1673         :raise nova.exception.NovaException: If the detach fails.
+1674         :returns: None
+1675         """
+1676         # NOTE(vdrok): instance info cache gets updated by the network-changed
+1677         # event from neutron or by _heal_instance_info_cache periodic task. In
+1678         # both cases, this is done asynchronously, so the cache may not be up
+1679         # to date immediately after detachment.
+1680         self.unplug_vifs(instance, [vif])
+1681 
+1682     def rebuild(self, context, instance, image_meta, injected_files,
+1683                 admin_password, allocations, bdms, detach_block_devices,
+1684                 attach_block_devices, network_info=None,
+1685                 evacuate=False, block_device_info=None,
+1686                 preserve_ephemeral=False):
+1687         """Rebuild/redeploy an instance.
+1688 
+1689         This version of rebuild() allows for supporting the option to
+1690         preserve the ephemeral partition. We cannot call spawn() from
+1691         here because it will attempt to set the instance_uuid value
+1692         again, which is not allowed by the Ironic API. It also requires
+1693         the instance to not have an 'active' provision state, but we
+1694         cannot safely change that. Given that, we implement only the
+1695         portions of spawn() we need within rebuild().
+1696 
+1697         :param context: The security context.
+1698         :param instance: The instance object.
+1699         :param image_meta: Image object returned by nova.image.glance
+1700             that defines the image from which to boot this instance. Ignored
+1701             by this driver.
+1702         :param injected_files: User files to inject into instance.
+1703         :param admin_password: Administrator password to set in
+1704             instance. Ignored by this driver.
+1705         :param allocations: Information about resources allocated to the
+1706                             instance via placement, of the form returned by
+1707                             SchedulerReportClient.get_allocations_for_consumer.
+1708                             Ignored by this driver.
+1709         :param bdms: block-device-mappings to use for rebuild. Ignored
+1710             by this driver.
+1711         :param detach_block_devices: function to detach block devices. See
+1712             nova.compute.manager.ComputeManager:_rebuild_default_impl for
+1713             usage. Ignored by this driver.
+1714         :param attach_block_devices: function to attach block devices. See
+1715             nova.compute.manager.ComputeManager:_rebuild_default_impl for
+1716             usage. Ignored by this driver.
+1717         :param network_info: Instance network information. Ignored by
+1718             this driver.
+1719         :param evacuate: Boolean value; if True the instance is
+1720             recreated on a new hypervisor - all the cleanup of old state is
+1721             skipped. Ignored by this driver.
+1722         :param block_device_info: Instance block device
+1723             information. Ignored by this driver.
+1724         :param preserve_ephemeral: Boolean value; if True the ephemeral
+1725             must be preserved on rebuild.
+1726 
+1727         """
+1728         LOG.debug('Rebuild called for instance', instance=instance)
+1729 
+1730         instance.task_state = task_states.REBUILD_SPAWNING
+1731         instance.save(expected_task_state=[task_states.REBUILDING])
+1732 
+1733         node_uuid = instance.node
+1734         node = self._get_node(node_uuid)
+1735 
+1736         self._add_instance_info_to_node(node, instance, image_meta,
+1737                                         instance.flavor, preserve_ephemeral)
+1738 
+1739         # Config drive
+1740         configdrive_value = None
+1741         if configdrive.required_by(instance):
+1742             extra_md = {}
+1743             if admin_password:
+1744                 extra_md['admin_pass'] = admin_password
+1745 
+1746             try:
+1747                 configdrive_value = self._generate_configdrive(
+1748                     context, instance, node, network_info, extra_md=extra_md,
+1749                     files=injected_files)
+1750             except Exception as e:
+1751                 with excutils.save_and_reraise_exception():
+1752                     msg = ("Failed to build configdrive: %s" %
+1753                            six.text_type(e))
+1754                     LOG.error(msg, instance=instance)
+1755                     raise exception.InstanceDeployFailure(msg)
+1756 
+1757             LOG.info("Config drive for instance %(instance)s on "
+1758                      "baremetal node %(node)s created.",
+1759                      {'instance': instance['uuid'], 'node': node_uuid})
+1760 
+1761         # Trigger the node rebuild/redeploy.
+1762         try:
+1763             self.ironicclient.call("node.set_provision_state",
+1764                               node_uuid, ironic_states.REBUILD,
+1765                               configdrive=configdrive_value)
+1766         except (exception.NovaException,         # Retry failed
+1767                 ironic.exc.InternalServerError,  # Validations
+1768                 ironic.exc.BadRequest) as e:     # Maintenance
+1769             msg = (_("Failed to request Ironic to rebuild instance "
+1770                      "%(inst)s: %(reason)s") % {'inst': instance.uuid,
+1771                                                 'reason': six.text_type(e)})
+1772             raise exception.InstanceDeployFailure(msg)
+1773 
+1774         # Although the target provision state is REBUILD, it will actually go
+1775         # to ACTIVE once the redeploy is finished.
+1776         timer = loopingcall.FixedIntervalLoopingCall(self._wait_for_active,
+1777                                                      instance)
+1778         timer.start(interval=CONF.ironic.api_retry_interval).wait()
+1779         LOG.info('Instance was successfully rebuilt', instance=instance)
+1780 
+1781     def network_binding_host_id(self, context, instance):
+1782         """Get host ID to associate with network ports.
+1783 
+1784         This defines the binding:host_id parameter to the port-create calls for
+1785         Neutron. If using the neutron network interface (separate networks for
+1786         the control plane and tenants), return None here to indicate that the
+1787         port should not yet be bound; Ironic will make a port-update call to
+1788         Neutron later to tell Neutron to bind the port.
+1789 
+1790         NOTE: the late binding is important for security. If an ML2 mechanism
+1791         manages to connect the tenant network to the baremetal machine before
+1792         deployment is done (e.g. port-create time), then the tenant potentially
+1793         has access to the deploy agent, which may contain firmware blobs or
+1794         secrets. ML2 mechanisms may be able to connect the port without the
+1795         switchport info that comes from ironic, if they store that switchport
+1796         info for some reason. As such, we should *never* pass binding:host_id
+1797         in the port-create call when using the 'neutron' network_interface,
+1798         because a null binding:host_id indicates to Neutron that it should
+1799         not connect the port yet.
+1800 
+1801         :param context:  request context
+1802         :param instance: nova.objects.instance.Instance that the network
+1803                          ports will be associated with
+1804         :returns: None
+1805         """
+1806         # NOTE(vsaienko) Ironic will set binding:host_id later with port-update
+1807         # call when updating mac address or setting binding:profile
+1808         # to tell Neutron to bind the port.
+1809         return None
+1810 
+1811     def _get_node_console_with_reset(self, instance):
+1812         """Acquire console information for an instance.
+1813 
+1814         If the console is enabled, the console will be re-enabled
+1815         before returning.
+1816 
+1817         :param instance: nova instance
+1818         :return: a dictionary with below values
+1819             { 'node': ironic node
+1820               'console_info': node console info }
+1821         :raise ConsoleNotAvailable: if console is unavailable
+1822             for the instance
+1823         """
+1824         node = self._validate_instance_and_node(instance)
+1825         node_uuid = node.uuid
+1826 
+1827         def _get_console():
+1828             """Request ironicclient to acquire node console."""
+1829             try:
+1830                 return self.ironicclient.call('node.get_console', node_uuid)
+1831             except (exception.NovaException,  # Retry failed
+1832                     ironic.exc.InternalServerError,  # Validations
+1833                     ironic.exc.BadRequest) as e:  # Maintenance
+1834                 LOG.error('Failed to acquire console information for '
+1835                           'instance %(inst)s: %(reason)s',
+1836                           {'inst': instance.uuid, 'reason': e})
+1837                 raise exception.ConsoleNotAvailable()
+1838 
+1839         def _wait_state(state):
+1840             """Wait for the expected console mode to be set on node."""
+1841             console = _get_console()
+1842             if console['console_enabled'] == state:
+1843                 raise loopingcall.LoopingCallDone(retvalue=console)
+1844 
+1845             _log_ironic_polling('set console mode', node, instance)
+1846 
+1847             # Return False to start backing off
+1848             return False
+1849 
+1850         def _enable_console(mode):
+1851             """Request ironicclient to enable/disable node console."""
+1852             try:
+1853                 self.ironicclient.call('node.set_console_mode', node_uuid,
+1854                                        mode)
+1855             except (exception.NovaException,  # Retry failed
+1856                     ironic.exc.InternalServerError,  # Validations
+1857                     ironic.exc.BadRequest) as e:  # Maintenance
+1858                 LOG.error('Failed to set console mode to "%(mode)s" '
+1859                           'for instance %(inst)s: %(reason)s',
+1860                           {'mode': mode,
+1861                            'inst': instance.uuid,
+1862                            'reason': e})
+1863                 raise exception.ConsoleNotAvailable()
+1864 
+1865             # Waiting for the console state to change (disabled/enabled)
+1866             try:
+1867                 timer = loopingcall.BackOffLoopingCall(_wait_state, state=mode)
+1868                 return timer.start(
+1869                     starting_interval=_CONSOLE_STATE_CHECKING_INTERVAL,
+1870                     timeout=CONF.ironic.serial_console_state_timeout,
+1871                     jitter=0.5).wait()
+1872             except loopingcall.LoopingCallTimeOut:
+1873                 LOG.error('Timeout while waiting for console mode to be '
+1874                           'set to "%(mode)s" on node %(node)s',
+1875                           {'mode': mode,
+1876                            'node': node_uuid})
+1877                 raise exception.ConsoleNotAvailable()
+1878 
+1879         # Acquire the console
+1880         console = _get_console()
+1881 
+1882         # NOTE: Resetting console is a workaround to force acquiring
+1883         # console when it has already been acquired by another user/operator.
+1884         # IPMI serial console does not support multi session, so
+1885         # resetting console will deactivate any active one without
+1886         # warning the operator.
+1887         if console['console_enabled']:
+1888             try:
+1889                 # Disable console
+1890                 _enable_console(False)
+1891                 # Then re-enable it
+1892                 console = _enable_console(True)
+1893             except exception.ConsoleNotAvailable:
+1894                 # NOTE: We try to do recover on failure.
+1895                 # But if recover fails, the console may remain in
+1896                 # "disabled" state and cause any new connection
+1897                 # will be refused.
+1898                 console = _enable_console(True)
+1899 
+1900         if console['console_enabled']:
+1901             return {'node': node,
+1902                     'console_info': console['console_info']}
+1903         else:
+1904             LOG.debug('Console is disabled for instance %s',
+1905                       instance.uuid)
+1906             raise exception.ConsoleNotAvailable()
+1907 
+1908     def get_serial_console(self, context, instance):
+1909         """Acquire serial console information.
+1910 
+1911         :param context: request context
+1912         :param instance: nova instance
+1913         :return: ConsoleSerial object
+1914         :raise ConsoleTypeUnavailable: if serial console is unavailable
+1915             for the instance
+1916         """
+1917         LOG.debug('Getting serial console', instance=instance)
+1918         try:
+1919             result = self._get_node_console_with_reset(instance)
+1920         except exception.ConsoleNotAvailable:
+1921             raise exception.ConsoleTypeUnavailable(console_type='serial')
+1922 
+1923         node = result['node']
+1924         console_info = result['console_info']
+1925 
+1926         if console_info["type"] != "socat":
+1927             LOG.warning('Console type "%(type)s" (of ironic node '
+1928                         '%(node)s) does not support Nova serial console',
+1929                         {'type': console_info["type"],
+1930                          'node': node.uuid},
+1931                         instance=instance)
+1932             raise exception.ConsoleTypeUnavailable(console_type='serial')
+1933 
+1934         # Parse and check the console url
+1935         url = urlparse.urlparse(console_info["url"])
+1936         try:
+1937             scheme = url.scheme
+1938             hostname = url.hostname
+1939             port = url.port
+1940             if not (scheme and hostname and port):
+1941                 raise AssertionError()
+1942         except (ValueError, AssertionError):
+1943             LOG.error('Invalid Socat console URL "%(url)s" '
+1944                       '(ironic node %(node)s)',
+1945                       {'url': console_info["url"],
+1946                        'node': node.uuid},
+1947                       instance=instance)
+1948             raise exception.ConsoleTypeUnavailable(console_type='serial')
+1949 
+1950         if scheme == "tcp":
+1951             return console_type.ConsoleSerial(host=hostname,
+1952                                               port=port)
+1953         else:
+1954             LOG.warning('Socat serial console only supports "tcp". '
+1955                         'This URL is "%(url)s" (ironic node %(node)s).',
+1956                         {'url': console_info["url"],
+1957                          'node': node.uuid},
+1958                         instance=instance)
+1959             raise exception.ConsoleTypeUnavailable(console_type='serial')
+1960 
+1961     @property
+1962     def need_legacy_block_device_info(self):
+1963         return False
+1964 
+1965     def prepare_networks_before_block_device_mapping(self, instance,
+1966                                                      network_info):
+1967         """Prepare networks before the block devices are mapped to instance.
+1968 
+1969         Plug VIFs before block device preparation. In case where storage
+1970         network is managed by neutron and a MAC address is specified as a
+1971         volume connector to a node, we can get the IP address assigned to
+1972         the connector. An IP address of volume connector may be required by
+1973         some volume backend drivers. For getting the IP address, VIFs need to
+1974         be plugged before block device preparation so that a VIF is assigned to
+1975         a MAC address.
+1976         """
+1977 
+1978         try:
+1979             self.plug_vifs(instance, network_info)
+1980         except Exception:
+1981             with excutils.save_and_reraise_exception():
+1982                 LOG.error("Error preparing deploy for instance "
+1983                           "%(instance)s on baremetal node %(node)s.",
+1984                           {'instance': instance.uuid,
+1985                            'node': instance.node},
+1986                           instance=instance)
+1987 
+1988     def clean_networks_preparation(self, instance, network_info):
+1989         """Clean networks preparation when block device mapping is failed.
+1990 
+1991         Unplug VIFs when block device preparation is failed.
+1992         """
+1993 
+1994         try:
+1995             self.unplug_vifs(instance, network_info)
+1996         except Exception as e:
+1997             LOG.warning('Error detaching VIF from node %(node)s '
+1998                         'after deploy failed; %(reason)s',
+1999                         {'node': instance.node,
+2000                          'reason': six.text_type(e)},
+2001                         instance=instance)
+2002 
+2003     def get_volume_connector(self, instance):
+2004         """Get connector information for the instance for attaching to volumes.
+2005 
+2006         Connector information is a dictionary representing the hardware
+2007         information that will be making the connection. This information
+2008         consists of properties for protocols supported by the hardware.
+2009         If the hardware supports iSCSI protocol, iSCSI initiator IQN is
+2010         included as follows::
+2011 
+2012             {
+2013                 'ip': ip,
+2014                 'initiator': initiator,
+2015                 'host': hostname
+2016             }
+2017 
+2018         An IP address is set if a volume connector with type ip is assigned to
+2019         a node. An IP address is also set if a node has a volume connector with
+2020         type mac. An IP address is got from a VIF attached to an ironic port
+2021         or portgroup with the MAC address. Otherwise, an IP address of one
+2022         of VIFs is used.
+2023 
+2024         :param instance: nova instance
+2025         :return: A connector information dictionary
+2026         """
+2027         node = self.ironicclient.call("node.get", instance.node)
+2028         properties = self._parse_node_properties(node)
+2029         connectors = self.ironicclient.call("node.list_volume_connectors",
+2030                                             instance.node, detail=True)
+2031         values = {}
+2032         for conn in connectors:
+2033             values.setdefault(conn.type, []).append(conn.connector_id)
+2034         props = {}
+2035 
+2036         ip = self._get_volume_connector_ip(instance, node, values)
+2037         if ip:
+2038             LOG.debug('Volume connector IP address for node %(node)s is '
+2039                       '%(ip)s.',
+2040                       {'node': node.uuid, 'ip': ip},
+2041                       instance=instance)
+2042             props['ip'] = props['host'] = ip
+2043         if values.get('iqn'):
+2044             props['initiator'] = values['iqn'][0]
+2045         if values.get('wwpn'):
+2046             props['wwpns'] = values['wwpn']
+2047         if values.get('wwnn'):
+2048             props['wwnns'] = values['wwnn']
+2049         props['platform'] = properties.get('cpu_arch')
+2050         props['os_type'] = 'baremetal'
+2051 
+2052         # NOTE(TheJulia): The host field is important to cinder connectors
+2053         # as it is used in some drivers for logging purposes, and we presently
+2054         # only otherwise set it when an IP address is used.
+2055         if 'host' not in props:
+2056             props['host'] = instance.hostname
+2057         # Eventually it would be nice to be able to do multipath, but for now
+2058         # we should at least set the value to False.
+2059         props['multipath'] = False
+2060         return props
+2061 
+2062     def _get_volume_connector_ip(self, instance, node, values):
+2063         if values.get('ip'):
+2064             LOG.debug('Node %s has an IP address for volume connector',
+2065                       node.uuid, instance=instance)
+2066             return values['ip'][0]
+2067 
+2068         vif_id = self._get_vif_from_macs(node, values.get('mac', []), instance)
+2069 
+2070         # retrieve VIF and get the IP address
+2071         nw_info = instance.get_network_info()
+2072         if vif_id:
+2073             fixed_ips = [ip for vif in nw_info if vif['id'] == vif_id
+2074                          for ip in vif.fixed_ips()]
+2075         else:
+2076             fixed_ips = [ip for vif in nw_info for ip in vif.fixed_ips()]
+2077         fixed_ips_v4 = [ip for ip in fixed_ips if ip['version'] == 4]
+2078         if fixed_ips_v4:
+2079             return fixed_ips_v4[0]['address']
+2080         elif fixed_ips:
+2081             return fixed_ips[0]['address']
+2082         return None
+2083 
+2084     def _get_vif_from_macs(self, node, macs, instance):
+2085         """Get a VIF from specified MACs.
+2086 
+2087         Retrieve ports and portgroups which have specified MAC addresses and
+2088         return a UUID of a VIF attached to a port or a portgroup found first.
+2089 
+2090         :param node: The node object.
+2091         :param mac: A list of MAC addresses of volume connectors.
+2092         :param instance: nova instance, used for logging.
+2093         :return: A UUID of a VIF assigned to one of the MAC addresses.
+2094         """
+2095         for mac in macs:
+2096             for method in ['portgroup.list', 'port.list']:
+2097                 ports = self.ironicclient.call(method,
+2098                                                node=node.uuid,
+2099                                                address=mac,
+2100                                                detail=True)
+2101                 for p in ports:
+2102                     vif_id = (p.internal_info.get('tenant_vif_port_id') or
+2103                               p.extra.get('vif_port_id'))
+2104                     if vif_id:
+2105                         LOG.debug('VIF %(vif)s for volume connector is '
+2106                                   'retrieved with MAC %(mac)s of node '
+2107                                   '%(node)s',
+2108                                   {'vif': vif_id,
+2109                                    'mac': mac,
+2110                                    'node': node.uuid},
+2111                                   instance=instance)
+2112                         return vif_id
+2113         return None
+2114 
+2115     def _can_send_version(self, min_version=None, max_version=None):
+2116         """Validate if the suppplied version is available in the API."""
+2117         # NOTE(TheJulia): This will effectively just be a pass if no
+2118         # version negotiation has occured, since there is no way for
+2119         # us to know without explicitly otherwise requesting that
+2120         # back-end negotiation occurs. This is a capability that is
+2121         # present in python-ironicclient, however it may not be needed
+2122         # in this case.
+2123         if self.ironicclient.is_api_version_negotiated:
+2124             current_api_version = self.ironicclient.current_api_version
+2125             if (min_version and
+2126                     version.StrictVersion(current_api_version) <
+2127                     version.StrictVersion(min_version)):
+2128                 raise exception.IronicAPIVersionNotAvailable(
+2129                     version=min_version)
+2130             if (max_version and
+2131                     version.StrictVersion(current_api_version) >
+2132                     version.StrictVersion(max_version)):
+2133                 raise exception.IronicAPIVersionNotAvailable(
+2134                     version=max_version)
+2135 
+2136     def rescue(self, context, instance, network_info, image_meta,
+2137                rescue_password):
+2138         """Rescue the specified instance.
+2139 
+2140         :param nova.context.RequestContext context:
+2141             The context for the rescue.
+2142         :param nova.objects.instance.Instance instance:
+2143             The instance being rescued.
+2144         :param nova.network.model.NetworkInfo network_info:
+2145             Necessary network information for the rescue. Ignored by this
+2146             driver.
+2147         :param nova.objects.ImageMeta image_meta:
+2148             The metadata of the image of the instance. Ignored by this driver.
+2149         :param rescue_password: new root password to set for rescue.
+2150         :raise InstanceRescueFailure if rescue fails.
+2151         """
+2152         LOG.debug('Rescue called for instance', instance=instance)
+2153 
+2154         node_uuid = instance.node
+2155 
+2156         def _wait_for_rescue():
+2157             try:
+2158                 node = self._validate_instance_and_node(instance)
+2159             except exception.InstanceNotFound as e:
+2160                 raise exception.InstanceRescueFailure(reason=six.text_type(e))
+2161 
+2162             if node.provision_state == ironic_states.RESCUE:
+2163                 raise loopingcall.LoopingCallDone()
+2164 
+2165             if node.provision_state == ironic_states.RESCUEFAIL:
+2166                 raise exception.InstanceRescueFailure(
+2167                           reason=node.last_error)
+2168 
+2169         try:
+2170             self.ironicclient.call("node.set_provision_state",
+2171                                    node_uuid, ironic_states.RESCUE,
+2172                                    rescue_password=rescue_password)
+2173         except Exception as e:
+2174             raise exception.InstanceRescueFailure(reason=six.text_type(e))
+2175 
+2176         timer = loopingcall.FixedIntervalLoopingCall(_wait_for_rescue)
+2177         timer.start(interval=CONF.ironic.api_retry_interval).wait()
+2178         LOG.info('Successfully rescued Ironic node %(node)s',
+2179                  {'node': node_uuid}, instance=instance)
+2180 
+2181     def unrescue(self, instance, network_info):
+2182         """Unrescue the specified instance.
+2183 
+2184         :param instance: nova.objects.instance.Instance
+2185         :param nova.network.model.NetworkInfo network_info:
+2186             Necessary network information for the unrescue. Ignored by this
+2187             driver.
+2188         """
+2189         LOG.debug('Unrescue called for instance', instance=instance)
+2190 
+2191         node_uuid = instance.node
+2192 
+2193         def _wait_for_unrescue():
+2194             try:
+2195                 node = self._validate_instance_and_node(instance)
+2196             except exception.InstanceNotFound as e:
+2197                 raise exception.InstanceUnRescueFailure(
+2198                           reason=six.text_type(e))
+2199 
+2200             if node.provision_state == ironic_states.ACTIVE:
+2201                 raise loopingcall.LoopingCallDone()
+2202 
+2203             if node.provision_state == ironic_states.UNRESCUEFAIL:
+2204                 raise exception.InstanceUnRescueFailure(
+2205                           reason=node.last_error)
+2206 
+2207         try:
+2208             self.ironicclient.call("node.set_provision_state",
+2209                                    node_uuid, ironic_states.UNRESCUE)
+2210         except Exception as e:
+2211             raise exception.InstanceUnRescueFailure(reason=six.text_type(e))
+2212 
+2213         timer = loopingcall.FixedIntervalLoopingCall(_wait_for_unrescue)
+2214         timer.start(interval=CONF.ironic.api_retry_interval).wait()
+2215         LOG.info('Successfully unrescued Ironic node %(node)s',
+2216                  {'node': node_uuid}, instance=instance)
+2217 
+2218     def manages_network_binding_host_id(self):
+2219         """IronicDriver manages port bindings for baremetal instances.
+2220         """
+2221         return True

@@ -1,0 +1,466 @@
+Please review the code below for security defects. You can consider defect types in terms of:
+1.CWE-284 (Improper Access Control)
+2.CWE-435 (Improper Interaction Between Multiple Entities)
+3.CWE-664 (Improper Control of a Resource Through its Lifetime)
+4.CWE-682 (Incorrect Calculation)
+5.CWE-691 (Insufficient Control Flow Management)
+6.CWE-693 (Protection Mechanism Failure)
+7.CWE-697 (Incorrect Comparison)
+8.CWE-703 (Improper Check or Handling of Exceptional Conditions)
+9.CWE-707 (Improper Neutralization)
+10.CWE-710 (Improper Adherence to Coding Standards)
+If any are found, please describe the security defect in detail and indicate the corresponding line number of code and solution. If none are detected, states: 'No security defects are detected in the code'.
+
+1 # Copyright 2018 OpenStack Foundation
+2 # All Rights Reserved.
+3 #
+4 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
+5 #    not use this file except in compliance with the License. You may obtain
+6 #    a copy of the License at
+7 #
+8 #         http://www.apache.org/licenses/LICENSE-2.0
+9 #
+10 #    Unless required by applicable law or agreed to in writing, software
+11 #    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+12 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+13 #    License for the specific language governing permissions and limitations
+14 #    under the License.
+15 
+16 import collections
+17 
+18 import netaddr
+19 from oslo_concurrency import lockutils
+20 from oslo_log import log as logging
+21 
+22 from neutron.agent.linux import ip_lib
+23 from neutron.api.rpc.callbacks.consumer import registry
+24 from neutron.api.rpc.callbacks import events
+25 from neutron.api.rpc.callbacks import resources
+26 from neutron.api.rpc.handlers import resources_rpc
+27 from neutron.common import rpc as n_rpc
+28 from neutron_lib.agent import l3_extension
+29 from neutron_lib import constants as lib_constants
+30 
+31 LOG = logging.getLogger(__name__)
+32 DEFAULT_PORT_FORWARDING_CHAIN = 'fip-pf'
+33 PORT_FORWARDING_PREFIX = 'fip_portforwarding-'
+34 PORT_FORWARDING_CHAIN_PREFIX = 'pf-'
+35 # This is the same with iptables_manager constant value, but as the value is
+36 # not move to constants file. So define it for port forwarding here.
+37 MAX_CHAIN_LEN_WRAP = 11
+38 
+39 
+40 class RouterFipPortForwardingMapping(object):
+41     def __init__(self):
+42         self.managed_port_forwardings = {}
+43         """
+44         fip_port_forwarding = {
+45             fip_id_1: set(pf_id1, pf_id2),
+46             fip_id_2: set(pf_id3, pf_id4)
+47         }
+48         """
+49         self.fip_port_forwarding = collections.defaultdict(set)
+50         """
+51         router_fip_mapping = {
+52             router_id_1: set(fip_id_1, fip_id_2),
+53             router_id_1: set(fip_id_3, fip_id_4)
+54         }
+55         """
+56         self.router_fip_mapping = collections.defaultdict(set)
+57 
+58     def set_port_forwardings(self, port_forwardings):
+59         for port_forwarding in port_forwardings:
+60             self.set_fip_port_forwarding(port_forwarding.floating_ip_id,
+61                                          port_forwarding,
+62                                          port_forwarding.router_id)
+63 
+64     def update_port_forwardings(self, port_forwardings):
+65         for port_forwarding in port_forwardings:
+66             self.managed_port_forwardings[port_forwarding.id] = port_forwarding
+67 
+68     def get_port_forwarding(self, port_forwarding_id):
+69         return self.managed_port_forwardings.get(port_forwarding_id)
+70 
+71     def del_port_forwardings(self, port_forwardings):
+72         for port_forwarding in port_forwardings:
+73             if not self.get_port_forwarding(port_forwarding.id):
+74                 continue
+75             del self.managed_port_forwardings[port_forwarding.id]
+76             self.fip_port_forwarding[port_forwarding.floating_ip_id].remove(
+77                 port_forwarding.id)
+78             if not self.fip_port_forwarding[port_forwarding.floating_ip_id]:
+79                 del self.fip_port_forwarding[port_forwarding.floating_ip_id]
+80                 self.router_fip_mapping[port_forwarding.router_id].remove(
+81                     port_forwarding.floating_ip_id)
+82                 if not self.router_fip_mapping[port_forwarding.router_id]:
+83                     del self.router_fip_mapping[port_forwarding.router_id]
+84 
+85     def set_fip_port_forwarding(self, fip_id, pf, router_id):
+86         self.router_fip_mapping[router_id].add(fip_id)
+87         self.fip_port_forwarding[fip_id].add(pf.id)
+88         self.managed_port_forwardings[pf.id] = pf
+89 
+90     def clear_by_fip(self, fip_id, router_id):
+91         self.router_fip_mapping[router_id].remove(fip_id)
+92         if len(self.router_fip_mapping[router_id]) == 0:
+93             del self.router_fip_mapping[router_id]
+94         for pf_id in self.fip_port_forwarding[fip_id]:
+95             del self.managed_port_forwardings[pf_id]
+96         del self.fip_port_forwarding[fip_id]
+97 
+98     def check_port_forwarding_changes(self, new_pf):
+99         old_pf = self.get_port_forwarding(new_pf.id)
+100         return old_pf != new_pf
+101 
+102 
+103 class PortForwardingAgentExtension(l3_extension.L3AgentExtension):
+104     SUPPORTED_RESOURCE_TYPES = [resources.PORTFORWARDING]
+105 
+106     def initialize(self, connection, driver_type):
+107         self.resource_rpc = resources_rpc.ResourcesPullRpcApi()
+108         self._register_rpc_consumers()
+109         self.mapping = RouterFipPortForwardingMapping()
+110 
+111     def _register_rpc_consumers(self):
+112         registry.register(self._handle_notification,
+113                           resources.PORTFORWARDING)
+114 
+115         self._connection = n_rpc.Connection()
+116         endpoints = [resources_rpc.ResourcesPushRpcCallback()]
+117         topic = resources_rpc.resource_type_versioned_topic(
+118             resources.PORTFORWARDING)
+119         self._connection.create_consumer(topic, endpoints, fanout=True)
+120         self._connection.consume_in_threads()
+121 
+122     def consume_api(self, agent_api):
+123         self.agent_api = agent_api
+124 
+125     @lockutils.synchronized('port-forwarding')
+126     def _handle_notification(self, context, resource_type,
+127                              forwardings, event_type):
+128         for forwarding in forwardings:
+129             self._process_port_forwarding_event(
+130                 context, forwarding, event_type)
+131             self._store_local([forwarding], event_type)
+132 
+133     def _store_local(self, pf_objs, event_type):
+134         if event_type == events.CREATED:
+135             self.mapping.set_port_forwardings(pf_objs)
+136         elif event_type == events.UPDATED:
+137             self.mapping.update_port_forwardings(pf_objs)
+138         elif event_type == events.DELETED:
+139             self.mapping.del_port_forwardings(pf_objs)
+140 
+141     def _get_fip_rules(self, port_forward, wrap_name):
+142         chain_rule_list = []
+143         pf_chain_name = self._get_port_forwarding_chain_name(port_forward.id)
+144         chain_rule_list.append((DEFAULT_PORT_FORWARDING_CHAIN,
+145                                 '-j %s-%s' %
+146                                 (wrap_name, pf_chain_name)))
+147         floating_ip_address = str(port_forward.floating_ip_address)
+148         protocol = port_forward.protocol
+149         internal_ip_address = str(port_forward.internal_ip_address)
+150         internal_port = port_forward.internal_port
+151         external_port = port_forward.external_port
+152         chain_rule = (pf_chain_name,
+153                       '-d %s/32 -p %s -m %s --dport %s '
+154                       '-j DNAT --to-destination %s:%s' % (
+155                           floating_ip_address, protocol, protocol,
+156                           external_port, internal_ip_address,
+157                           internal_port))
+158         chain_rule_list.append(chain_rule)
+159         return chain_rule_list
+160 
+161     def _rule_apply(self, iptables_manager, port_forwarding, rule_tag):
+162         iptables_manager.ipv4['nat'].clear_rules_by_tag(rule_tag)
+163         if DEFAULT_PORT_FORWARDING_CHAIN not in iptables_manager.ipv4[
+164              'nat'].chains:
+165             self._install_default_rules(iptables_manager)
+166 
+167         for chain, rule in self._get_fip_rules(
+168                 port_forwarding, iptables_manager.wrap_name):
+169             if chain not in iptables_manager.ipv4['nat'].chains:
+170                 iptables_manager.ipv4['nat'].add_chain(chain)
+171             iptables_manager.ipv4['nat'].add_rule(chain, rule, tag=rule_tag)
+172 
+173     def _process_create(self, port_forwardings, ri, interface_name, namespace,
+174                         iptables_manager):
+175         if not port_forwardings:
+176             return
+177         device = ip_lib.IPDevice(interface_name, namespace=namespace)
+178 
+179         is_distributed = ri.router.get('distributed')
+180         ha_port = ri.router.get(lib_constants.HA_INTERFACE_KEY, None)
+181         fip_statuses = {}
+182         for port_forwarding in port_forwardings:
+183             if port_forwarding.id in self.mapping.managed_port_forwardings:
+184                 continue
+185             existing_cidrs = ri.get_router_cidrs(device)
+186             fip_ip = str(port_forwarding.floating_ip_address)
+187             fip_cidr = str(netaddr.IPNetwork(fip_ip))
+188             if fip_cidr not in existing_cidrs:
+189                 try:
+190                     if not is_distributed:
+191                         fip_statuses[
+192                             port_forwarding.floating_ip_id] = \
+193                             ri.add_floating_ip(
+194                                 {'floating_ip_address': fip_ip},
+195                                 interface_name, device)
+196                     else:
+197                         if not ha_port:
+198                             device.addr.add(fip_cidr)
+199                             ip_lib.send_ip_addr_adv_notif(namespace,
+200                                                           interface_name,
+201                                                           fip_ip)
+202                         else:
+203                             ri._add_vip(fip_cidr, interface_name)
+204                         fip_statuses[
+205                             port_forwarding.floating_ip_id] = 'ACTIVE'
+206                 except Exception:
+207                     # Any error will causes the fip status to be set 'ERROR'
+208                     fip_statuses[port_forwarding.floating_ip_id] = 'ERROR'
+209                     LOG.warning("Unable to configure floating IP %(fip_id)s "
+210                                 "for port forwarding %(pf_id)s",
+211                                 {'fip_id': port_forwarding.floating_ip_id,
+212                                  'pf_id': port_forwarding.id})
+213             else:
+214                 if not ha_port:
+215                     ip_lib.send_ip_addr_adv_notif(namespace,
+216                                                   interface_name,
+217                                                   fip_ip)
+218 
+219         if ha_port and ha_port['status'] == lib_constants.PORT_STATUS_ACTIVE:
+220             ri.enable_keepalived()
+221 
+222         for port_forwarding in port_forwardings:
+223             rule_tag = PORT_FORWARDING_PREFIX + port_forwarding.id
+224             self._rule_apply(iptables_manager, port_forwarding, rule_tag)
+225 
+226         iptables_manager.apply()
+227         self._sending_port_forwarding_fip_status(ri, fip_statuses)
+228 
+229     def _sending_port_forwarding_fip_status(self, ri, statuses):
+230         if not statuses:
+231             return
+232         LOG.debug('Sending Port Forwarding floating ip '
+233                   'statuses: %s', statuses)
+234         # Update floating IP status on the neutron server
+235         ri.agent.plugin_rpc.update_floatingip_statuses(
+236             ri.agent.context, ri.router_id, statuses)
+237 
+238     def _get_resource_by_router(self, ri):
+239         is_distributed = ri.router.get('distributed')
+240         ex_gw_port = ri.get_ex_gw_port()
+241         if not is_distributed:
+242             interface_name = ri.get_external_device_interface_name(ex_gw_port)
+243             namespace = ri.ns_name
+244             iptables_manager = ri.iptables_manager
+245         else:
+246             interface_name = ri.get_snat_external_device_interface_name(
+247                 ex_gw_port)
+248             namespace = ri.snat_namespace.name
+249             iptables_manager = ri.snat_iptables_manager
+250         return interface_name, namespace, iptables_manager
+251 
+252     def _check_if_need_process(self, ri):
+253         if not ri or not ri.get_ex_gw_port():
+254             # agent not hold the router. pass
+255             # This router doesn't own a gw port. pass
+256             return False
+257         is_distributed = ri.router.get('distributed')
+258         agent_mode = ri.agent_conf.agent_mode
+259         if (is_distributed and
+260                 agent_mode in [lib_constants.L3_AGENT_MODE_DVR_NO_EXTERNAL,
+261                                lib_constants.L3_AGENT_MODE_DVR]):
+262             # just support centralized cases
+263             return False
+264         return True
+265 
+266     def _process_port_forwarding_event(self, context, port_forwarding,
+267                                        event_type):
+268         router_id = port_forwarding.router_id
+269         ri = self._get_router_info(router_id)
+270         if not self._check_if_need_process(ri):
+271             return
+272 
+273         (interface_name, namespace,
+274          iptables_manager) = self._get_resource_by_router(ri)
+275 
+276         if event_type == events.CREATED:
+277             self._process_create(
+278                 [port_forwarding], ri, interface_name, namespace,
+279                 iptables_manager)
+280         elif event_type == events.UPDATED:
+281             self._process_update([port_forwarding], iptables_manager,
+282                                  interface_name, namespace)
+283         elif event_type == events.DELETED:
+284             self._process_delete(
+285                 context, [port_forwarding], ri, interface_name, namespace,
+286                 iptables_manager)
+287 
+288     def _process_update(self, port_forwardings, iptables_manager,
+289                         interface_name, namespace):
+290         if not port_forwardings:
+291             return
+292         device = ip_lib.IPDevice(interface_name, namespace=namespace)
+293         for port_forwarding in port_forwardings:
+294             if not self.mapping.check_port_forwarding_changes(port_forwarding):
+295                 continue
+296             current_chain = self._get_port_forwarding_chain_name(
+297                 port_forwarding.id)
+298             iptables_manager.ipv4['nat'].empty_chain(current_chain)
+299             iptables_manager.ipv4['nat'].remove_chain(current_chain)
+300             ori_pf = self.mapping.managed_port_forwardings[port_forwarding.id]
+301             device.delete_socket_conntrack_state(
+302                 str(ori_pf.floating_ip_address), ori_pf.external_port,
+303                 protocol=ori_pf.protocol)
+304             rule_tag = PORT_FORWARDING_PREFIX + port_forwarding.id
+305             self._rule_apply(iptables_manager, port_forwarding, rule_tag)
+306         iptables_manager.apply()
+307 
+308     def _process_delete(self, context, port_forwardings, ri, interface_name,
+309                         namespace, iptables_manager):
+310         if not port_forwardings:
+311             return
+312         device = ip_lib.IPDevice(interface_name, namespace=namespace)
+313         for port_forwarding in port_forwardings:
+314             current_chain = self._get_port_forwarding_chain_name(
+315                 port_forwarding.id)
+316             iptables_manager.ipv4['nat'].empty_chain(current_chain)
+317             iptables_manager.ipv4['nat'].remove_chain(current_chain)
+318             fip_address = str(port_forwarding.floating_ip_address)
+319             device.delete_socket_conntrack_state(
+320                 fip_address, port_forwarding.external_port,
+321                 protocol=port_forwarding.protocol)
+322 
+323         iptables_manager.apply()
+324 
+325         fip_id_cidrs = set([(pf.floating_ip_id,
+326                              str(pf.floating_ip_address)) for pf in
+327                             port_forwardings])
+328         self._sync_and_remove_fip(context, fip_id_cidrs, device, ri)
+329 
+330     def _sync_and_remove_fip(self, context, fip_id_cidrs, device, ri):
+331         if not fip_id_cidrs:
+332             return
+333         ha_port = ri.router.get(lib_constants.HA_INTERFACE_KEY)
+334         fip_ids = [item[0] for item in fip_id_cidrs]
+335         pfs = self.resource_rpc.bulk_pull(context, resources.PORTFORWARDING,
+336                                           filter_kwargs={
+337                                               'floating_ip_id': fip_ids})
+338         exist_fips = collections.defaultdict(set)
+339         fip_status = {}
+340         for pf in pfs:
+341             exist_fips[pf.floating_ip_id].add(pf.id)
+342 
+343         for fip_id_cidr in fip_id_cidrs:
+344             if fip_id_cidr[0] not in exist_fips:
+345                 if ha_port:
+346                     ri._remove_vip(fip_id_cidr[1])
+347                 else:
+348                     device.delete_addr_and_conntrack_state(fip_id_cidr[1])
+349                 fip_status[fip_id_cidr[0]] = 'DOWN'
+350 
+351         if ha_port:
+352             ri.enable_keepalived()
+353         self._sending_port_forwarding_fip_status(ri, fip_status)
+354         for fip_id in fip_status.keys():
+355             self.mapping.clear_by_fip(fip_id, ri.router_id)
+356 
+357     def _get_router_info(self, router_id):
+358         router_info = self.agent_api.get_router_info(router_id)
+359         if router_info:
+360             return router_info
+361         LOG.debug("Router %s is not managed by this agent. "
+362                   "It was possibly deleted concurrently.", router_id)
+363 
+364     def _get_port_forwarding_chain_name(self, pf_id):
+365         chain_name = PORT_FORWARDING_CHAIN_PREFIX + pf_id
+366         return chain_name[:MAX_CHAIN_LEN_WRAP]
+367 
+368     def _install_default_rules(self, iptables_manager):
+369         default_rule = '-j %s-%s' % (iptables_manager.wrap_name,
+370                                      DEFAULT_PORT_FORWARDING_CHAIN)
+371         iptables_manager.ipv4['nat'].add_chain(DEFAULT_PORT_FORWARDING_CHAIN)
+372         iptables_manager.ipv4['nat'].add_rule('PREROUTING', default_rule)
+373         iptables_manager.apply()
+374 
+375     def check_local_port_forwardings(self, context, ri, sync_mappings):
+376         fip_ids = [id[0] for id in sync_mappings[
+377             'floatingip_port_forwarding_mapping']]
+378         pfs = self.resource_rpc.bulk_pull(context, resources.PORTFORWARDING,
+379                                           filter_kwargs={
+380                                               'floating_ip_id': fip_ids})
+381 
+382         (interface_name, namespace,
+383          iptable_manager) = self._get_resource_by_router(ri)
+384         local_pfs = set(self.mapping.managed_port_forwardings.keys())
+385         new_pfs = []
+386         updated_pfs = []
+387         current_pfs = set()
+388         for pf in pfs:
+389             if pf.id in self.mapping.managed_port_forwardings:
+390                 if self.mapping.check_port_forwarding_changes(pf):
+391                     updated_pfs.append(pf)
+392             else:
+393                 new_pfs.append(pf)
+394             current_pfs.add(pf.id)
+395         remove_pf_ids_set = local_pfs - current_pfs
+396         remove_pfs = []
+397         for local_pf_id in local_pfs:
+398             if local_pf_id in remove_pf_ids_set:
+399                 remove_pfs.append(
+400                     self.mapping.managed_port_forwardings[local_pf_id])
+401         if updated_pfs:
+402             self._process_update(updated_pfs, iptable_manager,
+403                                  interface_name, namespace)
+404             self._store_local(updated_pfs, events.UPDATED)
+405         if new_pfs:
+406             self._process_create(new_pfs, ri, interface_name,
+407                                  namespace, iptable_manager)
+408             self._store_local(new_pfs, events.CREATED)
+409         if remove_pfs:
+410             self._process_delete(context, remove_pfs, ri, interface_name,
+411                                  namespace, iptable_manager)
+412             self._store_local(remove_pfs, events.DELETED)
+413 
+414     def process_port_forwarding(self, context, data):
+415         ri = self._get_router_info(data['id'])
+416         mappings = ri.port_forwarding_mappings
+417         if not self._check_if_need_process(ri) or not mappings:
+418             return
+419 
+420         self.check_local_port_forwardings(context, ri, mappings)
+421 
+422     @lockutils.synchronized('port-forwarding')
+423     def add_router(self, context, data):
+424         """Handle a router add event.
+425 
+426         Called on router create.
+427 
+428         :param context: RPC context.
+429         :param data: Router data.
+430         """
+431         self.process_port_forwarding(context, data)
+432 
+433     @lockutils.synchronized('port-forwarding')
+434     def update_router(self, context, data):
+435         """Handle a router update event.
+436 
+437         Called on router update.
+438 
+439         :param context: RPC context.
+440         :param data: Router data.
+441         """
+442         self.process_port_forwarding(context, data)
+443 
+444     def delete_router(self, context, data):
+445         """Handle a router delete event.
+446 
+447         :param context: RPC context.
+448         :param data: Router data.
+449         """
+450         pass
+451 
+452     def ha_state_change(self, context, data):
+453         pass

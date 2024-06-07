@@ -1,0 +1,293 @@
+Based on the given code from a commit, please generate supplementary code files according to the commit message.
+####commit message
+[ovn]: port forwarding -- core changes
+
+This is a subset of the changes for implementing the floating IP
+port forwarding feature in neutron, using OVN as the backend.
+
+This changeset covers the core implementation for portforwarding/drivers/ovn,
+mech_driver, ovn-router as well as a subset of tests.
+
+Port forwarding support in ovn_db_sync is not included here to facilitate review.
+That, as well as all other supporting changes, are under the ovn/port_forwarding topic:
+https://review.opendev.org/#/q/topic:ovn/port_forwarding+(status:open+OR+status:merged)
+
+Depends-On: https://review.opendev.org/#/c/726478/
+Depends-On: https://review.opendev.org/#/c/729354/
+Depends-On: https://review.opendev.org/#/c/740993/
+Depends-On: https://review.opendev.org/#/c/741000/
+Partially-implements: ovn/port_forwarding
+Partial-Bug: #1877447
+
+Change-Id: I019fe11ac1ddcf2304f3f144c62d52667fc11dce
+
+####code 
+1 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
+2 #    not use this file except in compliance with the License. You may obtain
+3 #    a copy of the License at
+4 #
+5 #         http://www.apache.org/licenses/LICENSE-2.0
+6 #
+7 #    Unless required by applicable law or agreed to in writing, software
+8 #    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+9 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+10 #    License for the specific language governing permissions and limitations
+11 #    under the License.
+12 
+13 from oslo_log import log
+14 
+15 from ovsdbapp import constants as ovsdbapp_const
+16 
+17 from neutron_lib.callbacks import events
+18 from neutron_lib.callbacks import registry
+19 from neutron_lib.plugins import constants as plugin_constants
+20 from neutron_lib.plugins import directory
+21 
+22 from neutron.common.ovn import constants as ovn_const
+23 from neutron.db import ovn_revision_numbers_db as db_rev
+24 from neutron import manager
+25 from neutron.objects import port_forwarding as port_forwarding_obj
+26 from neutron.services.portforwarding.constants import LB_PROTOCOL_MAP
+27 from neutron.services.portforwarding.constants import PORT_FORWARDING
+28 from neutron.services.portforwarding.constants import PORT_FORWARDING_PLUGIN
+29 from neutron.services.portforwarding.constants import PORT_FORWARDING_PREFIX
+30 
+31 LOG = log.getLogger(__name__)
+32 
+33 
+34 class OVNPortForwardingHandler(object):
+35     @staticmethod
+36     def _get_lb_protocol(pf_obj):
+37         return LB_PROTOCOL_MAP[pf_obj.protocol]
+38 
+39     @staticmethod
+40     def lb_name(fip_id, proto):
+41         return "{}-{}-{}".format(PORT_FORWARDING_PREFIX, fip_id, proto)
+42 
+43     @classmethod
+44     def lb_names(cls, fip_id):
+45         return [cls.lb_name(fip_id, proto)
+46                 for proto in LB_PROTOCOL_MAP.values()]
+47 
+48     @classmethod
+49     def _get_lb_attributes(cls, pf_obj):
+50         lb_name = cls.lb_name(pf_obj.floatingip_id,
+51                               cls._get_lb_protocol(pf_obj))
+52         vip = "{}:{}".format(pf_obj.floating_ip_address, pf_obj.external_port)
+53         internal_ip = "{}:{}".format(pf_obj.internal_ip_address,
+54                                      pf_obj.internal_port)
+55         rtr_name = 'neutron-{}'.format(pf_obj.router_id)
+56         return lb_name, vip, [internal_ip], rtr_name
+57 
+58     def port_forwarding_update_revision_number(self, ovn_txn, nb_ovn,
+59                                                floatingip_id, fip_revision):
+60         """Update revision number of OVN lb entries based on floatingip id
+61 
+62            A single floating ip maps to 1 or 2 OVN load balancer entries,
+63            because while multiple vips can exist in a single OVN LB row,
+64            they represent one protocol. So, to handle all port forwardings
+65            for a given floating ip, OVN will have up to two LB entries: one
+66            for udp and one for tcp. These 2 LB entries are expected to have
+67            the same revision number, in sync with the revision of the floating
+68            ip. And that is set via this function.
+69         """
+70         for iter_lb_name in self.lb_names(floatingip_id):
+71             LOG.debug("Setting lb for port-forwarding %s to revision %s",
+72                       iter_lb_name, fip_revision)
+73             ovn_txn.add(nb_ovn.update_lb_external_ids(
+74                 iter_lb_name,
+75                 {ovn_const.OVN_REV_NUM_EXT_ID_KEY: str(fip_revision)}))
+76 
+77     def port_forwarding_created(self, ovn_txn, nb_ovn, pf_obj,
+78                                 is_update=False):
+79         if not is_update:
+80             LOG.info("CREATE for port-forwarding %s vip %s:%s to %s:%s",
+81                      pf_obj.protocol,
+82                      pf_obj.floating_ip_address, pf_obj.external_port,
+83                      pf_obj.internal_ip_address, pf_obj.internal_port)
+84         # Add vip to its corresponding load balancer. There can be multiple
+85         # vips, so load balancer may already be present.
+86         lb_name, vip, internal_ips, rtr_name = self._get_lb_attributes(pf_obj)
+87         external_ids = {
+88             ovn_const.OVN_DEVICE_OWNER_EXT_ID_KEY: PORT_FORWARDING_PLUGIN,
+89             ovn_const.OVN_FIP_EXT_ID_KEY: pf_obj.floatingip_id,
+90             ovn_const.OVN_ROUTER_NAME_EXT_ID_KEY: rtr_name,
+91         }
+92         ovn_txn.add(
+93             nb_ovn.lb_add(lb_name, vip, internal_ips,
+94                           self._get_lb_protocol(pf_obj), may_exist=True,
+95                           external_ids=external_ids))
+96         # Ensure logical router has load balancer configured.
+97         ovn_txn.add(nb_ovn.lr_lb_add(rtr_name, lb_name, may_exist=True))
+98 
+99     def port_forwarding_updated(self, ovn_txn, nb_ovn, pf_obj, orig_pf_obj):
+100         LOG.info("UPDATE for port-forwarding %s vip %s:%s to %s:%s",
+101                  pf_obj.protocol,
+102                  pf_obj.floating_ip_address, pf_obj.external_port,
+103                  pf_obj.internal_ip_address, pf_obj.internal_port)
+104         self.port_forwarding_deleted(ovn_txn, nb_ovn, orig_pf_obj,
+105                                      is_update=True)
+106         self.port_forwarding_created(ovn_txn, nb_ovn, pf_obj,
+107                                      is_update=True)
+108 
+109     def port_forwarding_deleted(self, ovn_txn, nb_ovn, pf_obj,
+110                                 is_update=False):
+111         if not is_update:
+112             LOG.info("DELETE for port-forwarding %s vip %s:%s to %s:%s",
+113                      pf_obj.protocol,
+114                      pf_obj.floating_ip_address, pf_obj.external_port,
+115                      pf_obj.internal_ip_address, pf_obj.internal_port)
+116         # Note: load balancer instance is expected to be removed by api once
+117         #       last vip is removed. Since router has weak ref to the lb, that
+118         #       gets taken care automatically as well.
+119         lb_name, vip, _internal_ips, _rtr = self._get_lb_attributes(pf_obj)
+120         ovn_txn.add(nb_ovn.lb_del(lb_name, vip, if_exists=True))
+121 
+122 
+123 @registry.has_registry_receivers
+124 class OVNPortForwarding(object):
+125 
+126     def __init__(self, l3_plugin):
+127         self._l3_plugin = l3_plugin
+128         self._pf_plugin_property = None
+129         self._handler = OVNPortForwardingHandler()
+130 
+131     @property
+132     def _pf_plugin(self):
+133         if self._pf_plugin_property is None:
+134             self._pf_plugin_property = directory.get_plugin(
+135                 plugin_constants.PORTFORWARDING)
+136             if not self._pf_plugin_property:
+137                 self._pf_plugin_property = (
+138                     manager.NeutronManager.load_class_for_provider(
+139                         'neutron.service_plugins', 'port_forwarding')())
+140         return self._pf_plugin_property
+141 
+142     def _get_pf_objs(self, context, fip_id):
+143         pf_dicts = self._pf_plugin.get_floatingip_port_forwardings(
+144             context, fip_id)
+145         return[port_forwarding_obj.PortForwarding(context=context, **pf_dict)
+146                for pf_dict in pf_dicts]
+147 
+148     def _get_fip_objs(self, context, payload):
+149         floatingip_ids = set()
+150         for pf_payload in payload:
+151             if pf_payload.current_pf:
+152                 floatingip_ids.add(pf_payload.current_pf.floatingip_id)
+153             if pf_payload.original_pf:
+154                 floatingip_ids.add(pf_payload.original_pf.floatingip_id)
+155         fip_objs = {}
+156         for floatingip_id in floatingip_ids:
+157             fip_objs[floatingip_id] = self._l3_plugin.get_floatingip(
+158                 context, floatingip_id)
+159         return fip_objs
+160 
+161     def _handle_notification(self, _resource, event_type, _pf_plugin, payload):
+162         if not payload:
+163             return
+164         context = payload[0].context
+165         ovn_nb = self._l3_plugin._ovn
+166         txn = ovn_nb.transaction
+167         with txn(check_error=True) as ovn_txn:
+168             if event_type == events.AFTER_CREATE:
+169                 for pf_payload in payload:
+170                     self._handler.port_forwarding_created(ovn_txn, ovn_nb,
+171                         pf_payload.current_pf)
+172             elif event_type == events.AFTER_UPDATE:
+173                 for pf_payload in payload:
+174                     self._handler.port_forwarding_updated(ovn_txn, ovn_nb,
+175                         pf_payload.current_pf, pf_payload.original_pf)
+176             elif event_type == events.AFTER_DELETE:
+177                 for pf_payload in payload:
+178                     self._handler.port_forwarding_deleted(ovn_txn, ovn_nb,
+179                         pf_payload.original_pf)
+180 
+181             # Collect the revision numbers of all floating ips visited and
+182             # update the corresponding load balancer entries affected.
+183             # Note that there may be 2 entries for a given floatingip_id;
+184             # one for each protocol.
+185             fip_objs = self._get_fip_objs(context, payload)
+186             for floatingip_id, fip_obj in fip_objs.items():
+187                 fip_revision = fip_obj.get('revision_number', -1)
+188                 self._handler.port_forwarding_update_revision_number(
+189                     ovn_txn, ovn_nb, floatingip_id, fip_revision)
+190         # Update revision of affected floating ips. Note that even in
+191         # cases where port forwarding is deleted, floating ip remains.
+192         for fip_obj in fip_objs.values():
+193             db_rev.bump_revision(context, fip_obj, ovn_const.TYPE_FLOATINGIPS)
+194 
+195     def _maintenance_callback(self, context, fip_id, is_delete):
+196         # NOTE: Since the maintenance callback is not granular to the level
+197         #       of the affected pfs AND the fact that pfs are all vips
+198         #       in a load balancer entry, it is cheap enough to simply rebuild.
+199         ovn_nb = self._l3_plugin._ovn
+200         txn = ovn_nb.transaction
+201         pf_objs = [] if is_delete else self._get_pf_objs(context, fip_id)
+202         LOG.debug("Maintenance port forwarding under fip %s (delete: %s) : %s",
+203                   fip_id, is_delete, pf_objs)
+204         with txn(check_error=True) as ovn_txn:
+205             for lb_name in self._handler.lb_names(fip_id):
+206                 ovn_txn.add(ovn_nb.lb_del(lb_name, vip=None, if_exists=True))
+207 
+208             if not is_delete:
+209                 for pf_obj in pf_objs:
+210                     self._handler.port_forwarding_created(
+211                         ovn_txn, ovn_nb, pf_obj)
+212                 fip_obj = self._l3_plugin.get_floatingip(context, fip_id)
+213                 fip_revision = fip_obj.get('revision_number', -1)
+214                 self._handler.port_forwarding_update_revision_number(ovn_txn,
+215                     ovn_nb, fip_id, fip_revision)
+216 
+217         if not is_delete:
+218             db_rev.bump_revision(context, fip_obj, ovn_const.TYPE_FLOATINGIPS)
+219 
+220     def maintenance_create(self, context, floatingip):
+221         fip_id = floatingip['id']
+222         LOG.info("Maintenance CREATE port-forwarding entries under fip %s",
+223                  fip_id)
+224         self._maintenance_callback(context, fip_id, is_delete=False)
+225 
+226     def maintenance_update(self, context, floatingip, _fip_object):
+227         fip_id = floatingip['id']
+228         LOG.info("Maintenance UPDATE port-forwarding entries under fip %s",
+229                  fip_id)
+230         self._maintenance_callback(context, fip_id, is_delete=False)
+231 
+232     def maintenance_delete(self, context, fip_id, _fip_object):
+233         LOG.info("Maintenance DELETE port-forwarding entries under fip %s",
+234                  fip_id)
+235         self._maintenance_callback(context, fip_id, is_delete=True)
+236 
+237     def db_sync_create_or_update(self, context, fip_id, ovn_txn):
+238         LOG.info("db_sync UPDATE entries under fip %s", fip_id)
+239         # NOTE: Since the db_sync callback is not granular to the level
+240         #       of the affected pfs AND the fact that pfs are all vips
+241         #       in a load balancer entry, it is cheap enough to simply rebuild.
+242         ovn_nb = self._l3_plugin._ovn
+243         pf_objs = self._get_pf_objs(context, fip_id)
+244         LOG.debug("Db sync port forwarding under fip %s : %s", fip_id, pf_objs)
+245         for lb_name in self._handler.lb_names(fip_id):
+246             ovn_txn.add(ovn_nb.lb_del(lb_name, vip=None, if_exists=True))
+247         for pf_obj in pf_objs:
+248             self._handler.port_forwarding_created(ovn_txn, ovn_nb, pf_obj)
+249         fip_obj = self._l3_plugin.get_floatingip(context, fip_id)
+250         fip_revision = fip_obj.get('revision_number', -1)
+251         self._handler.port_forwarding_update_revision_number(ovn_txn,
+252             ovn_nb, fip_id, fip_revision)
+253 
+254     def db_sync_delete(self, context, fip_id, ovn_txn):
+255         LOG.info("db_sync DELETE entries under fip %s", fip_id)
+256         ovn_nb = self._l3_plugin._ovn
+257         for lb_name in self._handler.lb_names(fip_id):
+258             ovn_txn.add(ovn_nb.lb_del(lb_name, vip=None, if_exists=True))
+259 
+260     @staticmethod
+261     def ovn_lb_protocol(pf_protocol):
+262         return LB_PROTOCOL_MAP.get(pf_protocol, ovsdbapp_const.PROTO_TCP)
+263 
+264     @registry.receives(PORT_FORWARDING_PLUGIN, [events.AFTER_INIT])
+265     def register(self, resource, event, trigger, payload=None):
+266         for event_type in (events.AFTER_CREATE, events.AFTER_UPDATE,
+267                            events.AFTER_DELETE):
+268             registry.subscribe(self._handle_notification, PORT_FORWARDING,
+269                                event_type)

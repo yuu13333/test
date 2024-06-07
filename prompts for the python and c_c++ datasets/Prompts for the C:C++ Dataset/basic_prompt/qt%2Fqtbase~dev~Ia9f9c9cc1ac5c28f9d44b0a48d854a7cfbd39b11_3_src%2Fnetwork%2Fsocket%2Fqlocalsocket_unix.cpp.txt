@@ -1,0 +1,680 @@
+Please review the code below to detect security defects. If any are found, please describe the security defect in detail and indicate the corresponding line number of code and solution. If none are found, please state '''No security defects are detected in the code'''.
+
+1 /****************************************************************************
+2 **
+3 ** Copyright (C) 2016 The Qt Company Ltd.
+4 ** Contact: https://www.qt.io/licensing/
+5 **
+6 ** This file is part of the QtNetwork module of the Qt Toolkit.
+7 **
+8 ** $QT_BEGIN_LICENSE:LGPL$
+9 ** Commercial License Usage
+10 ** Licensees holding valid commercial Qt licenses may use this file in
+11 ** accordance with the commercial license agreement provided with the
+12 ** Software or, alternatively, in accordance with the terms contained in
+13 ** a written agreement between you and The Qt Company. For licensing terms
+14 ** and conditions see https://www.qt.io/terms-conditions. For further
+15 ** information use the contact form at https://www.qt.io/contact-us.
+16 **
+17 ** GNU Lesser General Public License Usage
+18 ** Alternatively, this file may be used under the terms of the GNU Lesser
+19 ** General Public License version 3 as published by the Free Software
+20 ** Foundation and appearing in the file LICENSE.LGPL3 included in the
+21 ** packaging of this file. Please review the following information to
+22 ** ensure the GNU Lesser General Public License version 3 requirements
+23 ** will be met: https://www.gnu.org/licenses/lgpl-3.0.html.
+24 **
+25 ** GNU General Public License Usage
+26 ** Alternatively, this file may be used under the terms of the GNU
+27 ** General Public License version 2.0 or (at your option) the GNU General
+28 ** Public license version 3 or any later version approved by the KDE Free
+29 ** Qt Foundation. The licenses are as published by the Free Software
+30 ** Foundation and appearing in the file LICENSE.GPL2 and LICENSE.GPL3
+31 ** included in the packaging of this file. Please review the following
+32 ** information to ensure the GNU General Public License requirements will
+33 ** be met: https://www.gnu.org/licenses/gpl-2.0.html and
+34 ** https://www.gnu.org/licenses/gpl-3.0.html.
+35 **
+36 ** $QT_END_LICENSE$
+37 **
+38 ****************************************************************************/
+39 
+40 #include "qlocalsocket.h"
+41 #include "qlocalsocket_p.h"
+42 #include "qnet_unix_p.h"
+43 
+44 #include <sys/types.h>
+45 #include <sys/socket.h>
+46 #include <sys/un.h>
+47 #include <unistd.h>
+48 #include <fcntl.h>
+49 #include <errno.h>
+50 
+51 #include <qdir.h>
+52 #include <qdebug.h>
+53 #include <qelapsedtimer.h>
+54 
+55 #ifdef Q_OS_VXWORKS
+56 #  include <selectLib.h>
+57 #endif
+58 
+59 #define QT_CONNECT_TIMEOUT 30000
+60 
+61 namespace {
+62 
+63 #if defined(Q_OS_LINUX)
+64 //Connecting to abstract socket possible states
+65 enum class AbstractSocketState
+66 {
+67     Undefined,
+68     Connecting,
+69     Ok,
+70     Retry,
+71     Error
+72 };
+73 AbstractSocketState abstractConnectStatus = AbstractSocketState::Undefined;
+74 #endif
+75 
+76 // determine the full server path
+77 QString GetPathNameForConnection(const QString connectingName)
+78 {
+79     auto connectingPathName = connectingName;
+80     if (!connectingName.startsWith(QLatin1Char('/'))) {
+81         connectingPathName = QDir::tempPath();
+82         connectingPathName += QLatin1Char('/') + connectingName;
+83     }
+84     return connectingPathName;
+85 }
+86 
+87 }
+88 
+89 QT_BEGIN_NAMESPACE
+90 
+91 QLocalSocketPrivate::QLocalSocketPrivate() : QIODevicePrivate(),
+92         delayConnect(nullptr),
+93         connectTimer(nullptr),
+94         connectingSocket(-1),
+95         state(QLocalSocket::UnconnectedState)
+96 {
+97 }
+98 
+99 void QLocalSocketPrivate::init()
+100 {
+101     Q_Q(QLocalSocket);
+102     // QIODevice signals
+103     q->connect(&unixSocket, SIGNAL(aboutToClose()), q, SIGNAL(aboutToClose()));
+104     q->connect(&unixSocket, SIGNAL(bytesWritten(qint64)),
+105                q, SIGNAL(bytesWritten(qint64)));
+106     q->connect(&unixSocket, SIGNAL(readyRead()), q, SIGNAL(readyRead()));
+107     // QAbstractSocket signals
+108     q->connect(&unixSocket, SIGNAL(connected()), q, SIGNAL(connected()));
+109     q->connect(&unixSocket, SIGNAL(disconnected()), q, SIGNAL(disconnected()));
+110     q->connect(&unixSocket, SIGNAL(stateChanged(QAbstractSocket::SocketState)),
+111                q, SLOT(_q_stateChanged(QAbstractSocket::SocketState)));
+112     q->connect(&unixSocket, SIGNAL(errorOccurred(QAbstractSocket::SocketError)),
+113                q, SLOT(_q_errorOccurred(QAbstractSocket::SocketError)));
+114     q->connect(&unixSocket, SIGNAL(readChannelFinished()), q, SIGNAL(readChannelFinished()));
+115     unixSocket.setParent(q);
+116 }
+117 
+118 void QLocalSocketPrivate::_q_errorOccurred(QAbstractSocket::SocketError socketError)
+119 {
+120     Q_Q(QLocalSocket);
+121     QString function = QLatin1String("QLocalSocket");
+122     QLocalSocket::LocalSocketError error = (QLocalSocket::LocalSocketError)socketError;
+123     QString errorString = generateErrorString(error, function);
+124     q->setErrorString(errorString);
+125     emit q->errorOccurred(error);
+126 }
+127 
+128 void QLocalSocketPrivate::_q_stateChanged(QAbstractSocket::SocketState newState)
+129 {
+130     Q_Q(QLocalSocket);
+131     QLocalSocket::LocalSocketState currentState = state;
+132     switch(newState) {
+133     case QAbstractSocket::UnconnectedState:
+134         state = QLocalSocket::UnconnectedState;
+135         serverName.clear();
+136         fullServerName.clear();
+137         break;
+138     case QAbstractSocket::ConnectingState:
+139         state = QLocalSocket::ConnectingState;
+140         break;
+141     case QAbstractSocket::ConnectedState:
+142         state = QLocalSocket::ConnectedState;
+143         break;
+144     case QAbstractSocket::ClosingState:
+145         state = QLocalSocket::ClosingState;
+146         break;
+147     default:
+148 #if defined QLOCALSOCKET_DEBUG
+149         qWarning() << "QLocalSocket::Unhandled socket state change:" << newState;
+150 #endif
+151         return;
+152     }
+153     if (currentState != state)
+154         emit q->stateChanged(state);
+155 }
+156 
+157 QString QLocalSocketPrivate::generateErrorString(QLocalSocket::LocalSocketError error, const QString &function) const
+158 {
+159     QString errorString;
+160     switch (error) {
+161     case QLocalSocket::ConnectionRefusedError:
+162         errorString = QLocalSocket::tr("%1: Connection refused").arg(function);
+163         break;
+164     case QLocalSocket::PeerClosedError:
+165         errorString = QLocalSocket::tr("%1: Remote closed").arg(function);
+166         break;
+167     case QLocalSocket::ServerNotFoundError:
+168         errorString = QLocalSocket::tr("%1: Invalid name").arg(function);
+169         break;
+170     case QLocalSocket::SocketAccessError:
+171         errorString = QLocalSocket::tr("%1: Socket access error").arg(function);
+172         break;
+173     case QLocalSocket::SocketResourceError:
+174         errorString = QLocalSocket::tr("%1: Socket resource error").arg(function);
+175         break;
+176     case QLocalSocket::SocketTimeoutError:
+177         errorString = QLocalSocket::tr("%1: Socket operation timed out").arg(function);
+178         break;
+179     case QLocalSocket::DatagramTooLargeError:
+180         errorString = QLocalSocket::tr("%1: Datagram too large").arg(function);
+181         break;
+182     case QLocalSocket::ConnectionError:
+183         errorString = QLocalSocket::tr("%1: Connection error").arg(function);
+184         break;
+185     case QLocalSocket::UnsupportedSocketOperationError:
+186         errorString = QLocalSocket::tr("%1: The socket operation is not supported").arg(function);
+187         break;
+188     case QLocalSocket::OperationError:
+189         errorString = QLocalSocket::tr("%1: Operation not permitted when socket is in this state").arg(function);
+190         break;
+191     case QLocalSocket::UnknownSocketError:
+192     default:
+193         errorString = QLocalSocket::tr("%1: Unknown error %2").arg(function).arg(errno);
+194     }
+195     return errorString;
+196 }
+197 
+198 void QLocalSocketPrivate::setErrorAndEmit(QLocalSocket::LocalSocketError error, const QString &function)
+199 {
+200     Q_Q(QLocalSocket);
+201     switch (error) {
+202     case QLocalSocket::ConnectionRefusedError:
+203         unixSocket.setSocketError(QAbstractSocket::ConnectionRefusedError);
+204         break;
+205     case QLocalSocket::PeerClosedError:
+206         unixSocket.setSocketError(QAbstractSocket::RemoteHostClosedError);
+207         break;
+208     case QLocalSocket::ServerNotFoundError:
+209         unixSocket.setSocketError(QAbstractSocket::HostNotFoundError);
+210         break;
+211     case QLocalSocket::SocketAccessError:
+212         unixSocket.setSocketError(QAbstractSocket::SocketAccessError);
+213         break;
+214     case QLocalSocket::SocketResourceError:
+215         unixSocket.setSocketError(QAbstractSocket::SocketResourceError);
+216         break;
+217     case QLocalSocket::SocketTimeoutError:
+218         unixSocket.setSocketError(QAbstractSocket::SocketTimeoutError);
+219         break;
+220     case QLocalSocket::DatagramTooLargeError:
+221         unixSocket.setSocketError(QAbstractSocket::DatagramTooLargeError);
+222         break;
+223     case QLocalSocket::ConnectionError:
+224         unixSocket.setSocketError(QAbstractSocket::NetworkError);
+225         break;
+226     case QLocalSocket::UnsupportedSocketOperationError:
+227         unixSocket.setSocketError(QAbstractSocket::UnsupportedSocketOperationError);
+228         break;
+229     case QLocalSocket::UnknownSocketError:
+230     default:
+231         unixSocket.setSocketError(QAbstractSocket::UnknownSocketError);
+232     }
+233 
+234     QString errorString = generateErrorString(error, function);
+235     q->setErrorString(errorString);
+236     emit q->errorOccurred(error);
+237 
+238     // errors cause a disconnect
+239     unixSocket.setSocketState(QAbstractSocket::UnconnectedState);
+240     bool stateChanged = (state != QLocalSocket::UnconnectedState);
+241     state = QLocalSocket::UnconnectedState;
+242     q->close();
+243     if (stateChanged)
+244         q->emit stateChanged(state);
+245 }
+246 
+247 void QLocalSocket::connectToServer(OpenMode openMode)
+248 {
+249     Q_D(QLocalSocket);
+250     if (state() == ConnectedState || state() == ConnectingState) {
+251         QString errorString = d->generateErrorString(QLocalSocket::OperationError, QLatin1String("QLocalSocket::connectToserver"));
+252         setErrorString(errorString);
+253         emit errorOccurred(QLocalSocket::OperationError);
+254         return;
+255     }
+256 
+257     d->errorString.clear();
+258     d->unixSocket.setSocketState(QAbstractSocket::ConnectingState);
+259     d->state = ConnectingState;
+260     emit stateChanged(d->state);
+261 
+262     if (d->serverName.isEmpty()) {
+263         d->setErrorAndEmit(ServerNotFoundError,
+264                            QLatin1String("QLocalSocket::connectToServer"));
+265         return;
+266     }
+267 
+268     // create the socket
+269     if (-1 == (d->connectingSocket = qt_safe_socket(PF_UNIX, SOCK_STREAM, 0, O_NONBLOCK))) {
+270         d->setErrorAndEmit(UnsupportedSocketOperationError,
+271                            QLatin1String("QLocalSocket::connectToServer"));
+272         return;
+273     }
+274 
+275     // _q_connectToSocket does the actual connecting
+276     d->connectingName = d->serverName;
+277     d->connectingOpenMode = openMode;
+278     d->_q_connectToSocket();
+279     return;
+280 }
+281 
+282 /*!
+283     \internal
+284 
+285     Tries to connect connectingName and connectingOpenMode
+286     In case of Linux or Android it tries to connect to an
+287     abstract socket, and if this fails connects to a regular one
+288 
+289     \sa connectToServer(), waitForConnected()
+290   */
+291 
+292 void QLocalSocketPrivate::_q_connectToSocket()
+293 {
+294 
+295 #if defined(Q_OS_LINUX)
+296     abstractConnectStatus = ::AbstractSocketState::Connecting;
+297     _q_connectToAbstractSocket();
+298     if (abstractConnectStatus == ::AbstractSocketState::Error)
+299         _q_connectToRegularSocket();
+300 #else
+301     _q_connectToRegularSocket();
+302 #endif
+303 }
+304 
+305 #if defined(Q_OS_LINUX)
+306 /*!
+307     \internal
+308 
+309     Tries to connect connectingName and connectingOpenMode. The socket will be
+310     an abstract one. This is specific to Linux and Android sockets.
+311 
+312     \sa connectToServer(), waitForConnected()
+313 */
+314 
+315 void QLocalSocketPrivate::_q_connectToAbstractSocket()
+316 {
+317     Q_Q(QLocalSocket);
+318     // determine the full server path
+319     const auto connectingPathName = ::GetPathNameForConnection(connectingName);
+320     const QByteArray encodedConnectingPathName = QFile::encodeName(connectingPathName);
+321     struct ::sockaddr_un addr = {PF_UNIX, {}};
+322 
+323     // add 2 to length, to take into account trailing AND leading null
+324     if (sizeof(addr.sun_path) < (uint)encodedConnectingPathName.size() + 2) {
+325         QString function = QLatin1String("QLocalSocket::connectToServer");
+326         setErrorAndEmit(QLocalSocket::ServerNotFoundError, function);
+327         return;
+328     }
+329     ::memcpy(addr.sun_path + 1, encodedConnectingPathName.constData(),
+330              encodedConnectingPathName.size() + 1);
+331 
+332     const int addrSize = strlen(&addr.sun_path[1]) + sizeof(sa_family_t) + 1;
+333 
+334     int errorCode = 0;
+335     if (-1 == qt_safe_connect(connectingSocket, (struct sockaddr *)&addr, addrSize)) {
+336         QString function = QLatin1String("QLocalSocket::connectToServer");
+337         errorCode = errno;
+338         if (errorCode == EAGAIN) {
+339             if (!delayConnect) {
+340                 delayConnect = new QSocketNotifier(connectingSocket, QSocketNotifier::Write, q);
+341                 q->connect(delayConnect, SIGNAL(activated(QSocketDescriptor)), q, SLOT(_q_connectToAbstractSocket()));
+342             }
+343             if (!connectTimer) {
+344                 connectTimer = new QTimer(q);
+345                 q->connect(connectTimer, SIGNAL(timeout()),
+346                            q, SLOT(_q_abortConnectionAttempt()),
+347                            Qt::DirectConnection);
+348                 connectTimer->start(QT_CONNECT_TIMEOUT);
+349             }
+350             delayConnect->setEnabled(true);
+351             abstractConnectStatus = ::AbstractSocketState::Retry;
+352         } else {
+353             abstractConnectStatus = ::AbstractSocketState::Error;
+354         }
+355         return;
+356     }
+357 
+358     // connected!
+359     cancelDelayedConnect();
+360 
+361     serverName = connectingName;
+362     fullServerName = connectingPathName;
+363     if (unixSocket.setSocketDescriptor(connectingSocket,
+364         QAbstractSocket::ConnectedState, connectingOpenMode)) {
+365         q->QIODevice::open(connectingOpenMode | QIODevice::Unbuffered);
+366         q->emit connected();
+367         abstractConnectStatus = ::AbstractSocketState::Ok;
+368     } else {
+369         QString function = QLatin1String("QLocalSocket::connectToServer");
+370         abstractConnectStatus = ::AbstractSocketState::Undefined;
+371         setErrorAndEmit(QLocalSocket::UnknownSocketError, function);
+372     }
+373     connectingSocket = -1;
+374     connectingName.clear();
+375     connectingOpenMode = { };
+376 }
+377 
+378 //
+379 #endif
+380 
+381 /*!
+382     \internal
+383 
+384     Tries to connect connectingName and connectingOpenMode. The socket will be
+385     a non-abstract.
+386 
+387     \sa connectToServer(), waitForConnected()
+388   */
+389 void QLocalSocketPrivate::_q_connectToRegularSocket()
+390 {
+391     Q_Q(QLocalSocket);
+392     const auto connectingPathName = ::GetPathNameForConnection(connectingName);
+393     const QByteArray encodedConnectingPathName = QFile::encodeName(connectingPathName);
+394     struct ::sockaddr_un addr = {PF_UNIX, {}};
+395 
+396     if (sizeof(addr.sun_path) < (uint)encodedConnectingPathName.size() + 1) {
+397         QString function = QLatin1String("QLocalSocket::connectToServer");
+398         setErrorAndEmit(QLocalSocket::ServerNotFoundError, function);
+399         return;
+400     }
+401     ::memcpy(addr.sun_path, encodedConnectingPathName.constData(),
+402              encodedConnectingPathName.size() + 1);
+403     if (-1 == qt_safe_connect(connectingSocket, (struct sockaddr *)&addr, sizeof(addr))) {
+404         QString function = QLatin1String("QLocalSocket::connectToServer");
+405         switch (errno)
+406         {
+407         case EINVAL:
+408         case ECONNREFUSED:
+409             setErrorAndEmit(QLocalSocket::ConnectionRefusedError, function);
+410             break;
+411         case ENOENT:
+412             setErrorAndEmit(QLocalSocket::ServerNotFoundError, function);
+413             break;
+414         case EACCES:
+415         case EPERM:
+416             setErrorAndEmit(QLocalSocket::SocketAccessError, function);
+417             break;
+418         case ETIMEDOUT:
+419             setErrorAndEmit(QLocalSocket::SocketTimeoutError, function);
+420             break;
+421         case EAGAIN:
+422             // Try again later, all of the sockets listening are full
+423             if (!delayConnect) {
+424                 delayConnect = new QSocketNotifier(connectingSocket, QSocketNotifier::Write, q);
+425                 q->connect(delayConnect, SIGNAL(activated(QSocketDescriptor)), q, SLOT(_q_connectToRegularSocket()));
+426             }
+427             if (!connectTimer) {
+428                 connectTimer = new QTimer(q);
+429                 q->connect(connectTimer, SIGNAL(timeout()),
+430                                  q, SLOT(_q_abortConnectionAttempt()),
+431                                  Qt::DirectConnection);
+432                 connectTimer->start(QT_CONNECT_TIMEOUT);
+433             }
+434             delayConnect->setEnabled(true);
+435             break;
+436         default:
+437             setErrorAndEmit(QLocalSocket::UnknownSocketError, function);
+438         }
+439         return;
+440     }
+441 
+442     // connected!
+443     cancelDelayedConnect();
+444 
+445     serverName = connectingName;
+446     fullServerName = connectingPathName;
+447     if (unixSocket.setSocketDescriptor(connectingSocket,
+448         QAbstractSocket::ConnectedState, connectingOpenMode)) {
+449         q->QIODevice::open(connectingOpenMode | QIODevice::Unbuffered);
+450         q->emit connected();
+451     } else {
+452         QString function = QLatin1String("QLocalSocket::connectToServer");
+453         setErrorAndEmit(QLocalSocket::UnknownSocketError, function);
+454     }
+455     connectingSocket = -1;
+456     connectingName.clear();
+457     connectingOpenMode = { };
+458 }
+459 
+460 bool QLocalSocket::setSocketDescriptor(qintptr socketDescriptor,
+461         LocalSocketState socketState, OpenMode openMode)
+462 {
+463     Q_D(QLocalSocket);
+464     QAbstractSocket::SocketState newSocketState = QAbstractSocket::UnconnectedState;
+465     switch (socketState) {
+466     case ConnectingState:
+467         newSocketState = QAbstractSocket::ConnectingState;
+468         break;
+469     case ConnectedState:
+470         newSocketState = QAbstractSocket::ConnectedState;
+471         break;
+472     case ClosingState:
+473         newSocketState = QAbstractSocket::ClosingState;
+474         break;
+475     case UnconnectedState:
+476         newSocketState = QAbstractSocket::UnconnectedState;
+477         break;
+478     }
+479     QIODevice::open(openMode);
+480     d->state = socketState;
+481     return d->unixSocket.setSocketDescriptor(socketDescriptor,
+482                                              newSocketState, openMode);
+483 }
+484 
+485 void QLocalSocketPrivate::_q_abortConnectionAttempt()
+486 {
+487     Q_Q(QLocalSocket);
+488     q->close();
+489 }
+490 
+491 void QLocalSocketPrivate::cancelDelayedConnect()
+492 {
+493     if (delayConnect) {
+494         delayConnect->setEnabled(false);
+495         delete delayConnect;
+496         delayConnect = nullptr;
+497         connectTimer->stop();
+498         delete connectTimer;
+499         connectTimer = nullptr;
+500     }
+501 }
+502 
+503 qintptr QLocalSocket::socketDescriptor() const
+504 {
+505     Q_D(const QLocalSocket);
+506     return d->unixSocket.socketDescriptor();
+507 }
+508 
+509 qint64 QLocalSocket::readData(char *data, qint64 c)
+510 {
+511     Q_D(QLocalSocket);
+512     return d->unixSocket.read(data, c);
+513 }
+514 
+515 qint64 QLocalSocket::skipData(qint64 maxSize)
+516 {
+517     return d_func()->unixSocket.skip(maxSize);
+518 }
+519 
+520 qint64 QLocalSocket::writeData(const char *data, qint64 c)
+521 {
+522     Q_D(QLocalSocket);
+523     return d->unixSocket.writeData(data, c);
+524 }
+525 
+526 void QLocalSocket::abort()
+527 {
+528     Q_D(QLocalSocket);
+529     d->unixSocket.abort();
+530 }
+531 
+532 qint64 QLocalSocket::bytesAvailable() const
+533 {
+534     Q_D(const QLocalSocket);
+535     return QIODevice::bytesAvailable() + d->unixSocket.bytesAvailable();
+536 }
+537 
+538 qint64 QLocalSocket::bytesToWrite() const
+539 {
+540     Q_D(const QLocalSocket);
+541     return d->unixSocket.bytesToWrite();
+542 }
+543 
+544 bool QLocalSocket::canReadLine() const
+545 {
+546     Q_D(const QLocalSocket);
+547     return QIODevice::canReadLine() || d->unixSocket.canReadLine();
+548 }
+549 
+550 void QLocalSocket::close()
+551 {
+552     Q_D(QLocalSocket);
+553     d->unixSocket.close();
+554     d->cancelDelayedConnect();
+555     if (d->connectingSocket != -1)
+556         ::close(d->connectingSocket);
+557     d->connectingSocket = -1;
+558     d->connectingName.clear();
+559     d->connectingOpenMode = { };
+560     d->serverName.clear();
+561     d->fullServerName.clear();
+562     QIODevice::close();
+563 }
+564 
+565 bool QLocalSocket::waitForBytesWritten(int msecs)
+566 {
+567     Q_D(QLocalSocket);
+568     return d->unixSocket.waitForBytesWritten(msecs);
+569 }
+570 
+571 bool QLocalSocket::flush()
+572 {
+573     Q_D(QLocalSocket);
+574     return d->unixSocket.flush();
+575 }
+576 
+577 void QLocalSocket::disconnectFromServer()
+578 {
+579     Q_D(QLocalSocket);
+580     d->unixSocket.disconnectFromHost();
+581 }
+582 
+583 QLocalSocket::LocalSocketError QLocalSocket::error() const
+584 {
+585     Q_D(const QLocalSocket);
+586     switch (d->unixSocket.error()) {
+587     case QAbstractSocket::ConnectionRefusedError:
+588         return QLocalSocket::ConnectionRefusedError;
+589     case QAbstractSocket::RemoteHostClosedError:
+590         return QLocalSocket::PeerClosedError;
+591     case QAbstractSocket::HostNotFoundError:
+592         return QLocalSocket::ServerNotFoundError;
+593     case QAbstractSocket::SocketAccessError:
+594         return QLocalSocket::SocketAccessError;
+595     case QAbstractSocket::SocketResourceError:
+596         return QLocalSocket::SocketResourceError;
+597     case QAbstractSocket::SocketTimeoutError:
+598         return QLocalSocket::SocketTimeoutError;
+599     case QAbstractSocket::DatagramTooLargeError:
+600         return QLocalSocket::DatagramTooLargeError;
+601     case QAbstractSocket::NetworkError:
+602         return QLocalSocket::ConnectionError;
+603     case QAbstractSocket::UnsupportedSocketOperationError:
+604         return QLocalSocket::UnsupportedSocketOperationError;
+605     case QAbstractSocket::UnknownSocketError:
+606         return QLocalSocket::UnknownSocketError;
+607     default:
+608 #if defined QLOCALSOCKET_DEBUG
+609         qWarning() << "QLocalSocket error not handled:" << d->unixSocket.error();
+610 #endif
+611         break;
+612     }
+613     return UnknownSocketError;
+614 }
+615 
+616 bool QLocalSocket::isValid() const
+617 {
+618     Q_D(const QLocalSocket);
+619     return d->unixSocket.isValid();
+620 }
+621 
+622 qint64 QLocalSocket::readBufferSize() const
+623 {
+624     Q_D(const QLocalSocket);
+625     return d->unixSocket.readBufferSize();
+626 }
+627 
+628 void QLocalSocket::setReadBufferSize(qint64 size)
+629 {
+630     Q_D(QLocalSocket);
+631     d->unixSocket.setReadBufferSize(size);
+632 }
+633 
+634 bool QLocalSocket::waitForConnected(int msec)
+635 {
+636     Q_D(QLocalSocket);
+637 
+638     if (state() != ConnectingState)
+639         return (state() == ConnectedState);
+640 
+641     QElapsedTimer timer;
+642     timer.start();
+643 
+644     pollfd pfd = qt_make_pollfd(d->connectingSocket, POLLIN);
+645 
+646     do {
+647         const int timeout = (msec > 0) ? qMax(msec - timer.elapsed(), Q_INT64_C(0)) : msec;
+648         const int result = qt_poll_msecs(&pfd, 1, timeout);
+649 
+650         if (result == -1)
+651             d->setErrorAndEmit(QLocalSocket::UnknownSocketError,
+652                                QLatin1String("QLocalSocket::waitForConnected"));
+653         else if (result > 0)
+654             d->_q_connectToSocket();
+655     } while (state() == ConnectingState && !timer.hasExpired(msec));
+656 
+657     return (state() == ConnectedState);
+658 }
+659 
+660 bool QLocalSocket::waitForDisconnected(int msecs)
+661 {
+662     Q_D(QLocalSocket);
+663     if (state() == UnconnectedState) {
+664         qWarning("QLocalSocket::waitForDisconnected() is not allowed in UnconnectedState");
+665         return false;
+666     }
+667     return (d->unixSocket.waitForDisconnected(msecs));
+668 }
+669 
+670 bool QLocalSocket::waitForReadyRead(int msecs)
+671 {
+672     Q_D(QLocalSocket);
+673     if (state() == QLocalSocket::UnconnectedState)
+674         return false;
+675     return (d->unixSocket.waitForReadyRead(msecs));
+676 }
+677 
+678 QT_END_NAMESPACE

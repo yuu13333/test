@@ -1,0 +1,428 @@
+I want you to act as a code reviewer of Nova in OpenStack. Please review the code below to detect security defects. If any are found, please describe the security defect in detail and indicate the corresponding line number of code and solution. If none are found, please state '''No security defects are detected in the code'''.
+
+1 # Copyright 2010 United States Government as represented by the
+2 # Administrator of the National Aeronautics and Space Administration.
+3 # Copyright 2011 Justin Santa Barbara
+4 # All Rights Reserved.
+5 #
+6 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
+7 #    not use this file except in compliance with the License. You may obtain
+8 #    a copy of the License at
+9 #
+10 #         http://www.apache.org/licenses/LICENSE-2.0
+11 #
+12 #    Unless required by applicable law or agreed to in writing, software
+13 #    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+14 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+15 #    License for the specific language governing permissions and limitations
+16 #    under the License.
+17 
+18 """Generic Node base class for all workers that run on hosts."""
+19 
+20 import os
+21 import random
+22 import sys
+23 
+24 from oslo_concurrency import processutils
+25 from oslo_log import log as logging
+26 import oslo_messaging as messaging
+27 from oslo_service import service
+28 from oslo_utils import importutils
+29 
+30 from nova import baserpc
+31 from nova import conductor
+32 import nova.conf
+33 from nova import context
+34 from nova import debugger
+35 from nova import exception
+36 from nova.i18n import _, _LE, _LI, _LW
+37 from nova import objects
+38 from nova.objects import base as objects_base
+39 from nova.objects import service as service_obj
+40 from nova import rpc
+41 from nova import servicegroup
+42 from nova import utils
+43 from nova import version
+44 from nova import wsgi
+45 
+46 LOG = logging.getLogger(__name__)
+47 
+48 CONF = nova.conf.CONF
+49 
+50 SERVICE_MANAGERS = {
+51     'nova-compute': 'nova.compute.manager.ComputeManager',
+52     'nova-console': 'nova.console.manager.ConsoleProxyManager',
+53     'nova-consoleauth': 'nova.consoleauth.manager.ConsoleAuthManager',
+54     'nova-cert': 'nova.cert.manager.CertManager',
+55     'nova-conductor': 'nova.conductor.manager.ConductorManager',
+56     'nova-metadata': 'nova.api.manager.MetadataManager',
+57     'nova-scheduler': 'nova.scheduler.manager.SchedulerManager',
+58     'nova-cells': 'nova.cells.manager.CellsManager',
+59 }
+60 
+61 
+62 def _create_service_ref(this_service, context):
+63     service = objects.Service(context)
+64     service.host = this_service.host
+65     service.binary = this_service.binary
+66     service.topic = this_service.topic
+67     service.report_count = 0
+68     service.create()
+69     return service
+70 
+71 
+72 def _update_service_ref(service):
+73     if service.version != service_obj.SERVICE_VERSION:
+74         LOG.info(_LI('Updating service version for %(binary)s on '
+75                      '%(host)s from %(old)i to %(new)i'),
+76                  {'binary': service.binary,
+77                   'host': service.host,
+78                   'old': service.version,
+79                   'new': service_obj.SERVICE_VERSION})
+80         service.version = service_obj.SERVICE_VERSION
+81         service.save()
+82 
+83 
+84 class Service(service.Service):
+85     """Service object for binaries running on hosts.
+86 
+87     A service takes a manager and enables rpc by listening to queues based
+88     on topic. It also periodically runs tasks on the manager and reports
+89     its state to the database services table.
+90     """
+91 
+92     def __init__(self, host, binary, topic, manager, report_interval=None,
+93                  periodic_enable=None, periodic_fuzzy_delay=None,
+94                  periodic_interval_max=None, *args, **kwargs):
+95         super(Service, self).__init__()
+96         self.host = host
+97         self.binary = binary
+98         self.topic = topic
+99         self.manager_class_name = manager
+100         self.servicegroup_api = servicegroup.API()
+101         manager_class = importutils.import_class(self.manager_class_name)
+102         self.manager = manager_class(host=self.host, *args, **kwargs)
+103         self.rpcserver = None
+104         self.report_interval = report_interval
+105         self.periodic_enable = periodic_enable
+106         self.periodic_fuzzy_delay = periodic_fuzzy_delay
+107         self.periodic_interval_max = periodic_interval_max
+108         self.saved_args, self.saved_kwargs = args, kwargs
+109         self.backdoor_port = None
+110         if objects_base.NovaObject.indirection_api:
+111             conductor_api = conductor.API()
+112             conductor_api.wait_until_ready(context.get_admin_context())
+113 
+114     def __repr__(self):
+115         return "<%(cls_name)s: host=%(host)s, binary=%(binary)s, " \
+116                "manager_class_name=%(manager)s>" % {
+117                  'cls_name': self.__class__.__name__,
+118                  'host': self.host,
+119                  'binary': self.binary,
+120                  'manager': self.manager_class_name
+121                 }
+122 
+123     def start(self):
+124         verstr = version.version_string_with_package()
+125         LOG.info(_LI('Starting %(topic)s node (version %(version)s)'),
+126                   {'topic': self.topic, 'version': verstr})
+127         self.basic_config_check()
+128         self.manager.init_host()
+129         self.model_disconnected = False
+130         ctxt = context.get_admin_context()
+131         self.service_ref = objects.Service.get_by_host_and_binary(
+132             ctxt, self.host, self.binary)
+133         if self.service_ref:
+134             _update_service_ref(self.service_ref)
+135 
+136         else:
+137             try:
+138                 self.service_ref = _create_service_ref(self, ctxt)
+139             except (exception.ServiceTopicExists,
+140                     exception.ServiceBinaryExists):
+141                 # NOTE(danms): If we race to create a record with a sibling
+142                 # worker, don't fail here.
+143                 self.service_ref = objects.Service.get_by_host_and_binary(
+144                     ctxt, self.host, self.binary)
+145 
+146         self.manager.pre_start_hook()
+147 
+148         if self.backdoor_port is not None:
+149             self.manager.backdoor_port = self.backdoor_port
+150 
+151         LOG.debug("Creating RPC server for service %s", self.topic)
+152 
+153         target = messaging.Target(topic=self.topic, server=self.host)
+154 
+155         endpoints = [
+156             self.manager,
+157             baserpc.BaseRPCAPI(self.manager.service_name, self.backdoor_port)
+158         ]
+159         endpoints.extend(self.manager.additional_endpoints)
+160 
+161         serializer = objects_base.NovaObjectSerializer()
+162 
+163         self.rpcserver = rpc.get_server(target, endpoints, serializer)
+164         self.rpcserver.start()
+165 
+166         self.manager.post_start_hook()
+167 
+168         LOG.debug("Join ServiceGroup membership for this service %s",
+169                   self.topic)
+170         # Add service to the ServiceGroup membership group.
+171         self.servicegroup_api.join(self.host, self.topic, self)
+172 
+173         if self.periodic_enable:
+174             if self.periodic_fuzzy_delay:
+175                 initial_delay = random.randint(0, self.periodic_fuzzy_delay)
+176             else:
+177                 initial_delay = None
+178 
+179             self.tg.add_dynamic_timer(self.periodic_tasks,
+180                                      initial_delay=initial_delay,
+181                                      periodic_interval_max=
+182                                         self.periodic_interval_max)
+183 
+184     def __getattr__(self, key):
+185         manager = self.__dict__.get('manager', None)
+186         return getattr(manager, key)
+187 
+188     @classmethod
+189     def create(cls, host=None, binary=None, topic=None, manager=None,
+190                report_interval=None, periodic_enable=None,
+191                periodic_fuzzy_delay=None, periodic_interval_max=None):
+192         """Instantiates class and passes back application object.
+193 
+194         :param host: defaults to CONF.host
+195         :param binary: defaults to basename of executable
+196         :param topic: defaults to bin_name - 'nova-' part
+197         :param manager: defaults to CONF.<topic>_manager
+198         :param report_interval: defaults to CONF.report_interval
+199         :param periodic_enable: defaults to CONF.periodic_enable
+200         :param periodic_fuzzy_delay: defaults to CONF.periodic_fuzzy_delay
+201         :param periodic_interval_max: if set, the max time to wait between runs
+202 
+203         """
+204         if not host:
+205             host = CONF.host
+206         if not binary:
+207             binary = os.path.basename(sys.argv[0])
+208         if not topic:
+209             topic = binary.rpartition('nova-')[2]
+210         if not manager:
+211             manager = SERVICE_MANAGERS.get(binary)
+212         if report_interval is None:
+213             report_interval = CONF.report_interval
+214         if periodic_enable is None:
+215             periodic_enable = CONF.periodic_enable
+216         if periodic_fuzzy_delay is None:
+217             periodic_fuzzy_delay = CONF.periodic_fuzzy_delay
+218 
+219         debugger.init()
+220 
+221         service_obj = cls(host, binary, topic, manager,
+222                           report_interval=report_interval,
+223                           periodic_enable=periodic_enable,
+224                           periodic_fuzzy_delay=periodic_fuzzy_delay,
+225                           periodic_interval_max=periodic_interval_max)
+226 
+227         return service_obj
+228 
+229     def kill(self):
+230         """Destroy the service object in the datastore.
+231 
+232         NOTE: Although this method is not used anywhere else than tests, it is
+233         convenient to have it here, so the tests might easily and in clean way
+234         stop and remove the service_ref.
+235 
+236         """
+237         self.stop()
+238         try:
+239             self.service_ref.destroy()
+240         except exception.NotFound:
+241             LOG.warning(_LW('Service killed that has no database entry'))
+242 
+243     def stop(self):
+244         try:
+245             self.rpcserver.stop()
+246             self.rpcserver.wait()
+247         except Exception:
+248             pass
+249 
+250         try:
+251             self.manager.cleanup_host()
+252         except Exception:
+253             LOG.exception(_LE('Service error occurred during cleanup_host'))
+254             pass
+255 
+256         super(Service, self).stop()
+257 
+258     def periodic_tasks(self, raise_on_error=False):
+259         """Tasks to be run at a periodic interval."""
+260         ctxt = context.get_admin_context()
+261         return self.manager.periodic_tasks(ctxt, raise_on_error=raise_on_error)
+262 
+263     def basic_config_check(self):
+264         """Perform basic config checks before starting processing."""
+265         # Make sure the tempdir exists and is writable
+266         try:
+267             with utils.tempdir():
+268                 pass
+269         except Exception as e:
+270             LOG.error(_LE('Temporary directory is invalid: %s'), e)
+271             sys.exit(1)
+272 
+273     def reset(self):
+274         self.manager.reset()
+275 
+276 
+277 class WSGIService(service.Service):
+278     """Provides ability to launch API from a 'paste' configuration."""
+279 
+280     def __init__(self, name, loader=None, use_ssl=False, max_url_len=None):
+281         """Initialize, but do not start the WSGI server.
+282 
+283         :param name: The name of the WSGI server given to the loader.
+284         :param loader: Loads the WSGI application using the given name.
+285         :returns: None
+286 
+287         """
+288         self.name = name
+289         # NOTE(danms): Name can be metadata, os_compute, or ec2, per
+290         # nova.service's enabled_apis
+291         self.binary = 'nova-%s' % name
+292         self.topic = None
+293         self.manager = self._get_manager()
+294         self.loader = loader or wsgi.Loader()
+295         self.app = self.loader.load_app(name)
+296         # inherit all compute_api worker counts from osapi_compute
+297         if name.startswith('openstack_compute_api'):
+298             wname = 'osapi_compute'
+299         else:
+300             wname = name
+301         self.host = CONF.host
+302         self.listen_address = getattr(CONF, '%s_listen' % name, "0.0.0.0")
+303         self.port = getattr(CONF, '%s_listen_port' % name, 0)
+304         self.workers = (getattr(CONF, '%s_workers' % wname, None) or
+305                         processutils.get_worker_count())
+306         if self.workers and self.workers < 1:
+307             worker_name = '%s_workers' % name
+308             msg = (_("%(worker_name)s value of %(workers)s is invalid, "
+309                      "must be greater than 0") %
+310                    {'worker_name': worker_name,
+311                     'workers': str(self.workers)})
+312             raise exception.InvalidInput(msg)
+313         self.use_ssl = use_ssl
+314         self.server = wsgi.Server(name,
+315                                   self.app,
+316                                   host=self.listen_address,
+317                                   port=self.port,
+318                                   use_ssl=self.use_ssl,
+319                                   max_url_len=max_url_len)
+320         # Pull back actual port used
+321         self.port = self.server.port
+322         self.backdoor_port = None
+323 
+324     def reset(self):
+325         """Reset server greenpool size to default and service version cache.
+326 
+327         :returns: None
+328 
+329         """
+330         self.server.reset()
+331         service_obj.Service.clear_min_version_cache()
+332 
+333     def _get_manager(self):
+334         """Initialize a Manager object appropriate for this service.
+335 
+336         Use the service name to look up a Manager subclass from the
+337         configuration and initialize an instance. If no class name
+338         is configured, just return None.
+339 
+340         :returns: a Manager instance, or None.
+341 
+342         """
+343         manager = SERVICE_MANAGERS.get(self.binary)
+344         if manager is None:
+345             return None
+346 
+347         manager_class = importutils.import_class(manager)
+348         return manager_class()
+349 
+350     def start(self):
+351         """Start serving this service using loaded configuration.
+352 
+353         Also, retrieve updated port number in case '0' was passed in, which
+354         indicates a random port should be used.
+355 
+356         :returns: None
+357 
+358         """
+359         ctxt = context.get_admin_context()
+360         service_ref = objects.Service.get_by_host_and_binary(ctxt, self.host,
+361                                                              self.binary)
+362         if service_ref:
+363             _update_service_ref(service_ref)
+364         else:
+365             try:
+366                 # Previously services were registered with self.listen_address
+367                 # Delete that entry and register with hostname.
+368                 old_service_ref = objects.Service.get_by_host_and_binary(
+369                                     ctxt, self.listen_address, self.binary)
+370                 if old_service_ref:
+371                     old_service_ref.destroy()
+372 
+373                 service_ref = _create_service_ref(self, ctxt)
+374             except (exception.ServiceTopicExists,
+375                     exception.ServiceBinaryExists):
+376                 # NOTE(danms): If we race to create a record wth a sibling,
+377                 # don't fail here.
+378                 service_ref = objects.Service.get_by_host_and_binary(
+379                     ctxt, self.host, self.binary)
+380 
+381         if self.manager:
+382             self.manager.init_host()
+383             self.manager.pre_start_hook()
+384             if self.backdoor_port is not None:
+385                 self.manager.backdoor_port = self.backdoor_port
+386         self.server.start()
+387         if self.manager:
+388             self.manager.post_start_hook()
+389 
+390     def stop(self):
+391         """Stop serving this API.
+392 
+393         :returns: None
+394 
+395         """
+396         self.server.stop()
+397 
+398     def wait(self):
+399         """Wait for the service to stop serving this API.
+400 
+401         :returns: None
+402 
+403         """
+404         self.server.wait()
+405 
+406 
+407 def process_launcher():
+408     return service.ProcessLauncher(CONF, restart_method='mutate')
+409 
+410 
+411 # NOTE(vish): the global launcher is to maintain the existing
+412 #             functionality of calling service.serve +
+413 #             service.wait
+414 _launcher = None
+415 
+416 
+417 def serve(server, workers=None):
+418     global _launcher
+419     if _launcher:
+420         raise RuntimeError(_('serve() can only be called once'))
+421 
+422     _launcher = service.launch(CONF, server, workers=workers)
+423 
+424 
+425 def wait():
+426     _launcher.wait()

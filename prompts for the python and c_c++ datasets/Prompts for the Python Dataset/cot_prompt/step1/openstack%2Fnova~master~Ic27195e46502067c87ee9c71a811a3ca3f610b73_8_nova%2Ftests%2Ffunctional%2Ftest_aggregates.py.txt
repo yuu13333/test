@@ -1,0 +1,562 @@
+Based on the given code from a commit, please generate supplementary code files according to the commit message.
+####commit message
+Check hosts have no instances for AZ rename
+
+Update aggregate and update aggregate metadata API calls have the
+ability to update availability zone name for the aggregate. If the
+aggregate is not empty (has hosts with instances on it)
+the update leads to discrepancy for objects saving availability zone as a
+string but not reference.
+
+From devstack DB they are:
+- cinder.backups.availability_zone
+- cinder.consistencygroups.availability_zone
+- cinder.groups.availability_zone
+- cinder.services.availability_zone
+- cinder.volumes.availability_zone
+- neutron.agents.availability_zone
+- neutron.networks.availability_zone_hints
+- neutron.router_extra_attributes.availability_zone_hints
+- nova.dns_domains.availability_zone
+- nova.instances.availability_zone
+- nova.volume_usage_cache.availability_zone
+- nova.shadow_dns_domains.availability_zone
+- nova.shadow_instances.availability_zone
+- nova.shadow_volume_usage_cache.availability_zone
+
+Why that's bad?
+First, API and Horizon show different values for host and instance for
+example. Second, migration for instances with changed availability
+zone fails with "No valid host found" for old AZ.
+
+This change adds an additional check to aggregate an Update Aggregate API call.
+With the check, it's not possible to rename AZ if the corresponding
+aggregate has instances in any hosts.
+
+PUT /os-aggregates/{aggregate_id} and
+POST /os-aggregates/{aggregate_id}/action return HTTP 400 for
+availability zone renaming if the hosts of the aggregate have any instances.
+It's similar to conflicting AZ names error already available.
+
+Change-Id: Ic27195e46502067c87ee9c71a811a3ca3f610b73
+Closes-Bug: #1378904
+
+####code 
+1 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
+2 #    not use this file except in compliance with the License. You may obtain
+3 #    a copy of the License at
+4 #
+5 #         http://www.apache.org/licenses/LICENSE-2.0
+6 #
+7 #    Unless required by applicable law or agreed to in writing, software
+8 #    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+9 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+10 #    License for the specific language governing permissions and limitations
+11 #    under the License.
+12 
+13 import time
+14 
+15 from oslo_utils.fixture import uuidsentinel as uuids
+16 
+17 from nova.scheduler.client import report
+18 
+19 import nova.conf
+20 from nova import context as nova_context
+21 from nova.scheduler import weights
+22 from nova import test
+23 from nova.tests import fixtures as nova_fixtures
+24 from nova.tests.functional.api import client
+25 from nova.tests.functional import fixtures as func_fixtures
+26 from nova.tests.functional import integrated_helpers
+27 import nova.tests.unit.image.fake
+28 from nova.tests.unit import policy_fixture
+29 from nova import utils
+30 from nova.virt import fake
+31 
+32 CONF = nova.conf.CONF
+33 
+34 
+35 class AggregatesTest(integrated_helpers._IntegratedTestBase):
+36     api_major_version = 'v2'
+37     ADMIN_API = True
+38 
+39     def _add_hosts_to_aggregate(self):
+40         """List all compute services and add them all to an aggregate."""
+41 
+42         compute_services = [s for s in self.api.get_services()
+43                             if s['binary'] == 'nova-compute']
+44         agg = {'aggregate': {'name': 'test-aggregate'}}
+45         agg = self.api.post_aggregate(agg)
+46         for service in compute_services:
+47             self.api.add_host_to_aggregate(agg['id'], service['host'])
+48         return len(compute_services)
+49 
+50     def test_add_hosts(self):
+51         # Default case with one compute, mapped for us
+52         self.assertEqual(1, self._add_hosts_to_aggregate())
+53 
+54     def test_add_unmapped_host(self):
+55         """Ensure that hosts without mappings are still found and added"""
+56 
+57         # Add another compute, but nuke its HostMapping
+58         self.start_service('compute', host='compute2')
+59         self.host_mappings['compute2'].destroy()
+60         self.assertEqual(2, self._add_hosts_to_aggregate())
+61 
+62 
+63 class AggregateRequestFiltersTest(test.TestCase,
+64                                   integrated_helpers.InstanceHelperMixin):
+65     microversion = 'latest'
+66     compute_driver = 'fake.MediumFakeDriver'
+67 
+68     def setUp(self):
+69         self.flags(compute_driver=self.compute_driver)
+70         super(AggregateRequestFiltersTest, self).setUp()
+71 
+72         self.useFixture(policy_fixture.RealPolicyFixture())
+73         self.useFixture(nova_fixtures.NeutronFixture(self))
+74         self.useFixture(nova_fixtures.AllServicesCurrent())
+75 
+76         placement = self.useFixture(func_fixtures.PlacementFixture())
+77         self.placement_api = placement.api
+78         api_fixture = self.useFixture(nova_fixtures.OSAPIFixture(
+79             api_version='v2.1'))
+80 
+81         self.admin_api = api_fixture.admin_api
+82         self.admin_api.microversion = self.microversion
+83         self.api = self.admin_api
+84 
+85         # the image fake backend needed for image discovery
+86         nova.tests.unit.image.fake.stub_out_image_service(self)
+87 
+88         self.start_service('conductor')
+89         self.scheduler_service = self.start_service('scheduler')
+90 
+91         self.computes = {}
+92         self.aggregates = {}
+93 
+94         self._start_compute('host1')
+95         self._start_compute('host2')
+96 
+97         self.context = nova_context.get_admin_context()
+98         self.report_client = report.SchedulerReportClient()
+99 
+100         self.flavors = self.api.get_flavors()
+101 
+102         # Aggregate with only host1
+103         self._create_aggregate('only-host1')
+104         self._add_host_to_aggregate('only-host1', 'host1')
+105 
+106         # Aggregate with only host2
+107         self._create_aggregate('only-host2')
+108         self._add_host_to_aggregate('only-host2', 'host2')
+109 
+110         # Aggregate with neither host
+111         self._create_aggregate('no-hosts')
+112 
+113     def _start_compute(self, host):
+114         """Start a nova compute service on the given host
+115 
+116         :param host: the name of the host that will be associated to the
+117                      compute service.
+118         :return: the nova compute service object
+119         """
+120         fake.set_nodes([host])
+121         self.addCleanup(fake.restore_nodes)
+122         compute = self.start_service('compute', host=host)
+123         self.computes[host] = compute
+124         return compute
+125 
+126     def _create_aggregate(self, name):
+127         agg = self.admin_api.post_aggregate({'aggregate': {'name': name}})
+128         self.aggregates[name] = agg
+129 
+130     def _get_provider_uuid_by_host(self, host):
+131         """Return the compute node uuid for a named compute host."""
+132         # NOTE(gibi): the compute node id is the same as the compute node
+133         # provider uuid on that compute
+134         resp = self.admin_api.api_get(
+135             'os-hypervisors?hypervisor_hostname_pattern=%s' % host).body
+136         return resp['hypervisors'][0]['id']
+137 
+138     def _add_host_to_aggregate(self, agg, host):
+139         """Add a compute host to both nova and placement aggregates.
+140 
+141         :param agg: Name of the nova aggregate
+142         :param host: Name of the compute host
+143         """
+144         agg = self.aggregates[agg]
+145         self.admin_api.add_host_to_aggregate(agg['id'], host)
+146 
+147         host_uuid = self._get_provider_uuid_by_host(host)
+148 
+149         # Make sure we have a view of the provider we're about to mess with
+150         # FIXME(efried): This should be a thing we can do without internals
+151         self.report_client._ensure_resource_provider(
+152             self.context, host_uuid, name=host)
+153         self.report_client.aggregate_add_host(self.context, agg['uuid'], host)
+154 
+155     def _wait_for_state_change(self, server, from_status):
+156         for i in range(0, 50):
+157             server = self.api.get_server(server['id'])
+158             if server['status'] != from_status:
+159                 break
+160             time.sleep(.1)
+161 
+162         return server
+163 
+164     def _boot_server(self, az=None):
+165         server_req = self._build_minimal_create_server_request(
+166             self.api, 'test-instance', flavor_id=self.flavors[0]['id'],
+167             image_uuid='155d900f-4e14-4e4c-a73d-069cbf4541e6',
+168             networks='none', az=az)
+169 
+170         created_server = self.api.post_server({'server': server_req})
+171         server = self._wait_for_state_change(created_server, 'BUILD')
+172 
+173         return server
+174 
+175     def _get_instance_host(self, server):
+176         srv = self.admin_api.get_server(server['id'])
+177         return srv['OS-EXT-SRV-ATTR:host']
+178 
+179     def _set_az_aggregate(self, agg, az):
+180         """Set the availability_zone of an aggregate
+181 
+182         :param agg: Name of the nova aggregate
+183         :param az: Availability zone name
+184         """
+185         agg = self.aggregates[agg]
+186         action = {
+187             'set_metadata': {
+188                 'metadata': {
+189                     'availability_zone': az,
+190                 }
+191             },
+192         }
+193         self.admin_api.post_aggregate_action(agg['id'], action)
+194 
+195     def _grant_tenant_aggregate(self, agg, tenants):
+196         """Grant a set of tenants access to use an aggregate.
+197 
+198         :param agg: Name of the nova aggregate
+199         :param tenants: A list of all tenant ids that will be allowed access
+200         """
+201         agg = self.aggregates[agg]
+202         action = {
+203             'set_metadata': {
+204                 'metadata': {
+205                     'filter_tenant_id%i' % i: tenant
+206                     for i, tenant in enumerate(tenants)
+207                 }
+208             },
+209         }
+210         self.admin_api.post_aggregate_action(agg['id'], action)
+211 
+212 
+213 class AggregatePostTest(AggregateRequestFiltersTest):
+214 
+215     def test_set_az_for_aggreate_no_instances(self):
+216         """Should be possible to update AZ for an empty aggregate.
+217 
+218         Check you can change the AZ name of an aggregate when it does
+219         not contain any servers.
+220 
+221         """
+222         self._set_az_aggregate('only-host1', 'fake-az')
+223 
+224     def test_fail_set_az(self):
+225         """Check it is not possible to update a non-empty aggregate.
+226 
+227         Check you cannot change the AZ name an aggregate when it
+228         contains any servers.
+229 
+230         """
+231         self.flags(reclaim_instance_interval=300)
+232         az = 'fake-az'
+233         self._set_az_aggregate('only-host1', az)
+234         server = self._boot_server(az=az)
+235         self.assertRaisesRegex(
+236             client.OpenStackApiException,
+237             'One or more hosts contain instances in this zone.',
+238             self._set_az_aggregate, 'only-host1', 'new' + az)
+239         self.api.delete_server(server['id'])
+240         self._wait_for_state_change(server, 'ACTIVE')
+241         self.assertRaisesRegex(
+242             client.OpenStackApiException,
+243             'One or more hosts contain instances in this zone.',
+244             self._set_az_aggregate, 'only-host1', 'new' + az)
+245         self.api.api_post(
+246             '/servers/%s/action' % server['id'], {'forceDelete': None})
+247         self._wait_for_state_change(server, 'SOFT_DELETED')
+248         self.computes['host1']._run_pending_deletes(self.context)
+249         self._set_az_aggregate('only-host1', 'new' + az)
+250 
+251 
+252 # NOTE: this test case has the same test methods as AggregatePostTest
+253 # but for the AZ update it uses PUT /os-aggregates/{aggregate_id} method
+254 class AggregatePutTest(AggregatePostTest):
+255 
+256     def _set_az_aggregate(self, agg, az):
+257         """Set the availability_zone of an aggregate via PUT
+258 
+259         :param agg: Name of the nova aggregate
+260         :param az: Availability zone name
+261         """
+262         agg = self.aggregates[agg]
+263         body = {
+264             'aggregate': {
+265                 'availability_zone': az,
+266             },
+267         }
+268         self.admin_api.put_aggregate(agg['id'], body)
+269 
+270 
+271 class TenantAggregateFilterTest(AggregateRequestFiltersTest):
+272     def setUp(self):
+273         super(TenantAggregateFilterTest, self).setUp()
+274 
+275         # Default to enabling the filter and making it mandatory
+276         self.flags(limit_tenants_to_placement_aggregate=True,
+277                    group='scheduler')
+278         self.flags(placement_aggregate_required_for_tenants=True,
+279                    group='scheduler')
+280 
+281     def test_tenant_id_required_fails_if_no_aggregate(self):
+282         server = self._boot_server()
+283         # Without granting our tenant permission to an aggregate, instance
+284         # creates should fail since aggregates are required
+285         self.assertEqual('ERROR', server['status'])
+286 
+287     def test_tenant_id_not_required_succeeds_if_no_aggregate(self):
+288         self.flags(placement_aggregate_required_for_tenants=False,
+289                    group='scheduler')
+290         server = self._boot_server()
+291         # Without granting our tenant permission to an aggregate, instance
+292         # creates should still succeed since aggregates are not required
+293         self.assertEqual('ACTIVE', server['status'])
+294 
+295     def test_filter_honors_tenant_id(self):
+296         tenant = self.api.project_id
+297 
+298         # Grant our tenant access to the aggregate with only host1 in it
+299         # and boot some servers. They should all stack up on host1.
+300         self._grant_tenant_aggregate('only-host1',
+301                                      ['foo', tenant, 'bar'])
+302         server1 = self._boot_server()
+303         server2 = self._boot_server()
+304         self.assertEqual('ACTIVE', server1['status'])
+305         self.assertEqual('ACTIVE', server2['status'])
+306 
+307         # Grant our tenant access to the aggregate with only host2 in it
+308         # and boot some servers. They should all stack up on host2.
+309         self._grant_tenant_aggregate('only-host1',
+310                                      ['foo', 'bar'])
+311         self._grant_tenant_aggregate('only-host2',
+312                                      ['foo', tenant, 'bar'])
+313         server3 = self._boot_server()
+314         server4 = self._boot_server()
+315         self.assertEqual('ACTIVE', server3['status'])
+316         self.assertEqual('ACTIVE', server4['status'])
+317 
+318         # Make sure the servers landed on the hosts we had access to at
+319         # the time we booted them.
+320         hosts = [self._get_instance_host(s)
+321                  for s in (server1, server2, server3, server4)]
+322         expected_hosts = ['host1', 'host1', 'host2', 'host2']
+323         self.assertEqual(expected_hosts, hosts)
+324 
+325     def test_filter_with_empty_aggregate(self):
+326         tenant = self.api.project_id
+327 
+328         # Grant our tenant access to the aggregate with no hosts in it
+329         self._grant_tenant_aggregate('no-hosts',
+330                                      ['foo', tenant, 'bar'])
+331         server = self._boot_server()
+332         self.assertEqual('ERROR', server['status'])
+333 
+334     def test_filter_with_multiple_aggregates_for_tenant(self):
+335         tenant = self.api.project_id
+336 
+337         # Grant our tenant access to the aggregate with no hosts in it,
+338         # and one with a host.
+339         self._grant_tenant_aggregate('no-hosts',
+340                                      ['foo', tenant, 'bar'])
+341         self._grant_tenant_aggregate('only-host2',
+342                                      ['foo', tenant, 'bar'])
+343 
+344         # Boot several servers and make sure they all land on the
+345         # only host we have access to.
+346         for i in range(0, 4):
+347             server = self._boot_server()
+348             self.assertEqual('ACTIVE', server['status'])
+349             self.assertEqual('host2', self._get_instance_host(server))
+350 
+351 
+352 class HostNameWeigher(weights.BaseHostWeigher):
+353     def _weigh_object(self, host_state, weight_properties):
+354         """Arbitrary preferring host1 over host2 over host3."""
+355         weights = {'host1': 100, 'host2': 50, 'host3': 1}
+356         return weights.get(host_state.host, 0)
+357 
+358 
+359 class AvailabilityZoneFilterTest(AggregateRequestFiltersTest):
+360     def setUp(self):
+361         # Default to enabling the filter
+362         self.flags(query_placement_for_availability_zone=True,
+363                    group='scheduler')
+364 
+365         # Use our custom weigher defined above to make sure that we have
+366         # a predictable scheduling sort order.
+367         self.flags(weight_classes=[__name__ + '.HostNameWeigher'],
+368                    group='filter_scheduler')
+369 
+370         # NOTE(danms): Do this before calling setUp() so that
+371         # the scheduler service that is started sees the new value
+372         filters = CONF.filter_scheduler.enabled_filters
+373         filters.remove('AvailabilityZoneFilter')
+374         self.flags(enabled_filters=filters, group='filter_scheduler')
+375 
+376         super(AvailabilityZoneFilterTest, self).setUp()
+377 
+378     def test_filter_with_az(self):
+379         self._set_az_aggregate('only-host2', 'myaz')
+380         server1 = self._boot_server(az='myaz')
+381         server2 = self._boot_server(az='myaz')
+382         hosts = [self._get_instance_host(s) for s in (server1, server2)]
+383         self.assertEqual(['host2', 'host2'], hosts)
+384 
+385 
+386 class TestAggregateFiltersTogether(AggregateRequestFiltersTest):
+387     def setUp(self):
+388         # NOTE(danms): Do this before calling setUp() so that
+389         # the scheduler service that is started sees the new value
+390         filters = CONF.filter_scheduler.enabled_filters
+391         filters.remove('AvailabilityZoneFilter')
+392         self.flags(enabled_filters=filters, group='filter_scheduler')
+393 
+394         super(TestAggregateFiltersTogether, self).setUp()
+395 
+396         # Default to enabling both filters
+397         self.flags(limit_tenants_to_placement_aggregate=True,
+398                    group='scheduler')
+399         self.flags(placement_aggregate_required_for_tenants=True,
+400                    group='scheduler')
+401         self.flags(query_placement_for_availability_zone=True,
+402                    group='scheduler')
+403 
+404     def test_tenant_with_az_match(self):
+405         # Grant our tenant access to the aggregate with
+406         # host1
+407         self._grant_tenant_aggregate('only-host1',
+408                                      [self.api.project_id])
+409         # Set an az on only-host1
+410         self._set_az_aggregate('only-host1', 'myaz')
+411 
+412         # Boot the server into that az and make sure we land
+413         server = self._boot_server(az='myaz')
+414         self.assertEqual('host1', self._get_instance_host(server))
+415 
+416     def test_tenant_with_az_mismatch(self):
+417         # Grant our tenant access to the aggregate with
+418         # host1
+419         self._grant_tenant_aggregate('only-host1',
+420                                      [self.api.project_id])
+421         # Set an az on only-host2
+422         self._set_az_aggregate('only-host2', 'myaz')
+423 
+424         # Boot the server into that az and make sure we fail
+425         server = self._boot_server(az='myaz')
+426         self.assertIsNone(self._get_instance_host(server))
+427         server = self.api.get_server(server['id'])
+428         self.assertEqual('ERROR', server['status'])
+429 
+430 
+431 class TestAggregateMultiTenancyIsolationFilter(
+432     test.TestCase, integrated_helpers.InstanceHelperMixin):
+433 
+434     def _start_compute(self, host):
+435         fake.set_nodes([host])
+436         self.addCleanup(fake.restore_nodes)
+437         self.start_service('compute', host=host)
+438 
+439     def setUp(self):
+440         super(TestAggregateMultiTenancyIsolationFilter, self).setUp()
+441         # Stub out glance, placement and neutron.
+442         nova.tests.unit.image.fake.stub_out_image_service(self)
+443         self.addCleanup(nova.tests.unit.image.fake.FakeImageService_reset)
+444         self.useFixture(func_fixtures.PlacementFixture())
+445         self.useFixture(nova_fixtures.NeutronFixture(self))
+446         # Start nova services.
+447         self.start_service('conductor')
+448         self.admin_api = self.useFixture(
+449             nova_fixtures.OSAPIFixture(api_version='v2.1')).admin_api
+450         # Add the AggregateMultiTenancyIsolation to the list of enabled
+451         # filters since it is not enabled by default.
+452         enabled_filters = CONF.filter_scheduler.enabled_filters
+453         enabled_filters.append('AggregateMultiTenancyIsolation')
+454         self.flags(enabled_filters=enabled_filters, group='filter_scheduler')
+455         self.start_service('scheduler')
+456         for host in ('host1', 'host2'):
+457             self._start_compute(host)
+458 
+459     def test_aggregate_multitenancy_isolation_filter(self):
+460         """Tests common scenarios with the AggregateMultiTenancyIsolation
+461         filter:
+462 
+463         * hosts in a tenant-isolated aggregate are only accepted for that
+464           tenant
+465         * hosts not in a tenant-isolated aggregate are acceptable for all
+466           tenants, including tenants with access to the isolated-tenant
+467           aggregate
+468         """
+469         # Create a tenant-isolated aggregate for the non-admin user.
+470         user_api = self.useFixture(
+471             nova_fixtures.OSAPIFixture(api_version='v2.1',
+472                                        project_id=uuids.non_admin)).api
+473         agg_id = self.admin_api.post_aggregate(
+474             {'aggregate': {'name': 'non_admin_agg'}})['id']
+475         meta_req = {'set_metadata': {
+476             'metadata': {'filter_tenant_id': uuids.non_admin}}}
+477         self.admin_api.api_post('/os-aggregates/%s/action' % agg_id, meta_req)
+478         # Add host2 to the aggregate; we'll restrict host2 to the non-admin
+479         # tenant.
+480         host_req = {'add_host': {'host': 'host2'}}
+481         self.admin_api.api_post('/os-aggregates/%s/action' % agg_id, host_req)
+482         # Stub out select_destinations to assert how many host candidates were
+483         # available per tenant-specific request.
+484         original_filtered_hosts = (
+485             nova.scheduler.host_manager.HostManager.get_filtered_hosts)
+486 
+487         def spy_get_filtered_hosts(*args, **kwargs):
+488             self.filtered_hosts = original_filtered_hosts(*args, **kwargs)
+489             return self.filtered_hosts
+490         self.stub_out(
+491             'nova.scheduler.host_manager.HostManager.get_filtered_hosts',
+492             spy_get_filtered_hosts)
+493         # Create a server for the admin - should only have one host candidate.
+494         server_req = self._build_minimal_create_server_request(
+495             self.admin_api,
+496             'test_aggregate_multitenancy_isolation_filter-admin',
+497             networks='none')  # requires microversion 2.37
+498         server_req = {'server': server_req}
+499         with utils.temporary_mutation(self.admin_api, microversion='2.37'):
+500             server = self.admin_api.post_server(server_req)
+501         server = self._wait_for_state_change(self.admin_api, server, 'ACTIVE')
+502         # Assert it's not on host2 which is isolated to the non-admin tenant.
+503         self.assertNotEqual('host2', server['OS-EXT-SRV-ATTR:host'])
+504         self.assertEqual(1, len(self.filtered_hosts))
+505         # Now create a server for the non-admin tenant to which host2 is
+506         # isolated via the aggregate, but the other compute host is a
+507         # candidate. We don't assert that the non-admin tenant server shows
+508         # up on host2 because the other host, which is not isolated to the
+509         # aggregate, is still a candidate.
+510         server_req = self._build_minimal_create_server_request(
+511             user_api,
+512             'test_aggregate_multitenancy_isolation_filter-user',
+513             networks='none')  # requires microversion 2.37
+514         server_req = {'server': server_req}
+515         with utils.temporary_mutation(user_api, microversion='2.37'):
+516             server = user_api.post_server(server_req)
+517         self._wait_for_state_change(user_api, server, 'ACTIVE')
+518         self.assertEqual(2, len(self.filtered_hosts))

@@ -1,0 +1,609 @@
+Please review the code below to detect security defects. If any are found, please describe the security defect in detail and indicate the corresponding line number of code and solution. If none are found, please state '''No security defects are detected in the code'''.
+
+1 # Copyright 2011 Isaku Yamahata <yamahata@valinux co jp>
+2 # All Rights Reserved.
+3 #
+4 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
+5 #    not use this file except in compliance with the License. You may obtain
+6 #    a copy of the License at
+7 #
+8 #         http://www.apache.org/licenses/LICENSE-2.0
+9 #
+10 #    Unless required by applicable law or agreed to in writing, software
+11 #    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+12 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+13 #    License for the specific language governing permissions and limitations
+14 #    under the License.
+15 
+16 import re
+17 
+18 from oslo_log import log as logging
+19 from oslo_utils import strutils
+20 
+21 
+22 import nova.conf
+23 from nova import exception
+24 from nova.i18n import _
+25 from nova import utils
+26 from nova.virt import driver
+27 
+28 CONF = nova.conf.CONF
+29 LOG = logging.getLogger(__name__)
+30 
+31 DEFAULT_ROOT_DEV_NAME = '/dev/sda1'
+32 _DEFAULT_MAPPINGS = {'ami': 'sda1',
+33                      'ephemeral0': 'sda2',
+34                      'root': DEFAULT_ROOT_DEV_NAME,
+35                      'swap': 'sda3'}
+36 
+37 
+38 bdm_legacy_fields = set(['device_name', 'delete_on_termination',
+39                          'virtual_name', 'snapshot_id',
+40                          'volume_id', 'volume_size', 'no_device',
+41                          'connection_info'])
+42 
+43 
+44 bdm_new_fields = set(['source_type', 'destination_type',
+45                      'guest_format', 'device_type', 'disk_bus', 'boot_index',
+46                      'device_name', 'delete_on_termination', 'snapshot_id',
+47                      'volume_id', 'volume_size', 'image_id', 'no_device',
+48                      'connection_info', 'tag'])
+49 
+50 
+51 bdm_db_only_fields = set(['id', 'instance_uuid'])
+52 
+53 
+54 bdm_db_inherited_fields = set(['created_at', 'updated_at',
+55                                'deleted_at', 'deleted'])
+56 
+57 
+58 bdm_new_non_api_fields = set(['volume_id', 'snapshot_id',
+59                               'image_id', 'connection_info'])
+60 
+61 
+62 bdm_new_api_only_fields = set(['uuid'])
+63 
+64 
+65 bdm_new_api_fields = ((bdm_new_fields - bdm_new_non_api_fields) |
+66                       bdm_new_api_only_fields)
+67 
+68 
+69 class BlockDeviceDict(dict):
+70     """Represents a Block Device Mapping in Nova."""
+71 
+72     _fields = bdm_new_fields
+73     _db_only_fields = (bdm_db_only_fields |
+74                bdm_db_inherited_fields)
+75 
+76     _required_fields = set(['source_type'])
+77 
+78     def __init__(self, bdm_dict=None, do_not_default=None, **kwargs):
+79         super(BlockDeviceDict, self).__init__()
+80 
+81         bdm_dict = bdm_dict or {}
+82         bdm_dict.update(kwargs)
+83         do_not_default = do_not_default or set()
+84 
+85         self._validate(bdm_dict)
+86         if bdm_dict.get('device_name'):
+87             bdm_dict['device_name'] = prepend_dev(bdm_dict['device_name'])
+88         bdm_dict['delete_on_termination'] = bool(
+89             bdm_dict.get('delete_on_termination'))
+90         # NOTE (ndipanov): Never default db fields
+91         self.update({field: None for field in self._fields - do_not_default})
+92         self.update(bdm_dict.items())
+93 
+94     def _validate(self, bdm_dict):
+95         """Basic data format validations."""
+96         dict_fields = set(key for key, _ in bdm_dict.items())
+97 
+98         # Check that there are no bogus fields
+99         if not (dict_fields <=
+100                 (self._fields | self._db_only_fields)):
+101             raise exception.InvalidBDMFormat(
+102                 details=_("Some fields are invalid."))
+103 
+104         if bdm_dict.get('no_device'):
+105             return
+106 
+107         # Check that all required fields are there
+108         if (self._required_fields and
+109                 not ((dict_fields & self._required_fields) ==
+110                       self._required_fields)):
+111             raise exception.InvalidBDMFormat(
+112                 details=_("Some required fields are missing"))
+113 
+114         if 'delete_on_termination' in bdm_dict:
+115             bdm_dict['delete_on_termination'] = strutils.bool_from_string(
+116                 bdm_dict['delete_on_termination'])
+117 
+118         if bdm_dict.get('device_name') is not None:
+119             validate_device_name(bdm_dict['device_name'])
+120 
+121         validate_and_default_volume_size(bdm_dict)
+122 
+123         if bdm_dict.get('boot_index'):
+124             try:
+125                 bdm_dict['boot_index'] = int(bdm_dict['boot_index'])
+126             except ValueError:
+127                 raise exception.InvalidBDMFormat(
+128                     details=_("Boot index is invalid."))
+129 
+130     @classmethod
+131     def from_legacy(cls, legacy_bdm):
+132 
+133         copy_over_fields = bdm_legacy_fields & bdm_new_fields
+134         copy_over_fields |= (bdm_db_only_fields |
+135                              bdm_db_inherited_fields)
+136         # NOTE (ndipanov): These fields cannot be computed
+137         # from legacy bdm, so do not default them
+138         # to avoid overwriting meaningful values in the db
+139         non_computable_fields = set(['boot_index', 'disk_bus',
+140                                      'guest_format', 'device_type'])
+141 
+142         new_bdm = {fld: val for fld, val in legacy_bdm.items()
+143                    if fld in copy_over_fields}
+144 
+145         virt_name = legacy_bdm.get('virtual_name')
+146 
+147         if is_swap_or_ephemeral(virt_name):
+148             new_bdm['source_type'] = 'blank'
+149             new_bdm['delete_on_termination'] = True
+150             new_bdm['destination_type'] = 'local'
+151 
+152             if virt_name == 'swap':
+153                 new_bdm['guest_format'] = 'swap'
+154             else:
+155                 new_bdm['guest_format'] = CONF.default_ephemeral_format
+156 
+157         elif legacy_bdm.get('snapshot_id'):
+158             new_bdm['source_type'] = 'snapshot'
+159             new_bdm['destination_type'] = 'volume'
+160 
+161         elif legacy_bdm.get('volume_id'):
+162             new_bdm['source_type'] = 'volume'
+163             new_bdm['destination_type'] = 'volume'
+164 
+165         elif legacy_bdm.get('no_device'):
+166             # NOTE (ndipanov): Just keep the BDM for now,
+167             pass
+168 
+169         else:
+170             raise exception.InvalidBDMFormat(
+171                 details=_("Unrecognized legacy format."))
+172 
+173         return cls(new_bdm, non_computable_fields)
+174 
+175     @classmethod
+176     def from_api(cls, api_dict, image_uuid_specified):
+177         """Transform the API format of data to the internally used one.
+178 
+179         Only validate if the source_type field makes sense.
+180         """
+181         if not api_dict.get('no_device'):
+182 
+183             source_type = api_dict.get('source_type')
+184             device_uuid = api_dict.get('uuid')
+185             destination_type = api_dict.get('destination_type')
+186 
+187             if source_type not in ('volume', 'image', 'snapshot', 'blank'):
+188                 raise exception.InvalidBDMFormat(
+189                     details=_("Invalid source_type field."))
+190             if destination_type is None:
+191                 if source_type in ('image', 'blank'):
+192                     destination_type = 'local'
+193                 if source_type in ('snapshot', 'volume'):
+194                     destination_type = 'volume'
+195             elif source_type == 'blank' and device_uuid:
+196                 raise exception.InvalidBDMFormat(
+197                     details=_("Invalid device UUID."))
+198             elif source_type != 'blank':
+199                 if not device_uuid:
+200                     raise exception.InvalidBDMFormat(
+201                         details=_("Missing device UUID."))
+202                 api_dict[source_type + '_id'] = device_uuid
+203             if source_type == 'image' and destination_type == 'local':
+204                 try:
+205                     boot_index = int(api_dict.get('boot_index', -1))
+206                 except ValueError:
+207                     raise exception.InvalidBDMFormat(
+208                         details=_("Boot index is invalid."))
+209                 # if this bdm is generated from --image ,then
+210                 # source_type = image and destination_type = local is allowed
+211                 if not (image_uuid_specified and boot_index == 0):
+212                     raise exception.InvalidBDMFormat(
+213                         details=_("Mapping image to local is not supported."))
+214 
+215         api_dict.pop('uuid', None)
+216         return cls(api_dict)
+217 
+218     def legacy(self):
+219         copy_over_fields = bdm_legacy_fields - set(['virtual_name'])
+220         copy_over_fields |= (bdm_db_only_fields |
+221                              bdm_db_inherited_fields)
+222 
+223         legacy_block_device = {field: self.get(field)
+224             for field in copy_over_fields if field in self}
+225 
+226         source_type = self.get('source_type')
+227         destination_type = self.get('destination_type')
+228         no_device = self.get('no_device')
+229         if source_type == 'blank':
+230             if self['guest_format'] == 'swap':
+231                 legacy_block_device['virtual_name'] = 'swap'
+232             else:
+233                 # NOTE (ndipanov): Always label as 0, it is up to
+234                 # the calling routine to re-enumerate them
+235                 legacy_block_device['virtual_name'] = 'ephemeral0'
+236         elif source_type in ('volume', 'snapshot') or no_device:
+237             legacy_block_device['virtual_name'] = None
+238         elif source_type == 'image':
+239             if destination_type != 'volume':
+240                 # NOTE(ndipanov): Image bdms with local destination
+241                 # have no meaning in the legacy format - raise
+242                 raise exception.InvalidBDMForLegacy()
+243             legacy_block_device['virtual_name'] = None
+244 
+245         return legacy_block_device
+246 
+247     def get_image_mapping(self):
+248         drop_fields = (set(['connection_info']) |
+249                        self._db_only_fields)
+250         mapping_dict = dict(self)
+251         for fld in drop_fields:
+252             mapping_dict.pop(fld, None)
+253         return mapping_dict
+254 
+255 
+256 def is_safe_for_update(block_device_dict):
+257     """Determine if passed dict is a safe subset for update.
+258 
+259     Safe subset in this case means a safe subset of both legacy
+260     and new versions of data, that can be passed to an UPDATE query
+261     without any transformation.
+262     """
+263     fields = set(block_device_dict.keys())
+264     return fields <= (bdm_new_fields |
+265                       bdm_db_inherited_fields |
+266                       bdm_db_only_fields)
+267 
+268 
+269 def create_image_bdm(image_ref, boot_index=0):
+270     """Create a block device dict based on the image_ref.
+271 
+272     This is useful in the API layer to keep the compatibility
+273     with having an image_ref as a field in the instance requests
+274     """
+275     return BlockDeviceDict(
+276         {'source_type': 'image',
+277          'image_id': image_ref,
+278          'delete_on_termination': True,
+279          'boot_index': boot_index,
+280          'device_type': 'disk',
+281          'destination_type': 'local'})
+282 
+283 
+284 def create_blank_bdm(size, guest_format=None):
+285     return BlockDeviceDict(
+286         {'source_type': 'blank',
+287          'delete_on_termination': True,
+288          'device_type': 'disk',
+289          'boot_index': -1,
+290          'destination_type': 'local',
+291          'guest_format': guest_format,
+292          'volume_size': size})
+293 
+294 
+295 def snapshot_from_bdm(snapshot_id, template):
+296     """Create a basic volume snapshot BDM from a given template bdm."""
+297 
+298     copy_from_template = ('disk_bus', 'device_type', 'boot_index',
+299                           'delete_on_termination', 'volume_size',
+300                           'device_name')
+301     snapshot_dict = {'source_type': 'snapshot',
+302                      'destination_type': 'volume',
+303                      'snapshot_id': snapshot_id}
+304     for key in copy_from_template:
+305         snapshot_dict[key] = template.get(key)
+306     return BlockDeviceDict(snapshot_dict)
+307 
+308 
+309 def legacy_mapping(block_device_mapping):
+310     """Transform a list of block devices of an instance back to the
+311     legacy data format.
+312     """
+313 
+314     legacy_block_device_mapping = []
+315 
+316     for bdm in block_device_mapping:
+317         try:
+318             legacy_block_device = BlockDeviceDict(bdm).legacy()
+319         except exception.InvalidBDMForLegacy:
+320             continue
+321 
+322         legacy_block_device_mapping.append(legacy_block_device)
+323 
+324     # Re-enumerate the ephemeral devices
+325     for i, dev in enumerate(dev for dev in legacy_block_device_mapping
+326                             if dev['virtual_name'] and
+327                             is_ephemeral(dev['virtual_name'])):
+328         dev['virtual_name'] = dev['virtual_name'][:-1] + str(i)
+329 
+330     return legacy_block_device_mapping
+331 
+332 
+333 def from_legacy_mapping(legacy_block_device_mapping, image_uuid='',
+334                         root_device_name=None, no_root=False):
+335     """Transform a legacy list of block devices to the new data format."""
+336 
+337     new_bdms = [BlockDeviceDict.from_legacy(legacy_bdm)
+338                 for legacy_bdm in legacy_block_device_mapping]
+339     # NOTE (ndipanov): We will not decide which device is root here - we assume
+340     # that it will be supplied later. This is useful for having the root device
+341     # as part of the image defined mappings that are already in the v2 format.
+342     if no_root:
+343         for bdm in new_bdms:
+344             bdm['boot_index'] = -1
+345         return new_bdms
+346 
+347     image_bdm = None
+348     volume_backed = False
+349 
+350     # Try to assign boot_device
+351     if not root_device_name and not image_uuid:
+352         # NOTE (ndipanov): If there is no root_device, pick the first non
+353         #                  blank one.
+354         non_blank = [bdm for bdm in new_bdms if bdm['source_type'] != 'blank']
+355         if non_blank:
+356             non_blank[0]['boot_index'] = 0
+357     else:
+358         for bdm in new_bdms:
+359             if (bdm['source_type'] in ('volume', 'snapshot', 'image') and
+360                     root_device_name is not None and
+361                     (strip_dev(bdm.get('device_name')) ==
+362                      strip_dev(root_device_name))):
+363                 bdm['boot_index'] = 0
+364                 volume_backed = True
+365             elif not bdm['no_device']:
+366                 bdm['boot_index'] = -1
+367             else:
+368                 bdm['boot_index'] = None
+369 
+370         if not volume_backed and image_uuid:
+371             image_bdm = create_image_bdm(image_uuid, boot_index=0)
+372 
+373     return ([image_bdm] if image_bdm else []) + new_bdms
+374 
+375 
+376 def properties_root_device_name(properties):
+377     """get root device name from image meta data.
+378     If it isn't specified, return None.
+379     """
+380     root_device_name = None
+381 
+382     # NOTE(yamahata): see image_service.s3.s3create()
+383     for bdm in properties.get('mappings', []):
+384         if bdm['virtual'] == 'root':
+385             root_device_name = bdm['device']
+386 
+387     # NOTE(yamahata): register_image's command line can override
+388     #                 <machine>.manifest.xml
+389     if 'root_device_name' in properties:
+390         root_device_name = properties['root_device_name']
+391 
+392     return root_device_name
+393 
+394 
+395 def validate_device_name(value):
+396     try:
+397         # NOTE (ndipanov): Do not allow empty device names
+398         #                  until assigning default values
+399         #                  is supported by nova.compute
+400         utils.check_string_length(value, 'Device name',
+401                                   min_length=1, max_length=255)
+402     except exception.InvalidInput:
+403         raise exception.InvalidBDMFormat(
+404             details=_("Device name empty or too long."))
+405 
+406     if ' ' in value:
+407         raise exception.InvalidBDMFormat(
+408             details=_("Device name contains spaces."))
+409 
+410 
+411 def validate_and_default_volume_size(bdm):
+412     if bdm.get('volume_size'):
+413         try:
+414             bdm['volume_size'] = utils.validate_integer(
+415                 bdm['volume_size'], 'volume_size', min_value=0)
+416         except exception.InvalidInput:
+417             # NOTE: We can remove this validation code after removing
+418             # Nova v2.0 API code because v2.1 API validates this case
+419             # already at its REST API layer.
+420             raise exception.InvalidBDMFormat(
+421                 details=_("Invalid volume_size."))
+422 
+423 
+424 _ephemeral = re.compile('^ephemeral(\d|[1-9]\d+)$')
+425 
+426 
+427 def is_ephemeral(device_name):
+428     return _ephemeral.match(device_name) is not None
+429 
+430 
+431 def ephemeral_num(ephemeral_name):
+432     assert is_ephemeral(ephemeral_name)
+433     return int(_ephemeral.sub('\\1', ephemeral_name))
+434 
+435 
+436 def is_swap_or_ephemeral(device_name):
+437     return (device_name and
+438             (device_name == 'swap' or is_ephemeral(device_name)))
+439 
+440 
+441 def new_format_is_swap(bdm):
+442     if (bdm.get('source_type') == 'blank' and
+443             bdm.get('destination_type') == 'local' and
+444             bdm.get('guest_format') == 'swap'):
+445         return True
+446     return False
+447 
+448 
+449 def new_format_is_ephemeral(bdm):
+450     if (bdm.get('source_type') == 'blank' and
+451             bdm.get('destination_type') == 'local' and
+452             bdm.get('guest_format') != 'swap'):
+453         return True
+454     return False
+455 
+456 
+457 def get_root_bdm(bdms):
+458     try:
+459         return next(bdm for bdm in bdms if bdm.get('boot_index', -1) == 0)
+460     except StopIteration:
+461         return None
+462 
+463 
+464 def get_bdms_to_connect(bdms, exclude_root_mapping=False):
+465     """Will return non-root mappings, when exclude_root_mapping is true.
+466        Otherwise all mappings will be returned.
+467     """
+468     return (bdm for bdm in bdms if bdm.get('boot_index', -1) != 0 or
+469             not exclude_root_mapping)
+470 
+471 
+472 def mappings_prepend_dev(mappings):
+473     """Prepend '/dev/' to 'device' entry of swap/ephemeral virtual type."""
+474     for m in mappings:
+475         virtual = m['virtual']
+476         if (is_swap_or_ephemeral(virtual) and
+477                 (not m['device'].startswith('/'))):
+478             m['device'] = '/dev/' + m['device']
+479     return mappings
+480 
+481 
+482 _dev = re.compile('^/dev/')
+483 
+484 
+485 def strip_dev(device_name):
+486     """remove leading '/dev/'."""
+487     return _dev.sub('', device_name) if device_name else device_name
+488 
+489 
+490 def prepend_dev(device_name):
+491     """Make sure there is a leading '/dev/'."""
+492     return device_name and '/dev/' + strip_dev(device_name)
+493 
+494 
+495 _pref = re.compile('^((x?v|s|h)d)')
+496 
+497 
+498 def strip_prefix(device_name):
+499     """remove both leading /dev/ and xvd or sd or vd or hd."""
+500     device_name = strip_dev(device_name)
+501     return _pref.sub('', device_name) if device_name else device_name
+502 
+503 
+504 _nums = re.compile('\d+')
+505 
+506 
+507 def get_device_letter(device_name):
+508     letter = strip_prefix(device_name)
+509     # NOTE(vish): delete numbers in case we have something like
+510     #             /dev/sda1
+511     return _nums.sub('', letter) if device_name else device_name
+512 
+513 
+514 def instance_block_mapping(instance, bdms):
+515     root_device_name = instance['root_device_name']
+516     # NOTE(clayg): remove this when xenapi is setting default_root_device
+517     if root_device_name is None:
+518         if driver.is_xenapi():
+519             root_device_name = '/dev/xvda'
+520         else:
+521             return _DEFAULT_MAPPINGS
+522 
+523     mappings = {}
+524     mappings['ami'] = strip_dev(root_device_name)
+525     mappings['root'] = root_device_name
+526     default_ephemeral_device = instance.get('default_ephemeral_device')
+527     if default_ephemeral_device:
+528         mappings['ephemeral0'] = default_ephemeral_device
+529     default_swap_device = instance.get('default_swap_device')
+530     if default_swap_device:
+531         mappings['swap'] = default_swap_device
+532     ebs_devices = []
+533     blanks = []
+534 
+535     # 'ephemeralN', 'swap' and ebs
+536     for bdm in bdms:
+537         # ebs volume case
+538         if bdm.destination_type == 'volume':
+539             ebs_devices.append(bdm.device_name)
+540             continue
+541 
+542         if bdm.source_type == 'blank':
+543             blanks.append(bdm)
+544 
+545     # NOTE(yamahata): I'm not sure how ebs device should be numbered.
+546     #                 Right now sort by device name for deterministic
+547     #                 result.
+548     if ebs_devices:
+549         # NOTE(claudiub): python2.7 sort places None values first.
+550         # this sort will maintain the same behaviour for both py27 and py34.
+551         ebs_devices = sorted(ebs_devices, key=lambda x: (x is not None, x))
+552         for nebs, ebs in enumerate(ebs_devices):
+553             mappings['ebs%d' % nebs] = ebs
+554 
+555     swap = [bdm for bdm in blanks if bdm.guest_format == 'swap']
+556     if swap:
+557         mappings['swap'] = swap.pop().device_name
+558 
+559     ephemerals = [bdm for bdm in blanks if bdm.guest_format != 'swap']
+560     if ephemerals:
+561         for num, eph in enumerate(ephemerals):
+562             mappings['ephemeral%d' % num] = eph.device_name
+563 
+564     return mappings
+565 
+566 
+567 def match_device(device):
+568     """Matches device name and returns prefix, suffix."""
+569     match = re.match("(^/dev/x{0,1}[a-z]{0,1}d{0,1})([a-z]+)[0-9]*$", device)
+570     if not match:
+571         return None
+572     return match.groups()
+573 
+574 
+575 def volume_in_mapping(mount_device, block_device_info):
+576     block_device_list = [strip_dev(vol['mount_device'])
+577                          for vol in
+578                          driver.block_device_info_get_mapping(
+579                          block_device_info)]
+580 
+581     swap = driver.block_device_info_get_swap(block_device_info)
+582     if driver.swap_is_usable(swap):
+583         block_device_list.append(strip_dev(swap['device_name']))
+584 
+585     block_device_list += [strip_dev(ephemeral['device_name'])
+586                           for ephemeral in
+587                           driver.block_device_info_get_ephemerals(
+588                           block_device_info)]
+589 
+590     LOG.debug("block_device_list %s", sorted(filter(None, block_device_list)))
+591     return strip_dev(mount_device) in block_device_list
+592 
+593 
+594 def get_bdm_ephemeral_disk_size(block_device_mappings):
+595     return sum(bdm.get('volume_size', 0)
+596             for bdm in block_device_mappings
+597             if new_format_is_ephemeral(bdm))
+598 
+599 
+600 def get_bdm_swap_list(block_device_mappings):
+601     return [bdm for bdm in block_device_mappings
+602             if new_format_is_swap(bdm)]
+603 
+604 
+605 def get_bdm_local_disk_num(block_device_mappings):
+606     return len([bdm for bdm in block_device_mappings
+607                 if bdm.get('destination_type') == 'local'])

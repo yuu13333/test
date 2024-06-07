@@ -1,0 +1,351 @@
+Please review the code below to detect security defects. If any are found, please describe the security defect in detail and indicate the corresponding line number of code and solution. If none are found, please state '''No security defects are detected in the code'''.
+
+1 # Copyright 2017 IBM Corp.
+2 #
+3 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
+4 #    not use this file except in compliance with the License. You may obtain
+5 #    a copy of the License at
+6 #
+7 #         http://www.apache.org/licenses/LICENSE-2.0
+8 #
+9 #    Unless required by applicable law or agreed to in writing, software
+10 #    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+11 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+12 #    License for the specific language governing permissions and limitations
+13 #    under the License.
+14 
+15 import datetime
+16 import eventlet
+17 import os
+18 import pwd
+19 import time
+20 
+21 from oslo_log import log as logging
+22 from oslo_serialization import jsonutils
+23 from oslo_service import loopingcall
+24 from oslo_utils import excutils
+25 from oslo_utils import timeutils
+26 
+27 from nova.compute import power_state
+28 from nova import conf
+29 from nova import exception
+30 from nova.i18n import _
+31 from nova.objects import fields as obj_fields
+32 from nova.virt import driver
+33 from nova.virt import hardware
+34 from nova.virt import images
+35 from nova.virt.zvm import utils as zvmutils
+36 
+37 
+38 LOG = logging.getLogger(__name__)
+39 CONF = conf.CONF
+40 
+41 HYPERVISOR_TYPE = 'zvm'
+42 ARCHITECTURE = 's390x'
+43 DEFAULT_EPH_DISK_FMT = 'ext3'
+44 ZVM_POWER_STAT = {
+45     'on': power_state.RUNNING,
+46     'off': power_state.SHUTDOWN,
+47     }
+48 
+49 
+50 class ZVMDriver(driver.ComputeDriver):
+51     """z/VM implementation of ComputeDriver."""
+52 
+53     def __init__(self, virtapi):
+54         super(ZVMDriver, self).__init__(virtapi)
+55 
+56         if CONF.zvm.cloud_connector_url is None:
+57             message = _('Must specify cloud_connector_url in zvm config '
+58                         'group to use compute_driver=zvm.driver.ZVMDriver')
+59             raise exception.NovaException(message)
+60 
+61         self._reqh = zvmutils.zVMConnectorRequestHandler()
+62 
+63         # get hypervisor host name
+64         res = self._reqh.call('host_get_info')
+65         self._hypervisor_hostname = res['hypervisor_hostname']
+66         self._ipl_time = res['ipl_time']
+67         self._vmutils = zvmutils.VMUtils()
+68         self._imageop_semaphore = eventlet.semaphore.Semaphore(1)
+69         LOG.info("The zVM compute driver has been initialized.")
+70 
+71     def init_host(self, host):
+72         pass
+73 
+74     def list_instances(self):
+75         """Return the names of all the instances known to the virtualization
+76         layer, as a list.
+77         """
+78         return self._reqh.call('guest_list')
+79 
+80     def get_available_resource(self, nodename=None):
+81         LOG.debug("Getting available resource for %(host)s:%(nodename)s",
+82                   {'host': CONF.host, 'nodename': nodename})
+83 
+84         try:
+85             host_stats = self._reqh.call('host_get_info')
+86         except exception.NovaException:
+87             LOG.warning("Failed to get host stats for %(host)s:%(nodename)s",
+88                         {'host': CONF.host, 'nodename': nodename})
+89             host_stats = {}
+90 
+91         res = {
+92             'vcpus': host_stats.get('vcpus', 0),
+93             'memory_mb': host_stats.get('memory_mb', 0),
+94             'local_gb': host_stats.get('disk_total', 0),
+95             'vcpus_used': 0,
+96             'memory_mb_used': host_stats.get('memory_mb_used', 0),
+97             'local_gb_used': host_stats.get('disk_used', 0),
+98             'hypervisor_type': host_stats.get('hypervisor_type', 'zvm'),
+99             'hypervisor_version': host_stats.get('hypervisor_version', ''),
+100             'hypervisor_hostname': host_stats.get('hypervisor_hostname', ''),
+101             'cpu_info': jsonutils.dumps(host_stats.get('cpu_info', {})),
+102             'disk_available_least': host_stats.get('disk_available', 0),
+103             'supported_instances': [(ARCHITECTURE,
+104                                      HYPERVISOR_TYPE,
+105                                      obj_fields.VMMode.HVM)],
+106             'numa_topology': None,
+107         }
+108 
+109         return res
+110 
+111     def get_available_nodes(self, refresh=False):
+112         return [self._hypervisor_hostname]
+113 
+114     def _mapping_power_stat(self, power_stat):
+115         """Translate power state to OpenStack defined constants."""
+116         return ZVM_POWER_STAT.get(power_stat, power_state.NOSTATE)
+117 
+118     def get_info(self, instance):
+119         """Get the current status of an instance."""
+120         power_stat = ''
+121         try:
+122             power_stat = self._reqh.call('guest_get_power_state',
+123                                          instance['name'])
+124         except exception.NovaException as err:
+125             if err.kwargs['results']['overallRC'] == 404:
+126                 # instance not exists
+127                 LOG.warning("Get power state of non-exist instance: %s",
+128                             instance['name'])
+129                 raise exception.InstanceNotFound(instance_id=instance['name'])
+130             else:
+131                 raise
+132 
+133         power_stat = self._mapping_power_stat(power_stat)
+134         _instance_info = hardware.InstanceInfo(power_stat)
+135 
+136         return _instance_info
+137 
+138     def _instance_exists(self, instance_name):
+139         """Overwrite this to using instance name as input parameter."""
+140         return instance_name in self.list_instances()
+141 
+142     def instance_exists(self, instance):
+143         """Overwrite this to using instance name as input parameter."""
+144         return self._instance_exists(instance.name)
+145 
+146     def spawn(self, context, instance, image_meta, injected_files,
+147               admin_password, allocations, network_info=None,
+148               block_device_info=None, flavor=None):
+149         LOG.info(_("Spawning new instance %s on zVM hypervisor"),
+150                  instance['name'], instance=instance)
+151         # For zVM instance, limit the maximum length of instance name to \ 8
+152         if len(instance['name']) > 8:
+153             msg = (_("Don't support spawn vm on zVM hypervisor with instance "
+154                 "name: %s, please change your instance_name_template to make "
+155                 "sure the length of instance name is not longer than 8 "
+156                 "characters") % instance['name'])
+157             raise exception.InvalidInput(reason=msg)
+158         try:
+159             spawn_start = time.time()
+160             os_distro = image_meta.properties.os_distro
+161             transportfiles = self._vmutils.generate_configdrive(
+162                             context, instance, injected_files, admin_password)
+163 
+164             resp = self._get_image_info(context, image_meta.id, os_distro)
+165             spawn_image_name = resp[0]['imagename']
+166             disk_list, eph_list = self._set_disk_list(instance,
+167                                                       spawn_image_name,
+168                                                       block_device_info)
+169 
+170             # Create the guest vm
+171             self._reqh.call('guest_create', instance['name'],
+172                             instance['vcpus'], instance['memory_mb'],
+173                             disk_list=disk_list)
+174 
+175             # Deploy image to the guest vm
+176             remotehost = self._get_host()
+177             self._reqh.call('guest_deploy', instance['name'],
+178                             spawn_image_name, transportfiles=transportfiles,
+179                             remotehost=remotehost)
+180 
+181             # Setup network for z/VM instance
+182             self._setup_network(instance['name'], os_distro, network_info,
+183                                 instance)
+184 
+185             # Handle ephemeral disks
+186             if eph_list:
+187                 self._reqh.call('guest_config_minidisks',
+188                                 instance['name'], eph_list)
+189 
+190             self._wait_network_ready(instance)
+191 
+192             self._reqh.call('guest_start', instance['name'])
+193             spawn_time = time.time() - spawn_start
+194             LOG.info(_("Instance spawned succeeded in %s seconds"),
+195                      spawn_time, instance=instance)
+196         except Exception as err:
+197             with excutils.save_and_reraise_exception():
+198                 LOG.error(_("Deploy image to instance %(instance)s "
+199                             "failed with reason: %(err)s"),
+200                           {'instance': instance['name'], 'err': err},
+201                           instance=instance)
+202                 self.destroy(context, instance, network_info,
+203                              block_device_info)
+204 
+205     def _get_image_info(self, context, image_meta_id, os_distro):
+206         spawn_image_exist = False
+207         try:
+208             spawn_image_exist = self._reqh.call('image_query',
+209                                                 imagename=image_meta_id)
+210         except exception.NovaException as err:
+211             if err.kwargs['results']['overallRC'] == 404:
+212                 # image not exist, nothing to do
+213                 pass
+214             else:
+215                 raise err
+216 
+217         if not spawn_image_exist:
+218             with self._imageop_semaphore:
+219                 self._import_spawn_image(context, image_meta_id, os_distro)
+220             return self._reqh.call('image_query', imagename=image_meta_id)
+221         else:
+222             return spawn_image_exist
+223 
+224     def _set_disk_list(self, instance, image_name, block_device_info):
+225         if instance['root_gb'] == 0:
+226             root_disk_size = self._reqh.call('image_get_root_disk_size',
+227                                              image_name)
+228         else:
+229             root_disk_size = '%ig' % instance['root_gb']
+230 
+231         disk_list = []
+232         root_disk = {'size': root_disk_size,
+233                      'is_boot_disk': True
+234                     }
+235         disk_list.append(root_disk)
+236         ephemeral_disks_info = block_device_info.get('ephemerals', [])
+237         eph_list = []
+238         for eph in ephemeral_disks_info:
+239             eph_dict = {'size': '%ig' % eph['size'],
+240                         'format': (eph['guest_format'] or
+241                                    CONF.default_ephemeral_format or
+242                                    DEFAULT_EPH_DISK_FMT)}
+243             eph_list.append(eph_dict)
+244 
+245         if eph_list:
+246             disk_list.extend(eph_list)
+247         return disk_list, eph_list
+248 
+249     def _setup_network(self, vm_name, os_distro, network_info, instance):
+250         LOG.debug("Creating NICs for vm %s", vm_name)
+251         inst_nets = []
+252         for vif in network_info:
+253             subnet = vif['network']['subnets'][0]
+254             _net = {'ip_addr': subnet['ips'][0]['address'],
+255                     'gateway_addr': subnet['gateway']['address'],
+256                     'cidr': subnet['cidr'],
+257                     'mac_addr': vif['address'],
+258                     'nic_id': vif['id']}
+259             inst_nets.append(_net)
+260 
+261         if inst_nets:
+262             self._reqh.call('guest_create_network_interface',
+263                             vm_name, os_distro, inst_nets)
+264 
+265     def _wait_network_ready(self, instance):
+266         """Wait until neutron zvm-agent add all NICs to vm"""
+267         inst_name = instance['name']
+268 
+269         def _wait_for_nics_add_in_vm(inst_name, expiration):
+270             if (CONF.zvm.reachable_timeout and
+271                     timeutils.utcnow() > expiration):
+272                 msg = _("NIC update check failed "
+273                         "on instance:%s") % instance.uuid
+274                 raise exception.NovaException(message=msg)
+275 
+276             try:
+277                 switch_dict = self._reqh.call('guest_get_nic_vswitch_info',
+278                                               inst_name)
+279                 if switch_dict and None not in switch_dict.values():
+280                     for key, value in switch_dict.items():
+281                         user_direct = self._reqh.call(
+282                                             'guest_get_definition_info',
+283                                             inst_name)
+284                         if not self._nic_coupled(user_direct, key, value):
+285                             return
+286                 else:
+287                     # In this case, the nic switch info is not ready yet
+288                     # need another loop to check until time out or find it
+289                     return
+290 
+291             except Exception as e:
+292                 # Ignore any zvm driver exceptions
+293                 LOG.info(_('encounter error %s during get vswitch info'),
+294                          e.format_message(), instance=instance)
+295                 return
+296 
+297             # Enter here means all NIC granted
+298             LOG.info(_("All NICs are added in user direct for "
+299                          "instance %s."), inst_name, instance=instance)
+300             raise loopingcall.LoopingCallDone()
+301 
+302         expiration = timeutils.utcnow() + datetime.timedelta(
+303                              seconds=CONF.zvm.reachable_timeout)
+304         LOG.info(_("Wait neturon-zvm-agent to add NICs to %s user direct."),
+305                  inst_name, instance=instance)
+306         timer = loopingcall.FixedIntervalLoopingCall(
+307                     _wait_for_nics_add_in_vm, inst_name, expiration)
+308         timer.start(interval=10).wait()
+309 
+310     def _nic_coupled(self, user_direct, vdev, vswitch):
+311         if vswitch is None:
+312             return False
+313         direct_info = user_direct['user_direct']
+314         nic_str = ("NICDEF %s TYPE QDIO LAN SYSTEM %s" %
+315                                 (vdev.upper(), vswitch.upper()))
+316         for info in direct_info:
+317             if nic_str in info:
+318                 return True
+319         return False
+320 
+321     def _get_host(self):
+322         return ''.join([pwd.getpwuid(os.geteuid()).pw_name, '@', CONF.my_ip])
+323 
+324     def _import_spawn_image(self, context, image_href, image_os_version):
+325         LOG.debug("Downloading the image %s from glance to nova compute "
+326                   "server", image_href)
+327         image_path = os.path.join(os.path.normpath(CONF.zvm.image_tmp_path),
+328                                   image_href)
+329         if not os.path.exists(image_path):
+330             images.fetch(context, image_href, image_path)
+331         image_url = "file://" + image_path
+332         image_meta = {'os_version': image_os_version}
+333         remote_host = self._get_host()
+334         self._reqh.call('image_import', image_href, image_url,
+335                         image_meta, remote_host=remote_host)
+336 
+337     def destroy(self, context, instance, network_info=None,
+338                 block_device_info=None, destroy_disks=False):
+339         inst_name = instance['name']
+340         if self._instance_exists(inst_name):
+341             LOG.info(_("Destroying instance %s"), inst_name,
+342                      instance=instance)
+343             self._reqh.call('guest_delete', inst_name)
+344         else:
+345             LOG.warning(_('Instance %s does not exist'), inst_name,
+346                         instance=instance)
+347 
+348     def get_host_uptime(self):
+349         return self._ipl_time

@@ -1,0 +1,2616 @@
+Please review the code below for security defects. You can consider defect types in terms of:
+1.CWE-284 (Improper Access Control)
+2.CWE-435 (Improper Interaction Between Multiple Entities)
+3.CWE-664 (Improper Control of a Resource Through its Lifetime)
+4.CWE-682 (Incorrect Calculation)
+5.CWE-691 (Insufficient Control Flow Management)
+6.CWE-693 (Protection Mechanism Failure)
+7.CWE-697 (Incorrect Comparison)
+8.CWE-703 (Improper Check or Handling of Exceptional Conditions)
+9.CWE-707 (Improper Neutralization)
+10.CWE-710 (Improper Adherence to Coding Standards)
+If any are found, please describe the security defect in detail and indicate the corresponding line number of code and solution. If none are detected, states: 'No security defects are detected in the code'.
+
+1 # Copyright 2011 VMware, Inc.
+2 # All Rights Reserved.
+3 #
+4 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
+5 #    not use this file except in compliance with the License. You may obtain
+6 #    a copy of the License at
+7 #
+8 #         http://www.apache.org/licenses/LICENSE-2.0
+9 #
+10 #    Unless required by applicable law or agreed to in writing, software
+11 #    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+12 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+13 #    License for the specific language governing permissions and limitations
+14 #    under the License.
+15 
+16 import base64
+17 import collections
+18 import functools
+19 import hashlib
+20 import signal
+21 import sys
+22 import time
+23 
+24 import netaddr
+25 from neutron_lib.agent import constants as agent_consts
+26 from neutron_lib.agent import topics
+27 from neutron_lib.api.definitions import portbindings
+28 from neutron_lib.api.definitions import provider_net
+29 from neutron_lib.callbacks import events as callback_events
+30 from neutron_lib.callbacks import registry
+31 from neutron_lib.callbacks import resources as callback_resources
+32 from neutron_lib import constants as n_const
+33 from neutron_lib import context
+34 from neutron_lib.placement import utils as place_utils
+35 from neutron_lib.plugins import utils as plugin_utils
+36 from neutron_lib.utils import helpers
+37 import os_vif
+38 from os_vif.objects import instance_info as vif_instance_object
+39 from os_vif.objects import network as vif_network_object
+40 from os_vif.objects import vif as vif_obj
+41 from oslo_config import cfg
+42 from oslo_log import log as logging
+43 import oslo_messaging
+44 from oslo_service import loopingcall
+45 from oslo_service import systemd
+46 from oslo_utils import netutils
+47 from osprofiler import profiler
+48 from ovsdbapp import exceptions as ovs_exceptions
+49 import six
+50 
+51 from neutron._i18n import _
+52 from neutron.agent.common import ip_lib
+53 from neutron.agent.common import ovs_lib
+54 from neutron.agent.common import polling
+55 from neutron.agent.common import utils
+56 from neutron.agent.l2 import l2_agent_extensions_manager as ext_manager
+57 from neutron.agent.linux import xenapi_root_helper
+58 from neutron.agent import rpc as agent_rpc
+59 from neutron.agent import securitygroups_rpc as agent_sg_rpc
+60 from neutron.api.rpc.callbacks import resources
+61 from neutron.api.rpc.handlers import dvr_rpc
+62 from neutron.api.rpc.handlers import securitygroups_rpc as sg_rpc
+63 from neutron.common import config
+64 from neutron.common import utils as n_utils
+65 from neutron.conf.agent import common as agent_config
+66 from neutron.conf.agent import xenapi_conf
+67 from neutron.conf import service as service_conf
+68 from neutron.plugins.ml2.drivers.agent import capabilities
+69 from neutron.plugins.ml2.drivers.l2pop.rpc_manager import l2population_rpc
+70 from neutron.plugins.ml2.drivers.openvswitch.agent.common \
+71     import constants
+72 from neutron.plugins.ml2.drivers.openvswitch.agent \
+73     import ovs_agent_extension_api as ovs_ext_api
+74 from neutron.plugins.ml2.drivers.openvswitch.agent \
+75     import ovs_capabilities
+76 from neutron.plugins.ml2.drivers.openvswitch.agent \
+77     import ovs_dvr_neutron_agent
+78 from neutron.plugins.ml2.drivers.openvswitch.agent import vlanmanager
+79 
+80 
+81 LOG = logging.getLogger(__name__)
+82 cfg.CONF.import_group('AGENT', 'neutron.plugins.ml2.drivers.openvswitch.'
+83                       'agent.common.config')
+84 cfg.CONF.import_group('OVS', 'neutron.plugins.ml2.drivers.openvswitch.agent.'
+85                       'common.config')
+86 
+87 INIT_MAX_TRIES = 3
+88 
+89 
+90 class _mac_mydialect(netaddr.mac_unix):
+91     word_fmt = '%.2x'
+92 
+93 
+94 class OVSPluginApi(agent_rpc.CacheBackedPluginApi):
+95     pass
+96 
+97 
+98 def has_zero_prefixlen_address(ip_addresses):
+99     return any(netaddr.IPNetwork(ip).prefixlen == 0 for ip in ip_addresses)
+100 
+101 
+102 class OVSNeutronAgent(l2population_rpc.L2populationRpcCallBackTunnelMixin,
+103                       dvr_rpc.DVRAgentRpcCallbackMixin):
+104     '''Implements OVS-based tunneling, VLANs and flat networks.
+105 
+106     Two local bridges are created: an integration bridge (defaults to
+107     'br-int') and a tunneling bridge (defaults to 'br-tun'). An
+108     additional bridge is created for each physical network interface
+109     used for VLANs and/or flat networks.
+110 
+111     All VM VIFs are plugged into the integration bridge. VM VIFs on a
+112     given virtual network share a common "local" VLAN (i.e. not
+113     propagated externally). The VLAN id of this local VLAN is mapped
+114     to the physical networking details realizing that virtual network.
+115 
+116     For virtual networks realized as GRE tunnels, a Logical Switch
+117     (LS) identifier is used to differentiate tenant traffic on
+118     inter-HV tunnels. A mesh of tunnels is created to other
+119     Hypervisors in the cloud. These tunnels originate and terminate on
+120     the tunneling bridge of each hypervisor. Port patching is done to
+121     connect local VLANs on the integration bridge to inter-hypervisor
+122     tunnels on the tunnel bridge.
+123 
+124     For each virtual network realized as a VLAN or flat network, a
+125     veth or a pair of patch ports is used to connect the local VLAN on
+126     the integration bridge with the physical network bridge, with flow
+127     rules adding, modifying, or stripping VLAN tags as necessary.
+128     '''
+129 
+130     # history
+131     #   1.0 Initial version
+132     #   1.1 Support Security Group RPC
+133     #   1.2 Support DVR (Distributed Virtual Router) RPC
+134     #   1.3 Added param devices_to_update to security_groups_provider_updated
+135     #   1.4 Added support for network_update
+136     #   1.5 Added binding_activate and binding_deactivate
+137     #   1.7 Add support for smartnic ports
+138     target = oslo_messaging.Target(version='1.7')
+139 
+140     def __init__(self, bridge_classes, ext_manager, conf=None):
+141         '''Constructor.
+142 
+143         :param bridge_classes: a dict for bridge classes.
+144         :param conf: an instance of ConfigOpts
+145         '''
+146         super(OVSNeutronAgent, self).__init__()
+147         self.conf = conf or cfg.CONF
+148         self.ovs = ovs_lib.BaseOVS()
+149         self.ext_manager = ext_manager
+150         agent_conf = self.conf.AGENT
+151         ovs_conf = self.conf.OVS
+152 
+153         self.fullsync = False
+154         # init bridge classes with configured datapath type.
+155         self.br_int_cls, self.br_phys_cls, self.br_tun_cls = (
+156             functools.partial(bridge_classes[b],
+157                               datapath_type=ovs_conf.datapath_type)
+158             for b in ('br_int', 'br_phys', 'br_tun'))
+159 
+160         self.use_veth_interconnection = ovs_conf.use_veth_interconnection
+161         self.veth_mtu = agent_conf.veth_mtu
+162         self.available_local_vlans = set(six.moves.range(
+163             n_const.MIN_VLAN_TAG, n_const.MAX_VLAN_TAG + 1))
+164         self.tunnel_types = agent_conf.tunnel_types or []
+165         self.l2_pop = agent_conf.l2_population
+166         # TODO(ethuleau): Change ARP responder so it's not dependent on the
+167         #                 ML2 l2 population mechanism driver.
+168         self.enable_distributed_routing = agent_conf.enable_distributed_routing
+169         self.arp_responder_enabled = agent_conf.arp_responder and self.l2_pop
+170 
+171         host = self.conf.host
+172         self.agent_id = 'ovs-agent-%s' % host
+173 
+174         self.enable_tunneling = bool(self.tunnel_types)
+175 
+176         # Validate agent configurations
+177         self._check_agent_configurations()
+178 
+179         # Keep track of int_br's device count for use by _report_state()
+180         self.int_br_device_count = 0
+181 
+182         self.int_br = self.br_int_cls(ovs_conf.integration_bridge)
+183         self.setup_integration_br()
+184         # Stores port update notifications for processing in main rpc loop
+185         self.updated_ports = set()
+186         # Stores port just added in last rpc loop cycle
+187         self.last_cycle_added = set()
+188         # Stores port delete notifications
+189         self.deleted_ports = set()
+190         # Stores the port IDs whose binding has been deactivated
+191         self.deactivated_bindings = set()
+192         # Stores the port IDs whose binding has been activated
+193         self.activated_bindings = set()
+194         # Stores smartnic ports update/remove
+195         self.updated_smartnic_ports = list()
+196 
+197         self.network_ports = collections.defaultdict(set)
+198         # keeps association between ports and ofports to detect ofport change
+199         self.vifname_to_ofport_map = {}
+200         # Stores newly created bridges
+201         self.added_bridges = list()
+202         self.bridge_mappings = self._parse_bridge_mappings(
+203             ovs_conf.bridge_mappings)
+204         self.rp_bandwidths = place_utils.parse_rp_bandwidths(
+205             ovs_conf.resource_provider_bandwidths)
+206 
+207         br_set = set(six.itervalues(self.bridge_mappings))
+208         n_utils.validate_rp_bandwidth(self.rp_bandwidths,
+209                                       br_set)
+210         self.rp_inventory_defaults = place_utils.parse_rp_inventory_defaults(
+211             ovs_conf.resource_provider_inventory_defaults)
+212 
+213         self.setup_physical_bridges(self.bridge_mappings)
+214         self.vlan_manager = vlanmanager.LocalVlanManager()
+215 
+216         self._reset_tunnel_ofports()
+217 
+218         self.polling_interval = agent_conf.polling_interval
+219         self.minimize_polling = agent_conf.minimize_polling
+220         self.ovsdb_monitor_respawn_interval = (
+221             agent_conf.ovsdb_monitor_respawn_interval or
+222             constants.DEFAULT_OVSDBMON_RESPAWN)
+223         self.local_ip = ovs_conf.local_ip
+224         self.tunnel_count = 0
+225         self.vxlan_udp_port = agent_conf.vxlan_udp_port
+226         self.dont_fragment = agent_conf.dont_fragment
+227         self.tunnel_csum = agent_conf.tunnel_csum
+228         self.tos = ('inherit'
+229                     if agent_conf.dscp_inherit
+230                     else (int(agent_conf.dscp) << 2
+231                           if agent_conf.dscp
+232                           else None))
+233         self.tun_br = None
+234         self.patch_int_ofport = constants.OFPORT_INVALID
+235         self.patch_tun_ofport = constants.OFPORT_INVALID
+236         if self.enable_tunneling:
+237             # The patch_int_ofport and patch_tun_ofport are updated
+238             # here inside the call to setup_tunnel_br()
+239             self.setup_tunnel_br(ovs_conf.tunnel_bridge)
+240             self.setup_tunnel_br_flows()
+241 
+242         self.setup_rpc()
+243 
+244         self.dvr_agent = ovs_dvr_neutron_agent.OVSDVRNeutronAgent(
+245             self.context,
+246             self.dvr_plugin_rpc,
+247             self.int_br,
+248             self.tun_br,
+249             self.bridge_mappings,
+250             self.phys_brs,
+251             self.int_ofports,
+252             self.phys_ofports,
+253             self.patch_int_ofport,
+254             self.patch_tun_ofport,
+255             host,
+256             self.enable_tunneling,
+257             self.enable_distributed_routing,
+258             self.arp_responder_enabled)
+259 
+260         if self.enable_distributed_routing:
+261             self.dvr_agent.setup_dvr_flows()
+262 
+263         # Collect additional bridges to monitor
+264         self.ancillary_brs = self.setup_ancillary_bridges(
+265             ovs_conf.integration_bridge, ovs_conf.tunnel_bridge)
+266 
+267         agent_api = ovs_ext_api.OVSAgentExtensionAPI(self.int_br,
+268                                                      self.tun_br,
+269                                                      self.phys_brs)
+270         self.ext_manager.initialize(
+271             self.connection, constants.EXTENSION_DRIVER_TYPE, agent_api)
+272 
+273         # In order to keep existed device's local vlan unchanged,
+274         # restore local vlan mapping at start
+275         self._restore_local_vlan_map()
+276 
+277         # Security group agent support
+278         self.sg_agent = agent_sg_rpc.SecurityGroupAgentRpc(
+279             self.context, self.sg_plugin_rpc, defer_refresh_firewall=True,
+280             integration_bridge=self.int_br)
+281         self.sg_plugin_rpc.register_legacy_sg_notification_callbacks(
+282             self.sg_agent)
+283 
+284         # we default to False to provide backward compat with out of tree
+285         # firewall drivers that expect the logic that existed on the Neutron
+286         # server which only enabled hybrid plugging based on the use of the
+287         # hybrid driver.
+288         hybrid_plug = getattr(self.sg_agent.firewall,
+289                               'OVS_HYBRID_PLUG_REQUIRED', False)
+290         self.prevent_arp_spoofing = (
+291             not self.sg_agent.firewall.provides_arp_spoofing_protection)
+292 
+293         self.failed_report_state = False
+294         # TODO(mangelajo): optimize resource_versions to only report
+295         #                  versions about resources which are common,
+296         #                  or which are used by specific extensions.
+297         self.agent_state = {
+298             'binary': 'neutron-openvswitch-agent',
+299             'host': host,
+300             'topic': n_const.L2_AGENT_TOPIC,
+301             'configurations': {'bridge_mappings': self.bridge_mappings,
+302                                n_const.RP_BANDWIDTHS: self.rp_bandwidths,
+303                                n_const.RP_INVENTORY_DEFAULTS:
+304                                    self.rp_inventory_defaults,
+305                                'integration_bridge':
+306                                ovs_conf.integration_bridge,
+307                                'tunnel_types': self.tunnel_types,
+308                                'tunneling_ip': self.local_ip,
+309                                'l2_population': self.l2_pop,
+310                                'arp_responder_enabled':
+311                                self.arp_responder_enabled,
+312                                'enable_distributed_routing':
+313                                self.enable_distributed_routing,
+314                                'log_agent_heartbeats':
+315                                agent_conf.log_agent_heartbeats,
+316                                'extensions': self.ext_manager.names(),
+317                                'datapath_type': ovs_conf.datapath_type,
+318                                'ovs_capabilities': self.ovs.capabilities,
+319                                'vhostuser_socket_dir':
+320                                ovs_conf.vhostuser_socket_dir,
+321                                portbindings.OVS_HYBRID_PLUG: hybrid_plug,
+322                                'baremetal_smartnic':
+323                                self.conf.AGENT.baremetal_smartnic},
+324             'resource_versions': resources.LOCAL_RESOURCE_VERSIONS,
+325             'agent_type': n_const.AGENT_TYPE_OVS,
+326             'start_flag': True}
+327 
+328         report_interval = agent_conf.report_interval
+329         if report_interval:
+330             heartbeat = loopingcall.FixedIntervalLoopingCall(
+331                 self._report_state)
+332             heartbeat.start(interval=report_interval)
+333         # Initialize iteration counter
+334         self.iter_num = 0
+335         self.run_daemon_loop = True
+336 
+337         self.catch_sigterm = False
+338         self.catch_sighup = False
+339 
+340         if self.conf.AGENT.baremetal_smartnic:
+341             os_vif.initialize()
+342 
+343         # The initialization is complete; we can start receiving messages
+344         self.connection.consume_in_threads()
+345 
+346         self.quitting_rpc_timeout = agent_conf.quitting_rpc_timeout
+347 
+348     def _parse_bridge_mappings(self, bridge_mappings):
+349         try:
+350             return helpers.parse_mappings(bridge_mappings)
+351         except ValueError as e:
+352             raise ValueError(_("Parsing bridge_mappings failed: %s.") % e)
+353 
+354     def _report_state(self):
+355         # How many devices are likely used by a VM
+356         self.agent_state.get('configurations')['devices'] = (
+357             self.int_br_device_count)
+358         self.agent_state.get('configurations')['in_distributed_mode'] = (
+359             self.dvr_agent.in_distributed_mode())
+360 
+361         try:
+362             agent_status = self.state_rpc.report_state(self.context,
+363                                                        self.agent_state,
+364                                                        True)
+365             if agent_status == agent_consts.AGENT_REVIVED:
+366                 LOG.info('Agent has just been revived. '
+367                          'Doing a full sync.')
+368                 self.fullsync = True
+369 
+370             # we only want to update resource versions on startup
+371             if self.agent_state.pop('resource_versions', None):
+372                 # On initial start, we notify systemd after initialization
+373                 # is complete.
+374                 systemd.notify_once()
+375 
+376             if self.iter_num > 0:
+377                 # agent is considered started after
+378                 # initial sync with server (iter 0) is done
+379                 self.agent_state.pop('start_flag', None)
+380 
+381         except Exception:
+382             self.failed_report_state = True
+383             LOG.exception("Failed reporting state!")
+384             return
+385         if self.failed_report_state:
+386             self.failed_report_state = False
+387             LOG.info("Successfully reported state after a previous failure.")
+388 
+389     def _restore_local_vlan_map(self):
+390         self._local_vlan_hints = {}
+391         # skip INVALID and UNASSIGNED to match scan_ports behavior
+392         ofport_filter = (ovs_lib.INVALID_OFPORT, ovs_lib.UNASSIGNED_OFPORT)
+393         cur_ports = self.int_br.get_vif_ports(ofport_filter)
+394         port_names = [p.port_name for p in cur_ports]
+395         port_info = self.int_br.get_ports_attributes(
+396             "Port", columns=["name", "other_config", "tag"], ports=port_names)
+397         by_name = {x['name']: x for x in port_info}
+398         for port in cur_ports:
+399             # if a port was deleted between get_vif_ports and
+400             # get_ports_attributes, we
+401             # will get a KeyError
+402             try:
+403                 local_vlan_map = by_name[port.port_name]['other_config']
+404                 local_vlan = by_name[port.port_name]['tag']
+405             except KeyError:
+406                 continue
+407             if not local_vlan:
+408                 continue
+409             net_uuid = local_vlan_map.get('net_uuid')
+410             if (net_uuid and net_uuid not in self._local_vlan_hints and
+411                     local_vlan != constants.DEAD_VLAN_TAG):
+412                 self.available_local_vlans.remove(local_vlan)
+413                 self._local_vlan_hints[local_vlan_map['net_uuid']] = local_vlan
+414 
+415     def _dispose_local_vlan_hints(self):
+416         self.available_local_vlans.update(self._local_vlan_hints.values())
+417         self._local_vlan_hints = {}
+418 
+419     def _reset_tunnel_ofports(self):
+420         self.tun_br_ofports = {n_const.TYPE_GENEVE: {},
+421                                n_const.TYPE_GRE: {},
+422                                n_const.TYPE_VXLAN: {}}
+423 
+424     def _update_network_segmentation_id(self, network):
+425         if network.get(provider_net.NETWORK_TYPE) != n_const.TYPE_VLAN:
+426             return
+427 
+428         try:
+429             lvm = self.vlan_manager.get(network['id'])
+430         except vlanmanager.MappingNotFound:
+431             return
+432 
+433         segmentation_id_old = lvm.segmentation_id
+434         if segmentation_id_old == network[provider_net.SEGMENTATION_ID]:
+435             return
+436         self.vlan_manager.update_segmentation_id(
+437             network['id'], network[provider_net.SEGMENTATION_ID])
+438 
+439         lvid = lvm.vlan
+440         physical_network = network[provider_net.PHYSICAL_NETWORK]
+441         phys_br = self.phys_brs[physical_network]
+442         phys_port = self.phys_ofports[physical_network]
+443         int_port = self.int_ofports[physical_network]
+444         phys_br.reclaim_local_vlan(port=phys_port, lvid=lvid)
+445         phys_br.provision_local_vlan(
+446             port=phys_port, lvid=lvid,
+447             segmentation_id=network[provider_net.SEGMENTATION_ID],
+448             distributed=self.enable_distributed_routing)
+449         self.int_br.reclaim_local_vlan(port=int_port,
+450                                        segmentation_id=segmentation_id_old)
+451         self.int_br.provision_local_vlan(
+452             port=int_port, lvid=lvid,
+453             segmentation_id=network[provider_net.SEGMENTATION_ID])
+454 
+455     def setup_rpc(self):
+456         self.plugin_rpc = OVSPluginApi(topics.PLUGIN)
+457         # allow us to receive port_update/delete callbacks from the cache
+458         self.plugin_rpc.register_legacy_notification_callbacks(self)
+459         self.sg_plugin_rpc = sg_rpc.SecurityGroupServerAPIShim(
+460             self.plugin_rpc.remote_resource_cache)
+461         self.dvr_plugin_rpc = dvr_rpc.DVRServerRpcApi(topics.PLUGIN)
+462         self.state_rpc = agent_rpc.PluginReportStateAPI(topics.REPORTS)
+463 
+464         # RPC network init
+465         self.context = context.get_admin_context_without_session()
+466         # Made a simple RPC call to Neutron Server.
+467         while True:
+468             try:
+469                 self.state_rpc.has_alive_neutron_server(self.context)
+470             except oslo_messaging.MessagingTimeout as e:
+471                 LOG.warning('l2-agent cannot contact neutron server. '
+472                             'Check connectivity to neutron server. '
+473                             'Retrying... '
+474                             'Detailed message: %(msg)s.', {'msg': e})
+475                 continue
+476             break
+477 
+478         # Define the listening consumers for the agent
+479         consumers = [[constants.TUNNEL, topics.UPDATE],
+480                      [constants.TUNNEL, topics.DELETE],
+481                      [topics.DVR, topics.UPDATE]]
+482         if self.l2_pop:
+483             consumers.append([topics.L2POPULATION, topics.UPDATE])
+484         self.connection = agent_rpc.create_consumers([self],
+485                                                      topics.AGENT,
+486                                                      consumers,
+487                                                      start_listening=False)
+488 
+489     @profiler.trace("rpc")
+490     def port_update(self, context, **kwargs):
+491         port = kwargs.get('port')
+492         agent_restarted = kwargs.pop("agent_restarted", False)
+493         # Put the port identifier in the updated_ports set.
+494         # Even if full port details might be provided to this call,
+495         # they are not used since there is no guarantee the notifications
+496         # are processed in the same order as the relevant API requests
+497         if not agent_restarted:
+498             # When ovs-agent is just restarted, the first RPC loop will
+499             # process all the port as 'added'. And all of these ports will
+500             # send a port_update notification after that processing. This
+501             # will cause all these ports to be processed again in next RPC
+502             # loop as 'updated'. So here we just ignore such local update
+503             # notification.
+504             self.updated_ports.add(port['id'])
+505 
+506         if not self.conf.AGENT.baremetal_smartnic:
+507             return
+508         # In case of smart-nic port, add smart-nic representor port to
+509         # the integration bridge.
+510         port_data = (self.plugin_rpc.remote_resource_cache
+511                      .get_resource_by_id(resources.PORT, port['id']))
+512         if not port_data:
+513             LOG.warning('Failed to get port details, port id: %s', port['id'])
+514             return
+515         for port_binding in port_data.get('bindings', []):
+516             if port_binding['vnic_type'] == portbindings.VNIC_SMARTNIC:
+517                 if port_binding['host'] == self.conf.host:
+518                     self._add_port_to_updated_smartnic_ports(port_data,
+519                                                              port_binding)
+520                 else:
+521                     # The port doesn't belong to this Smart NIC,
+522                     # the reason for this could be multi Smart NIC
+523                     # setup.
+524                     LOG.info("Smart NIC port %(port_id)s does not belong "
+525                              "to host %(host)s",
+526                              {'port_id': port['id'],
+527                               'host': self.conf.host})
+528 
+529     def treat_smartnic_port(self, smartnic_port_data):
+530         mac = smartnic_port_data['mac']
+531         vm_uuid = smartnic_port_data['vm_uuid']
+532         rep_port = smartnic_port_data['iface_name']
+533         iface_id = smartnic_port_data['iface_id']
+534         vif_type = smartnic_port_data['vif_type']
+535 
+536         instance_info = vif_instance_object.InstanceInfo(uuid=vm_uuid)
+537         vif = self._get_vif_object(iface_id, rep_port, mac)
+538         try:
+539             if vif_type == portbindings.VIF_TYPE_OVS:
+540                 os_vif.plug(vif, instance_info)
+541 
+542             elif vif_type == portbindings.VIF_TYPE_UNBOUND:
+543                 os_vif.unplug(vif, instance_info)
+544 
+545             else:
+546                 LOG.error("Unexpected vif_type:%(vif_type)s for "
+547                           "%(vnic_type)s port:%(port_id)s",
+548                           {'vnic_type': portbindings.VNIC_SMARTNIC,
+549                            'vif_type': vif_type,
+550                            'port_id': iface_id})
+551 
+552         except Exception as e:
+553             LOG.error("Failed to treat %(vnic_type)s port:%(port_id)s , "
+554                       "error:%(error)s",
+555                       {'vnic_type': portbindings.VNIC_SMARTNIC,
+556                        'port_id': iface_id,
+557                        'error': e})
+558 
+559     def _get_vif_object(self, iface_id, rep_port, mac):
+560         network = vif_network_object.Network(
+561             bridge=self.conf.OVS.integration_bridge)
+562         port_profile = vif_obj.VIFPortProfileOpenVSwitch(
+563             interface_id=iface_id, create_port=True)
+564         return vif_obj.VIFOpenVSwitch(
+565             vif_name=rep_port, plugin='ovs', port_profile=port_profile,
+566             network=network, address=str(mac))
+567 
+568     def _add_port_to_updated_smartnic_ports(self, port_data, port_binding):
+569         local_link = port_binding['profile']['local_link_information']
+570         if local_link:
+571             iface_name = local_link[0]['port_id']
+572             self.updated_smartnic_ports.append({
+573                 'mac': port_data['mac_address'],
+574                 'vm_uuid': port_data['device_id'],
+575                 'iface_name': iface_name,
+576                 'iface_id': port_data['id'],
+577                 'vif_type': port_binding['vif_type']})
+578 
+579     @profiler.trace("rpc")
+580     def port_delete(self, context, **kwargs):
+581         port_id = kwargs.get('port_id')
+582         self.deleted_ports.add(port_id)
+583         self.updated_ports.discard(port_id)
+584 
+585     @profiler.trace("rpc")
+586     def network_update(self, context, **kwargs):
+587         network_id = kwargs['network']['id']
+588         network = self.plugin_rpc.get_network_details(
+589             self.context, network_id, self.agent_id, self.conf.host)
+590         self._update_network_segmentation_id(network)
+591         for port_id in self.network_ports[network_id]:
+592             # notifications could arrive out of order, if the port is deleted
+593             # we don't want to update it anymore
+594             if port_id not in self.deleted_ports:
+595                 self.updated_ports.add(port_id)
+596         LOG.debug("network_update message processed for network "
+597                   "%(network_id)s, with ports: %(ports)s",
+598                   {'network_id': network_id,
+599                    'ports': self.network_ports[network_id]})
+600 
+601     @profiler.trace("rpc")
+602     def binding_deactivate(self, context, **kwargs):
+603         if kwargs.get('host') != self.conf.host:
+604             return
+605         port_id = kwargs.get('port_id')
+606         self.deactivated_bindings.add(port_id)
+607 
+608     @profiler.trace("rpc")
+609     def binding_activate(self, context, **kwargs):
+610         if kwargs.get('host') != self.conf.host:
+611             return
+612         port_id = kwargs.get('port_id')
+613         self.activated_bindings.add(port_id)
+614 
+615     def _clean_network_ports(self, port_id):
+616         for port_set in self.network_ports.values():
+617             if port_id in port_set:
+618                 port_set.remove(port_id)
+619                 break
+620 
+621     def process_deleted_ports(self, port_info):
+622         # don't try to process removed ports as deleted ports since
+623         # they are already gone
+624         if 'removed' in port_info:
+625             self.deleted_ports -= port_info['removed']
+626         deleted_ports = list(self.deleted_ports)
+627         while self.deleted_ports:
+628             port_id = self.deleted_ports.pop()
+629             port = self.int_br.get_vif_port_by_id(port_id)
+630             self._clean_network_ports(port_id)
+631             self.ext_manager.delete_port(self.context,
+632                                          {"vif_port": port,
+633                                           "port_id": port_id})
+634             # move to dead VLAN so deleted ports no
+635             # longer have access to the network
+636             if port:
+637                 # don't log errors since there is a chance someone will be
+638                 # removing the port from the bridge at the same time
+639                 self.port_dead(port, log_errors=False)
+640             self.port_unbound(port_id)
+641         # Flush firewall rules after ports are put on dead VLAN to be
+642         # more secure
+643         self.sg_agent.remove_devices_filter(deleted_ports)
+644 
+645     def process_smartnic_ports(self):
+646         smartnic_ports = self.plugin_rpc.get_ports_by_vnic_type_and_host(
+647             self.context, portbindings.VNIC_SMARTNIC, self.conf.host)
+648         ports = self.int_br.get_vif_port_set()
+649         for smartnic_port in smartnic_ports:
+650             if smartnic_port['id'] not in ports:
+651                 self._add_port_to_updated_smartnic_ports(
+652                     smartnic_port,
+653                     {'profile': smartnic_port['binding:profile'],
+654                      'vif_type': smartnic_port['binding:vif_type']})
+655 
+656     def process_deactivated_bindings(self, port_info):
+657         # don't try to deactivate bindings for removed ports since they are
+658         # already gone
+659         if 'removed' in port_info:
+660             self.deactivated_bindings -= port_info['removed']
+661         while self.deactivated_bindings:
+662             port_id = self.deactivated_bindings.pop()
+663             port = self.int_br.get_vif_port_by_id(port_id)
+664             if not port:
+665                 continue
+666             self.int_br.delete_port(port.port_name)
+667             LOG.debug(("Port id %s unplugged from integration bridge because "
+668                        "its binding was de-activated"), port_id)
+669 
+670     def process_activated_bindings(self, port_info, activated_bindings_copy):
+671         # Compute which ports for activated bindings are still present...
+672         activated_bindings_copy &= port_info['current']
+673         # ...and treat them as just added
+674         port_info['added'] |= activated_bindings_copy
+675 
+676     @profiler.trace("rpc")
+677     def tunnel_update(self, context, **kwargs):
+678         LOG.debug("tunnel_update received")
+679         if not self.enable_tunneling:
+680             return
+681         tunnel_ip = kwargs.get('tunnel_ip')
+682         tunnel_type = kwargs.get('tunnel_type')
+683         if not tunnel_type:
+684             LOG.error("No tunnel_type specified, cannot create tunnels")
+685             return
+686         if tunnel_type not in self.tunnel_types:
+687             LOG.error("tunnel_type %s not supported by agent",
+688                       tunnel_type)
+689             return
+690         if tunnel_ip == self.local_ip:
+691             return
+692         tun_name = self.get_tunnel_name(tunnel_type, self.local_ip, tunnel_ip)
+693         if tun_name is None:
+694             return
+695         if not self.l2_pop:
+696             self._setup_tunnel_port(self.tun_br, tun_name, tunnel_ip,
+697                                     tunnel_type)
+698             self._setup_tunnel_flood_flow(self.tun_br, tunnel_type)
+699 
+700     @profiler.trace("rpc")
+701     def tunnel_delete(self, context, **kwargs):
+702         LOG.debug("tunnel_delete received")
+703         if not self.enable_tunneling:
+704             return
+705         tunnel_ip = kwargs.get('tunnel_ip')
+706         if not tunnel_ip:
+707             LOG.error("No tunnel_ip specified, cannot delete tunnels")
+708             return
+709         tunnel_type = kwargs.get('tunnel_type')
+710         if not tunnel_type:
+711             LOG.error("No tunnel_type specified, cannot delete tunnels")
+712             return
+713         if tunnel_type not in self.tunnel_types:
+714             LOG.error("tunnel_type %s not supported by agent",
+715                       tunnel_type)
+716             return
+717         ofport = self.tun_br_ofports[tunnel_type].get(tunnel_ip)
+718         self.cleanup_tunnel_port(self.tun_br, ofport, tunnel_type)
+719 
+720     def _tunnel_port_lookup(self, network_type, remote_ip):
+721         return self.tun_br_ofports[network_type].get(remote_ip)
+722 
+723     def fdb_add(self, context, fdb_entries):
+724         LOG.debug("fdb_add received")
+725         for lvm, agent_ports in self.get_agent_ports(fdb_entries):
+726             agent_ports.pop(self.local_ip, None)
+727             if len(agent_ports):
+728                 if not self.enable_distributed_routing:
+729                     with self.tun_br.deferred() as deferred_br:
+730                         self.fdb_add_tun(context, deferred_br, lvm,
+731                                          agent_ports, self._tunnel_port_lookup)
+732                 else:
+733                     self.fdb_add_tun(context, self.tun_br, lvm,
+734                                      agent_ports, self._tunnel_port_lookup)
+735 
+736     def fdb_remove(self, context, fdb_entries):
+737         LOG.debug("fdb_remove received")
+738         for lvm, agent_ports in self.get_agent_ports(fdb_entries):
+739             agent_ports.pop(self.local_ip, None)
+740             if len(agent_ports):
+741                 if not self.enable_distributed_routing:
+742                     with self.tun_br.deferred() as deferred_br:
+743                         self.fdb_remove_tun(context, deferred_br, lvm,
+744                                             agent_ports,
+745                                             self._tunnel_port_lookup)
+746                 else:
+747                     self.fdb_remove_tun(context, self.tun_br, lvm,
+748                                         agent_ports, self._tunnel_port_lookup)
+749 
+750     def add_fdb_flow(self, br, port_info, remote_ip, lvm, ofport):
+751         if port_info == n_const.FLOODING_ENTRY:
+752             lvm.tun_ofports.add(ofport)
+753             br.install_flood_to_tun(lvm.vlan, lvm.segmentation_id,
+754                                     lvm.tun_ofports)
+755         else:
+756             self.setup_entry_for_arp_reply(br, 'add', lvm.vlan,
+757                                            port_info.mac_address,
+758                                            port_info.ip_address)
+759             br.install_unicast_to_tun(lvm.vlan,
+760                                       lvm.segmentation_id,
+761                                       ofport,
+762                                       port_info.mac_address)
+763 
+764     def del_fdb_flow(self, br, port_info, remote_ip, lvm, ofport):
+765         if port_info == n_const.FLOODING_ENTRY:
+766             if ofport not in lvm.tun_ofports:
+767                 LOG.debug("attempt to remove a non-existent port %s", ofport)
+768                 return
+769             lvm.tun_ofports.remove(ofport)
+770             if len(lvm.tun_ofports) > 0:
+771                 br.install_flood_to_tun(lvm.vlan, lvm.segmentation_id,
+772                                         lvm.tun_ofports)
+773             else:
+774                 # This local vlan doesn't require any more tunneling
+775                 br.delete_flood_to_tun(lvm.vlan)
+776         else:
+777             self.setup_entry_for_arp_reply(br, 'remove', lvm.vlan,
+778                                            port_info.mac_address,
+779                                            port_info.ip_address)
+780             br.delete_unicast_to_tun(lvm.vlan, port_info.mac_address)
+781 
+782     def _fdb_chg_ip(self, context, fdb_entries):
+783         LOG.debug("update chg_ip received")
+784         with self.tun_br.deferred() as deferred_br:
+785             self.fdb_chg_ip_tun(context, deferred_br, fdb_entries,
+786                                 self.local_ip)
+787 
+788     def setup_entry_for_arp_reply(self, br, action, local_vid, mac_address,
+789                                   ip_address):
+790         '''Set the ARP respond entry.
+791 
+792         When the l2 population mechanism driver and OVS supports to edit ARP
+793         fields, a table (ARP_RESPONDER) to resolve ARP locally is added to the
+794         tunnel bridge.
+795         '''
+796         if not self.arp_responder_enabled:
+797             return
+798 
+799         ip = netaddr.IPAddress(ip_address)
+800         if ip.version == 6:
+801             return
+802 
+803         ip = str(ip)
+804         mac = str(netaddr.EUI(mac_address, dialect=_mac_mydialect))
+805 
+806         if action == 'add':
+807             br.install_arp_responder(local_vid, ip, mac)
+808         elif action == 'remove':
+809             br.delete_arp_responder(local_vid, ip)
+810         else:
+811             LOG.warning('Action %s not supported', action)
+812 
+813     def _local_vlan_for_flat(self, lvid, physical_network):
+814         phys_br = self.phys_brs[physical_network]
+815         phys_port = self.phys_ofports[physical_network]
+816         int_br = self.int_br
+817         int_port = self.int_ofports[physical_network]
+818         phys_br.provision_local_vlan(port=phys_port, lvid=lvid,
+819                                      segmentation_id=None,
+820                                      distributed=False)
+821         int_br.provision_local_vlan(port=int_port, lvid=lvid,
+822                                     segmentation_id=None)
+823 
+824     def _local_vlan_for_vlan(self, lvid, physical_network, segmentation_id):
+825         distributed = self.enable_distributed_routing
+826         phys_br = self.phys_brs[physical_network]
+827         phys_port = self.phys_ofports[physical_network]
+828         int_br = self.int_br
+829         int_port = self.int_ofports[physical_network]
+830         phys_br.provision_local_vlan(port=phys_port, lvid=lvid,
+831                                      segmentation_id=segmentation_id,
+832                                      distributed=distributed)
+833         int_br.provision_local_vlan(port=int_port, lvid=lvid,
+834                                     segmentation_id=segmentation_id)
+835 
+836     def _add_local_vlan(self, net_uuid, network_type, physical_network,
+837                         segmentation_id):
+838         """Add a network to the local VLAN manager
+839 
+840         On a restart or crash of OVS, the network associated with this VLAN
+841         will already be assigned, so check for that here before assigning a
+842         new one. If the VLAN tag is not used, check if there are local VLAN
+843         tags available.
+844         """
+845         try:
+846             lvm = self.vlan_manager.get(net_uuid)
+847         except vlanmanager.MappingNotFound:
+848             lvid = self._local_vlan_hints.pop(net_uuid, None)
+849             if lvid is None:
+850                 if not self.available_local_vlans:
+851                     LOG.error("No local VLAN available for net-id=%s",
+852                               net_uuid)
+853                     return
+854                 lvid = self.available_local_vlans.pop()
+855             self.vlan_manager.add(
+856                 net_uuid, lvid, network_type, physical_network,
+857                 segmentation_id)
+858             lvm = self.vlan_manager.get(net_uuid)
+859             LOG.info(
+860                 "Assigning %(vlan_id)s as local vlan for net-id=%(net_uuid)s",
+861                 {'vlan_id': lvm.vlan, 'net_uuid': net_uuid})
+862 
+863         return lvm
+864 
+865     def provision_local_vlan(self, net_uuid, network_type, physical_network,
+866                              segmentation_id):
+867         '''Provisions a local VLAN.
+868 
+869         :param net_uuid: the uuid of the network associated with this vlan.
+870         :param network_type: the network type ('gre', 'vxlan', 'vlan', 'flat',
+871                                                'local', 'geneve')
+872         :param physical_network: the physical network for 'vlan' or 'flat'
+873         :param segmentation_id: the VID for 'vlan' or tunnel ID for 'tunnel'
+874         '''
+875         lvm = self._add_local_vlan(net_uuid, network_type, physical_network,
+876                                    segmentation_id)
+877         if not lvm or not lvm.vlan:
+878             return
+879 
+880         lvid = lvm.vlan
+881         if network_type in constants.TUNNEL_NETWORK_TYPES:
+882             if self.enable_tunneling:
+883                 # outbound broadcast/multicast
+884                 ofports = list(self.tun_br_ofports[network_type].values())
+885                 if ofports:
+886                     self.tun_br.install_flood_to_tun(lvid,
+887                                                      segmentation_id,
+888                                                      ofports)
+889                 # inbound from tunnels: set lvid in the right table
+890                 # and resubmit to Table LEARN_FROM_TUN for mac learning
+891                 if self.enable_distributed_routing:
+892                     self.dvr_agent.process_tunneled_network(
+893                         network_type, lvid, segmentation_id)
+894                 else:
+895                     self.tun_br.provision_local_vlan(
+896                         network_type=network_type, lvid=lvid,
+897                         segmentation_id=segmentation_id)
+898             else:
+899                 LOG.error("Cannot provision %(network_type)s network for "
+900                           "net-id=%(net_uuid)s - tunneling disabled",
+901                           {'network_type': network_type,
+902                            'net_uuid': net_uuid})
+903         elif network_type == n_const.TYPE_FLAT:
+904             if physical_network in self.phys_brs:
+905                 self._local_vlan_for_flat(lvid, physical_network)
+906             else:
+907                 LOG.error("Cannot provision flat network for "
+908                           "net-id=%(net_uuid)s - no bridge for "
+909                           "physical_network %(physical_network)s",
+910                           {'net_uuid': net_uuid,
+911                            'physical_network': physical_network})
+912         elif network_type == n_const.TYPE_VLAN:
+913             if physical_network in self.phys_brs:
+914                 self._local_vlan_for_vlan(lvid, physical_network,
+915                                           segmentation_id)
+916             else:
+917                 LOG.error("Cannot provision VLAN network for "
+918                           "net-id=%(net_uuid)s - no bridge for "
+919                           "physical_network %(physical_network)s",
+920                           {'net_uuid': net_uuid,
+921                            'physical_network': physical_network})
+922         elif network_type == n_const.TYPE_LOCAL:
+923             # no flows needed for local networks
+924             pass
+925         else:
+926             LOG.error("Cannot provision unknown network type "
+927                       "%(network_type)s for net-id=%(net_uuid)s",
+928                       {'network_type': network_type,
+929                        'net_uuid': net_uuid})
+930 
+931     def reclaim_local_vlan(self, net_uuid):
+932         '''Reclaim a local VLAN.
+933 
+934         :param net_uuid: the network uuid associated with this vlan.
+935         '''
+936         try:
+937             lvm = vlanmanager.LocalVlanManager().pop(net_uuid)
+938         except KeyError:
+939             LOG.debug("Network %s not used on agent.", net_uuid)
+940             return
+941 
+942         LOG.info("Reclaiming vlan = %(vlan_id)s from "
+943                  "net-id = %(net_uuid)s",
+944                  {'vlan_id': lvm.vlan, 'net_uuid': net_uuid})
+945 
+946         if lvm.network_type in constants.TUNNEL_NETWORK_TYPES:
+947             if self.enable_tunneling:
+948                 self.tun_br.reclaim_local_vlan(
+949                     network_type=lvm.network_type,
+950                     segmentation_id=lvm.segmentation_id)
+951                 self.tun_br.delete_flood_to_tun(lvm.vlan)
+952                 self.tun_br.delete_unicast_to_tun(lvm.vlan, None)
+953                 self.tun_br.delete_arp_responder(lvm.vlan, None)
+954                 if self.l2_pop:
+955                     # Try to remove tunnel ports if not used by other networks
+956                     for ofport in lvm.tun_ofports:
+957                         self.cleanup_tunnel_port(self.tun_br, ofport,
+958                                                  lvm.network_type)
+959         elif lvm.network_type == n_const.TYPE_FLAT:
+960             if lvm.physical_network in self.phys_brs:
+961                 # outbound
+962                 br = self.phys_brs[lvm.physical_network]
+963                 br.reclaim_local_vlan(
+964                     port=self.phys_ofports[lvm.physical_network],
+965                     lvid=lvm.vlan)
+966                 # inbound
+967                 br = self.int_br
+968                 br.reclaim_local_vlan(
+969                     port=self.int_ofports[lvm.physical_network],
+970                     segmentation_id=None)
+971         elif lvm.network_type == n_const.TYPE_VLAN:
+972             if lvm.physical_network in self.phys_brs:
+973                 # outbound
+974                 br = self.phys_brs[lvm.physical_network]
+975                 br.reclaim_local_vlan(
+976                     port=self.phys_ofports[lvm.physical_network],
+977                     lvid=lvm.vlan)
+978                 # inbound
+979                 br = self.int_br
+980                 br.reclaim_local_vlan(
+981                     port=self.int_ofports[lvm.physical_network],
+982                     segmentation_id=lvm.segmentation_id)
+983         elif lvm.network_type == n_const.TYPE_LOCAL:
+984             # no flows needed for local networks
+985             pass
+986         else:
+987             LOG.error("Cannot reclaim unknown network type "
+988                       "%(network_type)s for net-id=%(net_uuid)s",
+989                       {'network_type': lvm.network_type,
+990                        'net_uuid': net_uuid})
+991 
+992         self.available_local_vlans.add(lvm.vlan)
+993 
+994     def port_bound(self, port, net_uuid,
+995                    network_type, physical_network,
+996                    segmentation_id, fixed_ips, device_owner,
+997                    provisioning_needed):
+998         '''Bind port to net_uuid/lsw_id and install flow for inbound traffic
+999         to vm.
+1000 
+1001         :param port: an ovs_lib.VifPort object.
+1002         :param net_uuid: the net_uuid this port is to be associated with.
+1003         :param network_type: the network type ('gre', 'vlan', 'flat', 'local')
+1004         :param physical_network: the physical network for 'vlan' or 'flat'
+1005         :param segmentation_id: the VID for 'vlan' or tunnel ID for 'tunnel'
+1006         :param fixed_ips: the ip addresses assigned to this port
+1007         :param device_owner: the string indicative of owner of this port
+1008         :param provisioning_needed: indicates if this is called for an OVS
+1009                                     restart or recreated physical bridges
+1010                                     and requires to do local vlan provisioning
+1011         '''
+1012         if net_uuid not in self.vlan_manager or provisioning_needed:
+1013             self.provision_local_vlan(net_uuid, network_type,
+1014                                       physical_network, segmentation_id)
+1015         lvm = self.vlan_manager.get(net_uuid)
+1016         lvm.vif_ports[port.vif_id] = port
+1017 
+1018         self.dvr_agent.bind_port_to_dvr(port, lvm,
+1019                                         fixed_ips,
+1020                                         device_owner)
+1021         port_other_config = self.int_br.db_get_val("Port", port.port_name,
+1022                                                    "other_config")
+1023         if port_other_config is None:
+1024             if port.vif_id in self.deleted_ports:
+1025                 LOG.debug("Port %s deleted concurrently", port.vif_id)
+1026             elif port.vif_id in self.updated_ports:
+1027                 LOG.error("Expected port %s not found", port.vif_id)
+1028             else:
+1029                 LOG.debug("Unable to get config for port %s", port.vif_id)
+1030             return False
+1031 
+1032         vlan_mapping = {'net_uuid': net_uuid,
+1033                         'network_type': network_type,
+1034                         'physical_network': str(physical_network)}
+1035         if segmentation_id is not None:
+1036             vlan_mapping['segmentation_id'] = str(segmentation_id)
+1037         port_other_config.update(vlan_mapping)
+1038         self.int_br.set_db_attribute("Port", port.port_name, "other_config",
+1039                                      port_other_config)
+1040         return True
+1041 
+1042     def _add_port_tag_info(self, need_binding_ports):
+1043         port_names = [p['vif_port'].port_name for p in need_binding_ports]
+1044         port_info = self.int_br.get_ports_attributes(
+1045             "Port", columns=["name", "tag", "other_config"],
+1046             ports=port_names, if_exists=True)
+1047         info_by_port = {
+1048             x['name']: {
+1049                 'tag': x['tag'],
+1050                 'other_config': x['other_config'] or {}
+1051             }
+1052             for x in port_info
+1053         }
+1054         for port_detail in need_binding_ports:
+1055             try:
+1056                 lvm = self.vlan_manager.get(port_detail['network_id'])
+1057             except vlanmanager.MappingNotFound:
+1058                 continue
+1059             port = port_detail['vif_port']
+1060             try:
+1061                 cur_info = info_by_port[port.port_name]
+1062             except KeyError:
+1063                 continue
+1064             str_vlan = str(lvm.vlan)
+1065             other_config = cur_info['other_config']
+1066             if (cur_info['tag'] != lvm.vlan or
+1067                     other_config.get('tag') != str_vlan):
+1068                 other_config['tag'] = str_vlan
+1069                 self.int_br.set_db_attribute(
+1070                     "Port", port.port_name, "other_config", other_config)
+1071                 # Uninitialized port has tag set to []
+1072                 if cur_info['tag']:
+1073                     LOG.warning("Uninstall flows of ofport %s due to "
+1074                                 "local vlan change.", port.ofport)
+1075                     self.int_br.uninstall_flows(in_port=port.ofport)
+1076 
+1077     def _bind_devices(self, need_binding_ports):
+1078         devices_up = []
+1079         devices_down = []
+1080         failed_devices = []
+1081         port_names = [p['vif_port'].port_name for p in need_binding_ports]
+1082         port_info = self.int_br.get_ports_attributes(
+1083             "Port", columns=["name", "tag"], ports=port_names, if_exists=True)
+1084         tags_by_name = {x['name']: x['tag'] for x in port_info}
+1085         for port_detail in need_binding_ports:
+1086             try:
+1087                 lvm = self.vlan_manager.get(port_detail['network_id'])
+1088             except vlanmanager.MappingNotFound:
+1089                 # network for port was deleted. skip this port since it
+1090                 # will need to be handled as a DEAD port in the next scan
+1091                 continue
+1092             port = port_detail['vif_port']
+1093             device = port_detail['device']
+1094             # Do not bind a port if it's already bound
+1095             cur_tag = tags_by_name.get(port.port_name)
+1096             if cur_tag is None:
+1097                 LOG.debug("Port %s was deleted concurrently, skipping it",
+1098                           port.port_name)
+1099                 continue
+1100             if self.prevent_arp_spoofing:
+1101                 self.setup_arp_spoofing_protection(self.int_br,
+1102                                                    port, port_detail)
+1103             if cur_tag != lvm.vlan:
+1104                 self.int_br.set_db_attribute(
+1105                     "Port", port.port_name, "tag", lvm.vlan)
+1106 
+1107             # update plugin about port status
+1108             # FIXME(salv-orlando): Failures while updating device status
+1109             # must be handled appropriately. Otherwise this might prevent
+1110             # neutron server from sending network-vif-* events to the nova
+1111             # API server, thus possibly preventing instance spawn.
+1112             if port_detail.get('admin_state_up'):
+1113                 LOG.debug("Setting status for %s to UP", device)
+1114                 devices_up.append(device)
+1115             else:
+1116                 LOG.debug("Setting status for %s to DOWN", device)
+1117                 devices_down.append(device)
+1118         if devices_up or devices_down:
+1119             # When the iter_num == 0, that indicate the ovs-agent is doing
+1120             # the initialization work. L2 pop needs this precise knowledge
+1121             # to notify the agent to refresh the tunnel related flows.
+1122             # Otherwise, these flows will be cleaned as stale due to the
+1123             # different cookie id.
+1124             agent_restarted = self.iter_num == 0
+1125             devices_set = self.plugin_rpc.update_device_list(
+1126                 self.context, devices_up, devices_down, self.agent_id,
+1127                 self.conf.host, agent_restarted=agent_restarted)
+1128             failed_devices = (devices_set.get('failed_devices_up') +
+1129                               devices_set.get('failed_devices_down'))
+1130             if failed_devices:
+1131                 LOG.error("Configuration for devices %s failed!",
+1132                           failed_devices)
+1133         LOG.info("Configuration for devices up %(up)s and devices "
+1134                  "down %(down)s completed.",
+1135                  {'up': devices_up, 'down': devices_down})
+1136         return set(failed_devices)
+1137 
+1138     @staticmethod
+1139     def setup_arp_spoofing_protection(bridge, vif, port_details):
+1140         if not port_details.get('port_security_enabled', True):
+1141             LOG.info("Skipping ARP spoofing rules for port '%s' because "
+1142                      "it has port security disabled", vif.port_name)
+1143             bridge.delete_arp_spoofing_protection(port=vif.ofport)
+1144             bridge.set_allowed_macs_for_port(port=vif.ofport, allow_all=True)
+1145             return
+1146         if port_details['device_owner'].startswith(
+1147                 n_const.DEVICE_OWNER_NETWORK_PREFIX):
+1148             LOG.debug("Skipping ARP spoofing rules for network owned port "
+1149                       "'%s'.", vif.port_name)
+1150             bridge.delete_arp_spoofing_protection(port=vif.ofport)
+1151             bridge.set_allowed_macs_for_port(port=vif.ofport, allow_all=True)
+1152             return
+1153         # clear any previous flows related to this port in our ARP table
+1154         bridge.delete_arp_spoofing_allow_rules(port=vif.ofport)
+1155         # collect all of the addresses and cidrs that belong to the port
+1156         addresses = {f['ip_address'] for f in port_details['fixed_ips']}
+1157         mac_addresses = {vif.vif_mac}
+1158         if port_details.get('allowed_address_pairs'):
+1159             addresses |= {p['ip_address']
+1160                           for p in port_details['allowed_address_pairs']}
+1161             mac_addresses |= {p['mac_address']
+1162                               for p in port_details['allowed_address_pairs']
+1163                               if p.get('mac_address')}
+1164 
+1165         bridge.set_allowed_macs_for_port(vif.ofport, mac_addresses)
+1166         ipv6_addresses = {ip for ip in addresses
+1167                           if netaddr.IPNetwork(ip).version == 6}
+1168         # Allow neighbor advertisements for LLA address.
+1169         ipv6_addresses |= {str(netutils.get_ipv6_addr_by_EUI64(
+1170                                n_const.IPv6_LLA_PREFIX, mac))
+1171                            for mac in mac_addresses}
+1172         if not has_zero_prefixlen_address(ipv6_addresses):
+1173             # Install protection only when prefix is not zero because a /0
+1174             # prefix allows any address anyway and the nd_target can only
+1175             # match on /1 or more.
+1176             bridge.install_icmpv6_na_spoofing_protection(
+1177                 port=vif.ofport, ip_addresses=ipv6_addresses)
+1178 
+1179         ipv4_addresses = {ip for ip in addresses
+1180                           if netaddr.IPNetwork(ip).version == 4}
+1181         if not has_zero_prefixlen_address(ipv4_addresses):
+1182             # Install protection only when prefix is not zero because a /0
+1183             # prefix allows any address anyway and the ARP_SPA can only
+1184             # match on /1 or more.
+1185             bridge.install_arp_spoofing_protection(port=vif.ofport,
+1186                                                    ip_addresses=ipv4_addresses)
+1187         else:
+1188             bridge.delete_arp_spoofing_protection(port=vif.ofport)
+1189 
+1190     def port_unbound(self, vif_id, net_uuid=None):
+1191         '''Unbind port.
+1192 
+1193         Removes corresponding local vlan mapping object if this is its last
+1194         VIF.
+1195 
+1196         :param vif_id: the id of the vif
+1197         :param net_uuid: the net_uuid this port is associated with.
+1198         '''
+1199         try:
+1200             net_uuid = net_uuid or self.vlan_manager.get_net_uuid(vif_id)
+1201         except vlanmanager.VifIdNotFound:
+1202             LOG.info(
+1203                 'port_unbound(): net_uuid %s not managed by VLAN manager',
+1204                 net_uuid)
+1205             return
+1206 
+1207         lvm = self.vlan_manager.get(net_uuid)
+1208 
+1209         if vif_id in lvm.vif_ports:
+1210             vif_port = lvm.vif_ports[vif_id]
+1211             self.dvr_agent.unbind_port_from_dvr(vif_port, lvm)
+1212         lvm.vif_ports.pop(vif_id, None)
+1213 
+1214         if not lvm.vif_ports:
+1215             self.reclaim_local_vlan(net_uuid)
+1216 
+1217     def port_dead(self, port, log_errors=True):
+1218         '''Once a port has no binding, put it on the "dead vlan".
+1219 
+1220         :param port: an ovs_lib.VifPort object.
+1221         '''
+1222         # Don't kill a port if it's already dead
+1223         cur_tag = self.int_br.db_get_val("Port", port.port_name, "tag",
+1224                                          log_errors=log_errors)
+1225         if cur_tag and cur_tag != constants.DEAD_VLAN_TAG:
+1226             self.int_br.set_db_attribute("Port", port.port_name, "tag",
+1227                                          constants.DEAD_VLAN_TAG,
+1228                                          log_errors=log_errors)
+1229             self.int_br.drop_port(in_port=port.ofport)
+1230 
+1231     def setup_integration_br(self):
+1232         '''Setup the integration bridge.
+1233 
+1234         '''
+1235         # Ensure the integration bridge is created.
+1236         # ovs_lib.OVSBridge.create() will run the equivalent of
+1237         #   ovs-vsctl -- --may-exist add-br BRIDGE_NAME
+1238         # which does nothing if bridge already exists.
+1239         self.int_br.create()
+1240         self.int_br.set_secure_mode()
+1241         self.int_br.setup_controllers(self.conf)
+1242         self.int_br.set_igmp_snooping_state(self.conf.OVS.igmp_snooping_enable)
+1243 
+1244         if self.conf.AGENT.drop_flows_on_start:
+1245             # Delete the patch port between br-int and br-tun if we're deleting
+1246             # the flows on br-int, so that traffic doesn't get flooded over
+1247             # while flows are missing.
+1248             self.int_br.delete_port(self.conf.OVS.int_peer_patch_port)
+1249             self.int_br.uninstall_flows(cookie=ovs_lib.COOKIE_ANY)
+1250         self.int_br.setup_default_table()
+1251 
+1252     def setup_ancillary_bridges(self, integ_br, tun_br):
+1253         '''Setup ancillary bridges - for example br-ex.'''
+1254         ovs = ovs_lib.BaseOVS()
+1255         ovs_bridges = set(ovs.get_bridges())
+1256         # Remove all known bridges
+1257         ovs_bridges.remove(integ_br)
+1258         if self.enable_tunneling:
+1259             ovs_bridges.remove(tun_br)
+1260         br_names = [self.phys_brs[physical_network].br_name for
+1261                     physical_network in self.phys_brs]
+1262         ovs_bridges.difference_update(br_names)
+1263         # Filter list of bridges to those that have external
+1264         # bridge-id's configured
+1265         br_names = []
+1266         for bridge in ovs_bridges:
+1267             bridge_id = ovs.get_bridge_external_bridge_id(bridge,
+1268                                                           log_errors=False)
+1269             if bridge_id != bridge:
+1270                 br_names.append(bridge)
+1271         ovs_bridges.difference_update(br_names)
+1272         ancillary_bridges = []
+1273         for bridge in ovs_bridges:
+1274             br = ovs_lib.OVSBridge(bridge)
+1275             LOG.info('Adding %s to list of bridges.', bridge)
+1276             ancillary_bridges.append(br)
+1277         return ancillary_bridges
+1278 
+1279     def setup_tunnel_br(self, tun_br_name=None):
+1280         '''(re)initialize the tunnel bridge.
+1281 
+1282         Creates tunnel bridge, and links it to the integration bridge
+1283         using a patch port.
+1284 
+1285         :param tun_br_name: the name of the tunnel bridge.
+1286         '''
+1287         if not self.tun_br:
+1288             self.tun_br = self.br_tun_cls(tun_br_name)
+1289 
+1290         # tun_br.create() won't recreate bridge if it exists, but will handle
+1291         # cases where something like datapath_type has changed
+1292         self.tun_br.create(secure_mode=True)
+1293         self.tun_br.setup_controllers(self.conf)
+1294         if (not self.int_br.port_exists(self.conf.OVS.int_peer_patch_port) or
+1295                 self.patch_tun_ofport == ovs_lib.INVALID_OFPORT):
+1296             self.patch_tun_ofport = self.int_br.add_patch_port(
+1297                 self.conf.OVS.int_peer_patch_port,
+1298                 self.conf.OVS.tun_peer_patch_port)
+1299         if (not self.tun_br.port_exists(self.conf.OVS.tun_peer_patch_port) or
+1300                 self.patch_int_ofport == ovs_lib.INVALID_OFPORT):
+1301             self.patch_int_ofport = self.tun_br.add_patch_port(
+1302                 self.conf.OVS.tun_peer_patch_port,
+1303                 self.conf.OVS.int_peer_patch_port)
+1304         if ovs_lib.INVALID_OFPORT in (self.patch_tun_ofport,
+1305                                       self.patch_int_ofport):
+1306             LOG.error("Failed to create OVS patch port. Cannot have "
+1307                       "tunneling enabled on this agent, since this "
+1308                       "version of OVS does not support tunnels or patch "
+1309                       "ports. Agent terminated!")
+1310             sys.exit(1)
+1311         if self.conf.AGENT.drop_flows_on_start:
+1312             self.tun_br.uninstall_flows(cookie=ovs_lib.COOKIE_ANY)
+1313 
+1314     def setup_tunnel_br_flows(self):
+1315         '''Setup the tunnel bridge.
+1316 
+1317         Add all flows to the tunnel bridge.
+1318         '''
+1319         self.tun_br.setup_default_table(self.patch_int_ofport,
+1320                                         self.arp_responder_enabled)
+1321 
+1322     def _reconfigure_physical_bridges(self, bridges):
+1323         try:
+1324             sync = self._do_reconfigure_physical_bridges(bridges)
+1325             self.added_bridges = []
+1326         except RuntimeError:
+1327             # If there was error and bridges aren't properly reconfigured,
+1328             # there is no need to do full sync once again. It will be done when
+1329             # reconfiguration of physical bridges will be finished without
+1330             # errors
+1331             sync = False
+1332             self.added_bridges = bridges
+1333             LOG.warning("RuntimeError during setup of physical bridges: %s",
+1334                         bridges)
+1335         return sync
+1336 
+1337     def _do_reconfigure_physical_bridges(self, bridges):
+1338         sync = False
+1339         bridge_mappings = {}
+1340         for bridge in bridges:
+1341             LOG.info("Physical bridge %s was just re-created.", bridge)
+1342             for phys_net, phys_br in self.bridge_mappings.items():
+1343                 if bridge == phys_br:
+1344                     bridge_mappings[phys_net] = bridge
+1345         if bridge_mappings:
+1346             sync = True
+1347             self.setup_physical_bridges(bridge_mappings)
+1348         return sync
+1349 
+1350     def _check_bridge_datapath_id(self, bridge, datapath_ids_set):
+1351         """Check for bridges with duplicate datapath-id
+1352 
+1353         Bottom 48 bits auto-derived from MAC of NIC. Upper 12 bits free,
+1354         so we OR it with (bridge # << 48) to create a unique ID
+1355         It must be exactly 64 bits, else OVS will reject it - zfill
+1356 
+1357         :param bridge: (OVSPhysicalBridge) bridge
+1358         :param datapath_ids_set: (set) used datapath ids in OVS
+1359         """
+1360         dpid = int(bridge.get_datapath_id(), 16)
+1361         dpid_hex = format(dpid, '0x').zfill(16)
+1362         if dpid_hex in datapath_ids_set:
+1363             dpid_hex = format(
+1364                 dpid + (len(datapath_ids_set) << 48), '0x').zfill(16)
+1365             bridge.set_datapath_id(dpid_hex)
+1366         LOG.info('Bridge %s datapath-id = 0x%s', bridge.br_name, dpid_hex)
+1367         datapath_ids_set.add(dpid_hex)
+1368 
+1369     def setup_physical_bridges(self, bridge_mappings):
+1370         '''Setup the physical network bridges.
+1371 
+1372         Creates physical network bridges and links them to the
+1373         integration bridge using veths or patch ports.
+1374 
+1375         :param bridge_mappings: map physical network names to bridge names.
+1376         '''
+1377         self.phys_brs = {}
+1378         self.int_ofports = {}
+1379         self.phys_ofports = {}
+1380         datapath_ids_set = set()
+1381         ip_wrapper = ip_lib.IPWrapper()
+1382         ovs = ovs_lib.BaseOVS()
+1383         ovs_bridges = ovs.get_bridges()
+1384         for physical_network, bridge in bridge_mappings.items():
+1385             LOG.info("Mapping physical network %(physical_network)s to "
+1386                      "bridge %(bridge)s",
+1387                      {'physical_network': physical_network,
+1388                       'bridge': bridge})
+1389             # setup physical bridge
+1390             if bridge not in ovs_bridges:
+1391                 LOG.error("Bridge %(bridge)s for physical network "
+1392                           "%(physical_network)s does not exist. Agent "
+1393                           "terminated!",
+1394                           {'physical_network': physical_network,
+1395                            'bridge': bridge})
+1396                 sys.exit(1)
+1397             br = self.br_phys_cls(bridge)
+1398             self._check_bridge_datapath_id(br, datapath_ids_set)
+1399 
+1400             # The bridge already exists, so create won't recreate it, but will
+1401             # handle things like changing the datapath_type
+1402             br.create()
+1403             br.set_secure_mode()
+1404             br.setup_controllers(self.conf)
+1405             if cfg.CONF.AGENT.drop_flows_on_start:
+1406                 br.uninstall_flows(cookie=ovs_lib.COOKIE_ANY)
+1407             br.setup_default_table()
+1408             self.phys_brs[physical_network] = br
+1409 
+1410             # interconnect physical and integration bridges using veth/patches
+1411             int_if_name = plugin_utils.get_interface_name(
+1412                 bridge, prefix=constants.PEER_INTEGRATION_PREFIX)
+1413             phys_if_name = plugin_utils.get_interface_name(
+1414                 bridge, prefix=constants.PEER_PHYSICAL_PREFIX)
+1415             # Interface type of port for physical and integration bridges must
+1416             # be same, so check only one of them.
+1417             # Not logging error here, as the interface may not exist yet.
+1418             # Type check is done to cleanup wrong interface if any.
+1419             int_type = self.int_br.db_get_val("Interface", int_if_name, "type",
+1420                                               log_errors=False)
+1421             if self.use_veth_interconnection:
+1422                 # Drop ports if the interface types doesn't match the
+1423                 # configuration value.
+1424                 if int_type == 'patch':
+1425                     self.int_br.delete_port(int_if_name)
+1426                     br.delete_port(phys_if_name)
+1427                 device = ip_lib.IPDevice(int_if_name)
+1428                 if device.exists():
+1429                     device.link.delete()
+1430                     # Give udev a chance to process its rules here, to avoid
+1431                     # race conditions between commands launched by udev rules
+1432                     # and the subsequent call to ip_wrapper.add_veth
+1433                     utils.execute(['udevadm', 'settle', '--timeout=10'])
+1434                 int_veth, phys_veth = ip_wrapper.add_veth(int_if_name,
+1435                                                           phys_if_name)
+1436                 int_ofport = self.int_br.add_port(int_if_name)
+1437                 phys_ofport = br.add_port(phys_if_name)
+1438             else:
+1439                 # Drop ports if the interface type doesn't match the
+1440                 # configuration value
+1441                 if int_type == 'veth':
+1442                     self.int_br.delete_port(int_if_name)
+1443                     br.delete_port(phys_if_name)
+1444 
+1445                 # Setup int_br to physical bridge patches.  If they already
+1446                 # exist we leave them alone, otherwise we create them but don't
+1447                 # connect them until after the drop rules are in place.
+1448                 if self.int_br.port_exists(int_if_name):
+1449                     int_ofport = self.int_br.get_port_ofport(int_if_name)
+1450                 else:
+1451                     int_ofport = self.int_br.add_patch_port(
+1452                         int_if_name, constants.NONEXISTENT_PEER)
+1453                 if br.port_exists(phys_if_name):
+1454                     phys_ofport = br.get_port_ofport(phys_if_name)
+1455                 else:
+1456                     phys_ofport = br.add_patch_port(
+1457                         phys_if_name, constants.NONEXISTENT_PEER)
+1458 
+1459             self.int_ofports[physical_network] = int_ofport
+1460             self.phys_ofports[physical_network] = phys_ofport
+1461 
+1462             # These two drop flows are the root cause for the bug #1803919.
+1463             # And now we add a rpc check during agent start procedure. If
+1464             # ovs agent can not reach any neutron server, or all neutron
+1465             # servers are down, these flows will not be installed anymore.
+1466             # Bug #1803919 was fixed in that way.
+1467             # And as a reminder, we can not do much work on this. Because
+1468             # the bridge mappings can be varied. Provider (external) network
+1469             # can be implicitly set on any physical bridge due to the basic
+1470             # NORMAL flow. Different vlan range networks can also have many
+1471             # bridge map settings, these tenant network traffic can also be
+1472             # blocked by the following drop flows.
+1473             # block all untranslated traffic between bridges
+1474             self.int_br.drop_port(in_port=int_ofport)
+1475             br.drop_port(in_port=phys_ofport)
+1476 
+1477             if self.use_veth_interconnection:
+1478                 # enable veth to pass traffic
+1479                 int_veth.link.set_up()
+1480                 phys_veth.link.set_up()
+1481                 if self.veth_mtu:
+1482                     # set up mtu size for veth interfaces
+1483                     int_veth.link.set_mtu(self.veth_mtu)
+1484                     phys_veth.link.set_mtu(self.veth_mtu)
+1485             else:
+1486                 # associate patch ports to pass traffic
+1487                 self.int_br.set_db_attribute('Interface', int_if_name,
+1488                                              'options', {'peer': phys_if_name})
+1489                 br.set_db_attribute('Interface', phys_if_name,
+1490                                     'options', {'peer': int_if_name})
+1491 
+1492     def update_stale_ofport_rules(self):
+1493         # ARP spoofing rules and drop-flow upon port-delete
+1494         # use ofport-based rules
+1495         previous = self.vifname_to_ofport_map
+1496         current = self.int_br.get_vif_port_to_ofport_map()
+1497 
+1498         # if any ofport numbers have changed, re-process the devices as
+1499         # added ports so any rules based on ofport numbers are updated.
+1500         moved_ports = self._get_ofport_moves(current, previous)
+1501 
+1502         # delete any stale rules based on removed ofports
+1503         ofports_deleted = set(previous.values()) - set(current.values())
+1504         for ofport in ofports_deleted:
+1505             if self.prevent_arp_spoofing:
+1506                 self.int_br.delete_arp_spoofing_protection(port=ofport)
+1507             self.int_br.uninstall_flows(in_port=ofport)
+1508         # store map for next iteration
+1509         self.vifname_to_ofport_map = current
+1510         return moved_ports
+1511 
+1512     @staticmethod
+1513     def _get_ofport_moves(current, previous):
+1514         """Returns a list of moved ports.
+1515 
+1516         Takes two port->ofport maps and returns a list ports that moved to a
+1517         different ofport. Deleted ports are not included.
+1518         """
+1519         port_moves = []
+1520         for name, ofport in previous.items():
+1521             if name not in current:
+1522                 continue
+1523             current_ofport = current[name]
+1524             if ofport != current_ofport:
+1525                 port_moves.append(name)
+1526         return port_moves
+1527 
+1528     def _get_port_info(self, registered_ports, cur_ports,
+1529                        readd_registered_ports):
+1530         port_info = {'current': cur_ports,
+1531                      'added': set(),
+1532                      'removed': set()}
+1533         # FIXME(salv-orlando): It's not really necessary to return early
+1534         # if nothing has changed.
+1535         if not readd_registered_ports and cur_ports == registered_ports:
+1536             return port_info
+1537 
+1538         if readd_registered_ports:
+1539             port_info['added'] = cur_ports
+1540         else:
+1541             port_info['added'] = cur_ports - registered_ports
+1542         # Update port_info with ports not found on the integration bridge
+1543         port_info['removed'] = registered_ports - cur_ports
+1544         return port_info
+1545 
+1546     def _update_port_info_failed_devices_stats(self, port_info,
+1547                                                failed_devices):
+1548         # remove failed devices that don't need to be retried
+1549         failed_devices['added'] -= port_info['removed']
+1550         failed_devices['removed'] -= port_info['added']
+1551 
+1552         # Disregard devices that were never noticed by the agent
+1553         port_info['removed'] &= port_info['current']
+1554         # retry failed devices
+1555         port_info['added'] |= failed_devices['added']
+1556         if failed_devices['added']:
+1557             LOG.debug("retrying failed devices %s", failed_devices['added'])
+1558         port_info['removed'] |= failed_devices['removed']
+1559         # Update current ports
+1560         port_info['current'] |= port_info['added']
+1561         port_info['current'] -= port_info['removed']
+1562 
+1563     def process_ports_events(self, events, registered_ports, ancillary_ports,
+1564                              old_ports_not_ready, failed_devices,
+1565                              failed_ancillary_devices, updated_ports=None):
+1566         port_info = {}
+1567         port_info['added'] = set()
+1568         port_info['removed'] = set()
+1569         port_info['current'] = registered_ports
+1570 
+1571         ancillary_port_info = {}
+1572         ancillary_port_info['added'] = set()
+1573         ancillary_port_info['removed'] = set()
+1574         ancillary_port_info['current'] = ancillary_ports
+1575 
+1576         ports_not_ready_yet = set()
+1577         if updated_ports is None:
+1578             updated_ports = set()
+1579 
+1580         # if a port was added and then removed or viceversa since the agent
+1581         # can't know the order of the operations, check the status of the port
+1582         # to determine if the port was added or deleted
+1583         added_ports = {p['name'] for p in events['added']}
+1584         removed_ports = {p['name'] for p in events['removed']}
+1585         updated_ports.update({p['name'] for p in events['modified']})
+1586 
+1587         ports_removed_and_added = added_ports & removed_ports
+1588         for p in ports_removed_and_added:
+1589             if ovs_lib.BaseOVS().port_exists(p):
+1590                 events['removed'] = [e for e in events['removed']
+1591                                      if e['name'] != p]
+1592             else:
+1593                 events['added'] = [e for e in events['added']
+1594                                    if e['name'] != p]
+1595 
+1596         # TODO(rossella_s): scanning the ancillary bridge won't be needed
+1597         # anymore when https://review.opendev.org/#/c/203381 since the bridge
+1598         # id stored in external_ids will be used to identify the bridge the
+1599         # port belongs to
+1600         cur_ancillary_ports = set()
+1601         for bridge in self.ancillary_brs:
+1602             cur_ancillary_ports |= bridge.get_vif_port_set()
+1603         cur_ancillary_ports |= ancillary_port_info['current']
+1604 
+1605         def _process_port(port, ports, ancillary_ports):
+1606             # check 'iface-id' is set otherwise is not a port
+1607             # the agent should care about
+1608             if 'attached-mac' in port.get('external_ids', []):
+1609                 iface_id = self.int_br.portid_from_external_ids(
+1610                     port['external_ids'])
+1611                 if iface_id:
+1612                     if port['ofport'] == ovs_lib.UNASSIGNED_OFPORT:
+1613                         LOG.debug("Port %s not ready yet on the bridge",
+1614                                   iface_id)
+1615                         ports_not_ready_yet.add(port['name'])
+1616                         return
+1617                     # check if port belongs to ancillary bridge
+1618                     if iface_id in cur_ancillary_ports:
+1619                         ancillary_ports.add(iface_id)
+1620                     else:
+1621                         ports.add(iface_id)
+1622         if old_ports_not_ready:
+1623             old_ports_not_ready_attrs = self.int_br.get_ports_attributes(
+1624                 'Interface', columns=['name', 'external_ids', 'ofport'],
+1625                 ports=old_ports_not_ready, if_exists=True)
+1626             now_ready_ports = set(
+1627                 [p['name'] for p in old_ports_not_ready_attrs])
+1628             LOG.debug("Ports %s are now ready", now_ready_ports)
+1629             old_ports_not_ready_yet = old_ports_not_ready - now_ready_ports
+1630             removed_ports = set([p['name'] for p in events['removed']])
+1631             old_ports_not_ready_yet -= removed_ports
+1632             LOG.debug("Ports %s were not ready at last iteration and are not "
+1633                       "ready yet", old_ports_not_ready_yet)
+1634             ports_not_ready_yet |= old_ports_not_ready_yet
+1635             events['added'].extend(old_ports_not_ready_attrs)
+1636 
+1637         for port in events['added']:
+1638             _process_port(port, port_info['added'],
+1639                           ancillary_port_info['added'])
+1640         for port in events['removed']:
+1641             _process_port(port, port_info['removed'],
+1642                           ancillary_port_info['removed'])
+1643 
+1644         self._update_port_info_failed_devices_stats(port_info, failed_devices)
+1645         self._update_port_info_failed_devices_stats(ancillary_port_info,
+1646                                                     failed_ancillary_devices)
+1647 
+1648         updated_ports.update(self.check_changed_vlans())
+1649 
+1650         if updated_ports:
+1651             # Some updated ports might have been removed in the
+1652             # meanwhile, and therefore should not be processed.
+1653             # In this case the updated port won't be found among
+1654             # current ports.
+1655             updated_ports &= port_info['current']
+1656             port_info['updated'] = updated_ports
+1657         return port_info, ancillary_port_info, ports_not_ready_yet
+1658 
+1659     def scan_ports(self, registered_ports, sync, updated_ports=None):
+1660         cur_ports = self.int_br.get_vif_port_set()
+1661         self.int_br_device_count = len(cur_ports)
+1662         port_info = self._get_port_info(registered_ports, cur_ports, sync)
+1663         if updated_ports is None:
+1664             updated_ports = set()
+1665         updated_ports.update(self.check_changed_vlans())
+1666         if updated_ports:
+1667             # Some updated ports might have been removed in the
+1668             # meanwhile, and therefore should not be processed.
+1669             # In this case the updated port won't be found among
+1670             # current ports.
+1671             updated_ports &= cur_ports
+1672             if updated_ports:
+1673                 port_info['updated'] = updated_ports
+1674         return port_info
+1675 
+1676     def scan_ancillary_ports(self, registered_ports, sync):
+1677         cur_ports = set()
+1678         for bridge in self.ancillary_brs:
+1679             cur_ports |= bridge.get_vif_port_set()
+1680         return self._get_port_info(registered_ports, cur_ports, sync)
+1681 
+1682     def check_changed_vlans(self):
+1683         """Check for changed VLAN tags. If changes, notify server and return.
+1684 
+1685         The returned value is a set of port ids of the ports concerned by a
+1686         vlan tag loss.
+1687         """
+1688         port_tags = self.int_br.get_port_tag_dict()
+1689         changed_ports = set()
+1690         for lvm in self.vlan_manager:
+1691             for port in lvm.vif_ports.values():
+1692                 if (
+1693                     port.port_name in port_tags and
+1694                     port_tags[port.port_name] != lvm.vlan
+1695                 ):
+1696                     LOG.info(
+1697                         "Port '%(port_name)s' has lost "
+1698                         "its vlan tag '%(vlan_tag)d'!",
+1699                         {'port_name': port.port_name,
+1700                          'vlan_tag': lvm.vlan}
+1701                     )
+1702                     changed_ports.add(port.vif_id)
+1703         if changed_ports:
+1704             # explicitly mark these DOWN on the server since they have been
+1705             # manipulated (likely a nova unplug/replug) and need to be rewired
+1706             devices_down = self.plugin_rpc.update_device_list(self.context,
+1707                                                               [],
+1708                                                               changed_ports,
+1709                                                               self.agent_id,
+1710                                                               self.conf.host)
+1711             failed_devices = set(devices_down.get('failed_devices_down'))
+1712             if failed_devices:
+1713                 LOG.debug("Status updated failed for %s", failed_devices)
+1714 
+1715         return changed_ports
+1716 
+1717     def treat_vif_port(self, vif_port, port_id, network_id, network_type,
+1718                        physical_network, segmentation_id, admin_state_up,
+1719                        fixed_ips, device_owner, provisioning_needed):
+1720         # When this function is called for a port, the port should have
+1721         # an OVS ofport configured, as only these ports were considered
+1722         # for being treated. If that does not happen, it is a potential
+1723         # error condition of which operators should be aware
+1724         port_needs_binding = True
+1725         if not vif_port.ofport:
+1726             LOG.warning("VIF port: %s has no ofport configured, "
+1727                         "and might not be able to transmit",
+1728                         vif_port.vif_id)
+1729         if vif_port:
+1730             if admin_state_up:
+1731                 port_needs_binding = self.port_bound(
+1732                     vif_port, network_id, network_type,
+1733                     physical_network, segmentation_id,
+1734                     fixed_ips, device_owner, provisioning_needed)
+1735             else:
+1736                 LOG.info("VIF port: %s admin state up disabled, "
+1737                          "putting on the dead VLAN", vif_port.vif_id)
+1738 
+1739                 self.port_dead(vif_port)
+1740                 self.plugin_rpc.update_device_down(
+1741                     self.context, port_id, self.agent_id,
+1742                     self.conf.host)
+1743                 port_needs_binding = False
+1744         else:
+1745             LOG.debug("No VIF port for port %s defined on agent.", port_id)
+1746         return port_needs_binding
+1747 
+1748     def _setup_tunnel_port(self, br, port_name, remote_ip, tunnel_type):
+1749         try:
+1750             if (netaddr.IPAddress(self.local_ip).version !=
+1751                     netaddr.IPAddress(remote_ip).version):
+1752                 LOG.error("IP version mismatch, cannot create tunnel: "
+1753                           "local_ip=%(lip)s remote_ip=%(rip)s",
+1754                           {'lip': self.local_ip, 'rip': remote_ip})
+1755                 return 0
+1756         except Exception:
+1757             LOG.error("Invalid local or remote IP, cannot create tunnel: "
+1758                       "local_ip=%(lip)s remote_ip=%(rip)s",
+1759                       {'lip': self.local_ip, 'rip': remote_ip})
+1760             return 0
+1761         ofport = br.add_tunnel_port(port_name,
+1762                                     remote_ip,
+1763                                     self.local_ip,
+1764                                     tunnel_type,
+1765                                     self.vxlan_udp_port,
+1766                                     self.dont_fragment,
+1767                                     self.tunnel_csum,
+1768                                     self.tos)
+1769         if ofport == ovs_lib.INVALID_OFPORT:
+1770             LOG.error("Failed to set-up %(type)s tunnel port to %(ip)s",
+1771                       {'type': tunnel_type, 'ip': remote_ip})
+1772             return 0
+1773 
+1774         self.tun_br_ofports[tunnel_type][remote_ip] = ofport
+1775         # Add flow in default table to resubmit to the right
+1776         # tunneling table (lvid will be set in the latter)
+1777         br.setup_tunnel_port(tunnel_type, ofport)
+1778         return ofport
+1779 
+1780     def _setup_tunnel_flood_flow(self, br, tunnel_type):
+1781         ofports = self.tun_br_ofports[tunnel_type].values()
+1782         if ofports and not self.l2_pop:
+1783             # Update flooding flows to include the new tunnel
+1784             for vlan_mapping in self.vlan_manager:
+1785                 if vlan_mapping.network_type == tunnel_type:
+1786                     br.install_flood_to_tun(vlan_mapping.vlan,
+1787                                             vlan_mapping.segmentation_id,
+1788                                             ofports)
+1789 
+1790     def setup_tunnel_port(self, br, remote_ip, network_type):
+1791         port_name = self.get_tunnel_name(
+1792             network_type, self.local_ip, remote_ip)
+1793         if port_name is None:
+1794             return 0
+1795         ofport = self._setup_tunnel_port(br,
+1796                                          port_name,
+1797                                          remote_ip,
+1798                                          network_type)
+1799         self._setup_tunnel_flood_flow(br, network_type)
+1800         return ofport
+1801 
+1802     def cleanup_tunnel_port(self, br, tun_ofport, tunnel_type):
+1803         # Check if this tunnel port is still used
+1804         for lvm in self.vlan_manager:
+1805             if tun_ofport in lvm.tun_ofports:
+1806                 break
+1807         # If not, remove it
+1808         else:
+1809             items = list(self.tun_br_ofports[tunnel_type].items())
+1810             for remote_ip, ofport in items:
+1811                 if ofport == tun_ofport:
+1812                     port_name = self.get_tunnel_name(
+1813                         tunnel_type, self.local_ip, remote_ip)
+1814                     br.delete_port(port_name)
+1815                     br.cleanup_tunnel_port(ofport)
+1816                     self.tun_br_ofports[tunnel_type].pop(remote_ip, None)
+1817 
+1818     def treat_devices_added_or_updated(self, devices, provisioning_needed):
+1819         skipped_devices = []
+1820         need_binding_devices = []
+1821         binding_no_activated_devices = set()
+1822         agent_restarted = self.iter_num == 0
+1823         devices_details_list = (
+1824             self.plugin_rpc.get_devices_details_list_and_failed_devices(
+1825                 self.context,
+1826                 devices,
+1827                 self.agent_id,
+1828                 self.conf.host,
+1829                 agent_restarted))
+1830         failed_devices = set(devices_details_list.get('failed_devices'))
+1831 
+1832         devices = devices_details_list.get('devices')
+1833         vif_by_id = self.int_br.get_vifs_by_ids(
+1834             [vif['device'] for vif in devices])
+1835         for details in devices:
+1836             device = details['device']
+1837             LOG.debug("Processing port: %s", device)
+1838             port = vif_by_id.get(device)
+1839             if not port:
+1840                 # The port disappeared and cannot be processed
+1841                 LOG.info("Port %s was not found on the integration bridge "
+1842                          "and will therefore not be processed", device)
+1843                 self.ext_manager.delete_port(self.context, {'port_id': device})
+1844                 skipped_devices.append(device)
+1845                 continue
+1846 
+1847             if 'port_id' in details:
+1848                 LOG.info("Port %(device)s updated. Details: %(details)s",
+1849                          {'device': device, 'details': details})
+1850                 details['vif_port'] = port
+1851                 need_binding = self.treat_vif_port(port, details['port_id'],
+1852                                                    details['network_id'],
+1853                                                    details['network_type'],
+1854                                                    details['physical_network'],
+1855                                                    details['segmentation_id'],
+1856                                                    details['admin_state_up'],
+1857                                                    details['fixed_ips'],
+1858                                                    details['device_owner'],
+1859                                                    provisioning_needed)
+1860                 if need_binding:
+1861                     need_binding_devices.append(details)
+1862                 self._update_port_network(details['port_id'],
+1863                                           details['network_id'])
+1864                 self.ext_manager.handle_port(self.context, details)
+1865             else:
+1866                 if n_const.NO_ACTIVE_BINDING in details:
+1867                     # Port was added to the bridge, but its binding in this
+1868                     # agent hasn't been activated yet. It will be treated as
+1869                     # added when binding is activated
+1870                     binding_no_activated_devices.add(device)
+1871                     LOG.debug("Device %s has no active binding in host",
+1872                               device)
+1873                 else:
+1874                     LOG.warning(
+1875                         "Device %s not defined on plugin or binding failed",
+1876                         device)
+1877                 if (port and port.ofport != -1):
+1878                     self.port_dead(port)
+1879         return (skipped_devices, binding_no_activated_devices,
+1880                 need_binding_devices, failed_devices)
+1881 
+1882     def _update_port_network(self, port_id, network_id):
+1883         self._clean_network_ports(port_id)
+1884         self.network_ports[network_id].add(port_id)
+1885 
+1886     def treat_ancillary_devices_added(self, devices):
+1887         devices_details_list = (
+1888             self.plugin_rpc.get_devices_details_list_and_failed_devices(
+1889                 self.context,
+1890                 devices,
+1891                 self.agent_id,
+1892                 self.conf.host))
+1893         failed_devices = set(devices_details_list.get('failed_devices'))
+1894         devices_added = [
+1895             d['device'] for d in devices_details_list.get('devices')]
+1896 
+1897         # update plugin about port status
+1898         devices_set_up = (
+1899             self.plugin_rpc.update_device_list(self.context,
+1900                                                devices_added,
+1901                                                [],
+1902                                                self.agent_id,
+1903                                                self.conf.host))
+1904         failed_devices |= set(devices_set_up.get('failed_devices_up'))
+1905         LOG.info("Ancillary Ports %(added)s added, failed devices "
+1906                  "%(failed)s", {'added': devices, 'failed': failed_devices})
+1907         return failed_devices
+1908 
+1909     def treat_devices_removed(self, devices):
+1910         self.sg_agent.remove_devices_filter(devices)
+1911         LOG.info("Ports %s removed", devices)
+1912         devices_down = self.plugin_rpc.update_device_list(self.context,
+1913                                                           [],
+1914                                                           devices,
+1915                                                           self.agent_id,
+1916                                                           self.conf.host)
+1917         failed_devices = set(devices_down.get('failed_devices_down'))
+1918         LOG.debug("Port removal failed for %s", failed_devices)
+1919         for device in devices:
+1920             self.ext_manager.delete_port(self.context, {'port_id': device})
+1921             self.port_unbound(device)
+1922         return failed_devices
+1923 
+1924     def treat_ancillary_devices_removed(self, devices):
+1925         LOG.info("Ancillary ports %s removed", devices)
+1926         devices_down = self.plugin_rpc.update_device_list(self.context,
+1927                                                           [],
+1928                                                           devices,
+1929                                                           self.agent_id,
+1930                                                           self.conf.host)
+1931         LOG.info("Devices down  %s ", devices_down)
+1932         failed_devices = set(devices_down.get('failed_devices_down'))
+1933         if failed_devices:
+1934             LOG.debug("Port removal failed for %s", failed_devices)
+1935         for detail in devices_down.get('devices_down'):
+1936             if detail['exists']:
+1937                 LOG.info("Port %s updated.", detail['device'])
+1938                 # Nothing to do regarding local networking
+1939             else:
+1940                 LOG.debug("Device %s not defined on plugin", detail['device'])
+1941         return failed_devices
+1942 
+1943     def treat_devices_skipped(self, devices):
+1944         LOG.info("Ports %s skipped, changing status to down", devices)
+1945         devices_down = self.plugin_rpc.update_device_list(self.context,
+1946                                                           [],
+1947                                                           devices,
+1948                                                           self.agent_id,
+1949                                                           self.conf.host)
+1950         failed_devices = set(devices_down.get('failed_devices_down'))
+1951         if failed_devices:
+1952             LOG.debug("Port down failed for %s", failed_devices)
+1953 
+1954     def process_network_ports(self, port_info, provisioning_needed):
+1955         failed_devices = {'added': set(), 'removed': set()}
+1956         # TODO(salv-orlando): consider a solution for ensuring notifications
+1957         # are processed exactly in the same order in which they were
+1958         # received. This is tricky because there are two notification
+1959         # sources: the neutron server, and the ovs db monitor process
+1960         # If there is an exception while processing security groups ports
+1961         # will not be wired anyway, and a resync will be triggered
+1962         # VIF wiring needs to be performed always for 'new' devices.
+1963         # For updated ports, re-wiring is not needed in most cases, but needs
+1964         # to be performed anyway when the admin state of a device is changed.
+1965         # A device might be both in the 'added' and 'updated'
+1966         # list at the same time; avoid processing it twice.
+1967         devices_added_updated = (port_info.get('added', set()) |
+1968                                  port_info.get('updated', set()))
+1969         need_binding_devices = []
+1970         skipped_devices = set()
+1971         binding_no_activated_devices = set()
+1972         start = time.time()
+1973         if devices_added_updated:
+1974             (skipped_devices, binding_no_activated_devices,
+1975              need_binding_devices, failed_devices['added']) = (
+1976                 self.treat_devices_added_or_updated(
+1977                     devices_added_updated, provisioning_needed))
+1978             LOG.info("process_network_ports - iteration:%(iter_num)d - "
+1979                      "treat_devices_added_or_updated completed. "
+1980                      "Skipped %(num_skipped)d and no activated binding "
+1981                      "devices %(num_no_active_binding)d of %(num_current)d "
+1982                      "devices currently available. "
+1983                      "Time elapsed: %(elapsed).3f",
+1984                      {'iter_num': self.iter_num,
+1985                       'num_skipped': len(skipped_devices),
+1986                       'num_no_active_binding':
+1987                           len(binding_no_activated_devices),
+1988                       'num_current': len(port_info['current']),
+1989                       'elapsed': time.time() - start})
+1990             # Update the list of current ports storing only those which
+1991             # have been actually processed.
+1992             skipped_devices = set(skipped_devices)
+1993             port_info['current'] = (port_info['current'] - skipped_devices)
+1994 
+1995         # TODO(salv-orlando): Optimize avoiding applying filters
+1996         # unnecessarily, (eg: when there are no IP address changes)
+1997         added_ports = (port_info.get('added', set()) - skipped_devices -
+1998                        binding_no_activated_devices)
+1999         self._add_port_tag_info(need_binding_devices)
+2000         updated_ports = port_info.get('updated', set()) - self.last_cycle_added
+2001         self.sg_agent.setup_port_filters(added_ports, updated_ports)
+2002         LOG.info("process_network_ports - iteration:%(iter_num)d - "
+2003                  "agent port security group processed in %(elapsed).3f",
+2004                  {'iter_num': self.iter_num,
+2005                   'elapsed': time.time() - start})
+2006         failed_devices['added'] |= self._bind_devices(need_binding_devices)
+2007 
+2008         if 'removed' in port_info and port_info['removed']:
+2009             start = time.time()
+2010             failed_devices['removed'] |= self.treat_devices_removed(
+2011                 port_info['removed'])
+2012             LOG.info("process_network_ports - iteration:%(iter_num)d - "
+2013                      "treat_devices_removed completed in %(elapsed).3f",
+2014                      {'iter_num': self.iter_num,
+2015                       'elapsed': time.time() - start})
+2016         if skipped_devices:
+2017             start = time.time()
+2018             self.treat_devices_skipped(skipped_devices)
+2019             LOG.info("process_network_ports - iteration:%(iter_num)d - "
+2020                      "treat_devices_skipped completed in %(elapsed).3f",
+2021                      {'iter_num': self.iter_num,
+2022                       'elapsed': time.time() - start})
+2023         return failed_devices
+2024 
+2025     def process_ancillary_network_ports(self, port_info):
+2026         failed_devices = {'added': set(), 'removed': set()}
+2027         if 'added' in port_info and port_info['added']:
+2028             start = time.time()
+2029             failed_added = self.treat_ancillary_devices_added(
+2030                 port_info['added'])
+2031             LOG.info("process_ancillary_network_ports - iteration: "
+2032                      "%(iter_num)d - treat_ancillary_devices_added "
+2033                      "completed in %(elapsed).3f",
+2034                      {'iter_num': self.iter_num,
+2035                       'elapsed': time.time() - start})
+2036             failed_devices['added'] = failed_added
+2037 
+2038         if 'removed' in port_info and port_info['removed']:
+2039             start = time.time()
+2040             failed_removed = self.treat_ancillary_devices_removed(
+2041                 port_info['removed'])
+2042             failed_devices['removed'] = failed_removed
+2043 
+2044             LOG.info("process_ancillary_network_ports - iteration: "
+2045                      "%(iter_num)d - treat_ancillary_devices_removed "
+2046                      "completed in %(elapsed).3f",
+2047                      {'iter_num': self.iter_num,
+2048                       'elapsed': time.time() - start})
+2049         return failed_devices
+2050 
+2051     @classmethod
+2052     def get_tunnel_hash(cls, ip_address, hashlen):
+2053         try:
+2054             addr = netaddr.IPAddress(ip_address)
+2055             if addr.version == n_const.IP_VERSION_4:
+2056                 # We cannot change this from 8, since it could break
+2057                 # backwards-compatibility
+2058                 return '%08x' % addr
+2059             else:
+2060                 # Create 32-bit Base32 encoded hash
+2061                 sha1 = hashlib.sha1(ip_address.encode())
+2062                 iphash = base64.b32encode(sha1.digest())
+2063                 return iphash[:hashlen].decode().lower()
+2064         except Exception:
+2065             LOG.warning("Invalid remote IP: %s", ip_address)
+2066             return
+2067 
+2068     def tunnel_sync(self):
+2069         LOG.debug("Configuring tunnel endpoints to other OVS agents")
+2070 
+2071         try:
+2072             for tunnel_type in self.tunnel_types:
+2073                 details = self.plugin_rpc.tunnel_sync(self.context,
+2074                                                       self.local_ip,
+2075                                                       tunnel_type,
+2076                                                       self.conf.host)
+2077                 if not self.l2_pop:
+2078                     tunnels = details['tunnels']
+2079                     for tunnel in tunnels:
+2080                         if self.local_ip != tunnel['ip_address']:
+2081                             remote_ip = tunnel['ip_address']
+2082                             tun_name = self.get_tunnel_name(
+2083                                 tunnel_type, self.local_ip, remote_ip)
+2084                             if tun_name is None:
+2085                                 continue
+2086                             self._setup_tunnel_port(self.tun_br,
+2087                                                     tun_name,
+2088                                                     tunnel['ip_address'],
+2089                                                     tunnel_type)
+2090                     self._setup_tunnel_flood_flow(self.tun_br, tunnel_type)
+2091         except Exception as e:
+2092             LOG.debug("Unable to sync tunnel IP %(local_ip)s: %(e)s",
+2093                       {'local_ip': self.local_ip, 'e': e})
+2094             return True
+2095         return False
+2096 
+2097     @classmethod
+2098     def get_tunnel_name(cls, network_type, local_ip, remote_ip):
+2099         # This string is used to build port and interface names in OVS.
+2100         # Port and interface names can be max 16 characters long,
+2101         # including NULL, and must be unique per table per host.
+2102         # We make the name as long as possible given the network_type,
+2103         # for example, 'vxlan-012345678' or 'geneve-01234567'.
+2104 
+2105         # Remove length of network type and dash
+2106         hashlen = n_const.DEVICE_NAME_MAX_LEN - len(network_type) - 1
+2107         remote_tunnel_hash = cls.get_tunnel_hash(remote_ip, hashlen)
+2108         if not remote_tunnel_hash:
+2109             return None
+2110         return '%s-%s' % (network_type, remote_tunnel_hash)
+2111 
+2112     def _agent_has_updates(self, polling_manager):
+2113         return (polling_manager.is_polling_required or
+2114                 self.updated_ports or
+2115                 self.deleted_ports or
+2116                 self.deactivated_bindings or
+2117                 self.activated_bindings or
+2118                 self.updated_smartnic_ports or
+2119                 self.sg_agent.firewall_refresh_needed())
+2120 
+2121     def _port_info_has_changes(self, port_info):
+2122         return (port_info.get('added') or
+2123                 port_info.get('removed') or
+2124                 port_info.get('updated'))
+2125 
+2126     def check_ovs_status(self):
+2127         try:
+2128             # Check for the canary flow
+2129             status = self.int_br.check_canary_table()
+2130         except Exception:
+2131             LOG.exception("Failure while checking for the canary flow")
+2132             status = constants.OVS_DEAD
+2133         if status == constants.OVS_RESTARTED:
+2134             LOG.warning("OVS is restarted. OVSNeutronAgent will reset "
+2135                         "bridges and recover ports.")
+2136         elif status == constants.OVS_DEAD:
+2137             LOG.warning("OVS is dead. OVSNeutronAgent will keep running "
+2138                         "and checking OVS status periodically.")
+2139         return status
+2140 
+2141     def loop_count_and_wait(self, start_time, port_stats):
+2142         # sleep till end of polling interval
+2143         elapsed = time.time() - start_time
+2144         LOG.info("Agent rpc_loop - iteration:%(iter_num)d "
+2145                  "completed. Processed ports statistics: "
+2146                  "%(port_stats)s. Elapsed:%(elapsed).3f",
+2147                  {'iter_num': self.iter_num,
+2148                   'port_stats': port_stats,
+2149                   'elapsed': elapsed})
+2150         if elapsed < self.polling_interval:
+2151             time.sleep(self.polling_interval - elapsed)
+2152         else:
+2153             LOG.debug("Loop iteration exceeded interval "
+2154                       "(%(polling_interval)s vs. %(elapsed)s)!",
+2155                       {'polling_interval': self.polling_interval,
+2156                        'elapsed': elapsed})
+2157         self.iter_num = self.iter_num + 1
+2158 
+2159     def get_port_stats(self, port_info, ancillary_port_info):
+2160         port_stats = {
+2161             'regular': {
+2162                 'added': len(port_info.get('added', [])),
+2163                 'updated': len(port_info.get('updated', [])),
+2164                 'removed': len(port_info.get('removed', []))}}
+2165         if self.ancillary_brs:
+2166             port_stats['ancillary'] = {
+2167                 'added': len(ancillary_port_info.get('added', [])),
+2168                 'removed': len(ancillary_port_info.get('removed', []))}
+2169         return port_stats
+2170 
+2171     def cleanup_stale_flows(self):
+2172         LOG.info("Cleaning stale %s flows", self.int_br.br_name)
+2173         self.int_br.cleanup_flows()
+2174         for pby_br in self.phys_brs.values():
+2175             LOG.info("Cleaning stale %s flows", pby_br.br_name)
+2176             pby_br.cleanup_flows()
+2177 
+2178         if self.enable_tunneling:
+2179             LOG.info("Cleaning stale %s flows", self.tun_br.br_name)
+2180             self.tun_br.cleanup_flows()
+2181 
+2182     def process_port_info(self, start, polling_manager, sync, ovs_restarted,
+2183                           ports, ancillary_ports, updated_ports_copy,
+2184                           consecutive_resyncs, ports_not_ready_yet,
+2185                           failed_devices, failed_ancillary_devices):
+2186         # There are polling managers that don't have get_events, e.g.
+2187         # AlwaysPoll used by windows implementations
+2188         # REVISIT (rossella_s) This needs to be reworked to hide implementation
+2189         # details regarding polling in BasePollingManager subclasses
+2190         if sync or not (hasattr(polling_manager, 'get_events')):
+2191             if sync:
+2192                 LOG.info("Agent out of sync with plugin!")
+2193                 consecutive_resyncs = consecutive_resyncs + 1
+2194                 if (consecutive_resyncs >=
+2195                         constants.MAX_DEVICE_RETRIES):
+2196                     LOG.warning(
+2197                         "Clearing cache of registered ports,"
+2198                         " retries to resync were > %s",
+2199                         constants.MAX_DEVICE_RETRIES)
+2200                     ports.clear()
+2201                     ancillary_ports.clear()
+2202                     consecutive_resyncs = 0
+2203             else:
+2204                 consecutive_resyncs = 0
+2205                 # TODO(rossella_s): For implementations that use AlwaysPoll
+2206                 # resync if a device failed. This can be improved in future
+2207                 sync = (any(failed_devices.values()) or
+2208                         any(failed_ancillary_devices.values()))
+2209 
+2210             # NOTE(rossella_s) don't empty the queue of events
+2211             # calling polling_manager.get_events() since
+2212             # the agent might miss some event (for example a port
+2213             # deletion)
+2214             reg_ports = (set() if ovs_restarted else ports)
+2215             port_info = self.scan_ports(reg_ports, sync,
+2216                                         updated_ports_copy)
+2217             # Treat ancillary devices if they exist
+2218             if self.ancillary_brs:
+2219                 ancillary_port_info = self.scan_ancillary_ports(
+2220                     ancillary_ports, sync)
+2221                 LOG.info("Agent rpc_loop - iteration:%(iter_num)d"
+2222                          " - ancillary port info retrieved. "
+2223                          "Elapsed:%(elapsed).3f",
+2224                          {'iter_num': self.iter_num,
+2225                           'elapsed': time.time() - start})
+2226             else:
+2227                 ancillary_port_info = {}
+2228 
+2229         else:
+2230             consecutive_resyncs = 0
+2231             events = polling_manager.get_events()
+2232             port_info, ancillary_port_info, ports_not_ready_yet = (
+2233                 self.process_ports_events(events, ports, ancillary_ports,
+2234                                           ports_not_ready_yet,
+2235                                           failed_devices,
+2236                                           failed_ancillary_devices,
+2237                                           updated_ports_copy))
+2238             registry.notify(
+2239                 constants.OVSDB_RESOURCE,
+2240                 callback_events.AFTER_READ,
+2241                 self,
+2242                 ovsdb_events=events)
+2243 
+2244         return (port_info, ancillary_port_info, consecutive_resyncs,
+2245                 ports_not_ready_yet)
+2246 
+2247     def _remove_devices_not_to_retry(self, failed_devices,
+2248                                      failed_ancillary_devices,
+2249                                      devices_not_to_retry,
+2250                                      ancillary_devices_not_to_retry):
+2251         """This method removes the devices that exceeded the number of retries
+2252            from failed_devices and failed_ancillary_devices
+2253 
+2254         """
+2255         for event in ['added', 'removed']:
+2256             failed_devices[event] = (
+2257                 failed_devices[event] - devices_not_to_retry[event])
+2258             failed_ancillary_devices[event] = (
+2259                 failed_ancillary_devices[event] -
+2260                 ancillary_devices_not_to_retry[event])
+2261 
+2262     def _get_devices_not_to_retry(self, failed_devices,
+2263                                   failed_ancillary_devices,
+2264                                   failed_devices_retries_map):
+2265         """Return the devices not to retry and update the retries map"""
+2266         new_failed_devices_retries_map = {}
+2267         devices_not_to_retry = {}
+2268         ancillary_devices_not_to_retry = {}
+2269 
+2270         def _increase_retries(devices_set):
+2271             devices_not_to_retry = set()
+2272             for dev in devices_set:
+2273                 retries = failed_devices_retries_map.get(dev, 0)
+2274                 if retries >= constants.MAX_DEVICE_RETRIES:
+2275                     devices_not_to_retry.add(dev)
+2276                     LOG.warning(
+2277                         "Device %(dev)s failed for %(times)s times and won't "
+2278                         "be retried anymore", {
+2279                             'dev': dev, 'times': constants.MAX_DEVICE_RETRIES})
+2280                 else:
+2281                     new_failed_devices_retries_map[dev] = retries + 1
+2282             return devices_not_to_retry
+2283 
+2284         for event in ['added', 'removed']:
+2285             devices_not_to_retry[event] = _increase_retries(
+2286                 failed_devices[event])
+2287             ancillary_devices_not_to_retry[event] = _increase_retries(
+2288                 failed_ancillary_devices[event])
+2289 
+2290         return (new_failed_devices_retries_map, devices_not_to_retry,
+2291                 ancillary_devices_not_to_retry)
+2292 
+2293     def update_retries_map_and_remove_devs_not_to_retry(
+2294             self, failed_devices, failed_ancillary_devices,
+2295             failed_devices_retries_map):
+2296         (new_failed_devices_retries_map, devices_not_to_retry,
+2297          ancillary_devices_not_to_retry) = self._get_devices_not_to_retry(
+2298             failed_devices, failed_ancillary_devices,
+2299             failed_devices_retries_map)
+2300         self._remove_devices_not_to_retry(
+2301             failed_devices, failed_ancillary_devices, devices_not_to_retry,
+2302             ancillary_devices_not_to_retry)
+2303         return new_failed_devices_retries_map
+2304 
+2305     def _handle_ovs_restart(self, polling_manager):
+2306         self.setup_integration_br()
+2307         self.setup_physical_bridges(self.bridge_mappings)
+2308         if self.enable_tunneling:
+2309             self._reset_tunnel_ofports()
+2310             self.setup_tunnel_br()
+2311             self.setup_tunnel_br_flows()
+2312             self.agent_state['start_flag'] = True
+2313             # Force state report to avoid race condition
+2314             # with l2pop fdb entries update
+2315             self._report_state()
+2316         if self.enable_distributed_routing:
+2317             self.dvr_agent.reset_ovs_parameters(self.int_br,
+2318                                                 self.tun_br,
+2319                                                 self.patch_int_ofport,
+2320                                                 self.patch_tun_ofport)
+2321             self.dvr_agent.reset_dvr_parameters()
+2322             self.dvr_agent.setup_dvr_flows()
+2323         # notify that OVS has restarted
+2324         registry.publish(
+2325             callback_resources.AGENT,
+2326             callback_events.OVS_RESTARTED,
+2327             self, payload=None)
+2328         # restart the polling manager so that it will signal as added
+2329         # all the current ports
+2330         # REVISIT (rossella_s) Define a method "reset" in
+2331         # BasePollingManager that will be implemented by AlwaysPoll as
+2332         # no action and by InterfacePollingMinimizer as start/stop
+2333         if isinstance(polling_manager, polling.InterfacePollingMinimizer):
+2334             polling_manager.stop()
+2335             polling_manager.start()
+2336 
+2337     def rpc_loop(self, polling_manager):
+2338         idl_monitor = self.ovs.ovsdb.idl_monitor
+2339         sync = False
+2340         ports = set()
+2341         updated_ports_copy = set()
+2342         activated_bindings_copy = set()
+2343         ancillary_ports = set()
+2344         tunnel_sync = True
+2345         ovs_restarted = False
+2346         consecutive_resyncs = 0
+2347         need_clean_stale_flow = True
+2348         ports_not_ready_yet = set()
+2349         failed_devices = {'added': set(), 'removed': set()}
+2350         failed_ancillary_devices = {'added': set(), 'removed': set()}
+2351         failed_devices_retries_map = {}
+2352         while self._check_and_handle_signal():
+2353             if self.fullsync:
+2354                 LOG.info("rpc_loop doing a full sync.")
+2355                 sync = True
+2356                 self.fullsync = False
+2357             port_info = {}
+2358             ancillary_port_info = {}
+2359             start = time.time()
+2360             LOG.info("Agent rpc_loop - iteration:%d started",
+2361                      self.iter_num)
+2362             ovs_status = self.check_ovs_status()
+2363             if ovs_status == constants.OVS_RESTARTED:
+2364                 self._handle_ovs_restart(polling_manager)
+2365                 tunnel_sync = self.enable_tunneling or tunnel_sync
+2366             elif ovs_status == constants.OVS_DEAD:
+2367                 # Agent doesn't apply any operations when ovs is dead, to
+2368                 # prevent unexpected failure or crash. Sleep and continue
+2369                 # loop in which ovs status will be checked periodically.
+2370                 port_stats = self.get_port_stats({}, {})
+2371                 self.loop_count_and_wait(start, port_stats)
+2372                 continue
+2373             # Check if any physical bridge wasn't recreated recently
+2374             added_bridges = idl_monitor.bridges_added + self.added_bridges
+2375             bridges_recreated = self._reconfigure_physical_bridges(
+2376                 added_bridges)
+2377             sync |= bridges_recreated
+2378             # Notify the plugin of tunnel IP
+2379             if self.enable_tunneling and tunnel_sync:
+2380                 try:
+2381                     tunnel_sync = self.tunnel_sync()
+2382                 except Exception:
+2383                     LOG.exception("Error while configuring tunnel endpoints")
+2384                     tunnel_sync = True
+2385             ovs_restarted |= (ovs_status == constants.OVS_RESTARTED)
+2386             devices_need_retry = (any(failed_devices.values()) or
+2387                                   any(failed_ancillary_devices.values()) or
+2388                                   ports_not_ready_yet)
+2389             if (self._agent_has_updates(polling_manager) or sync or
+2390                     devices_need_retry):
+2391                 try:
+2392                     LOG.info("Agent rpc_loop - iteration:%(iter_num)d - "
+2393                              "starting polling. Elapsed:%(elapsed).3f",
+2394                              {'iter_num': self.iter_num,
+2395                               'elapsed': time.time() - start})
+2396 
+2397                     if self.conf.AGENT.baremetal_smartnic:
+2398                         if sync:
+2399                             self.process_smartnic_ports()
+2400                         updated_smartnic_ports_copy = (
+2401                             self.updated_smartnic_ports)
+2402                         self.updated_smartnic_ports = list()
+2403                         for port_data in updated_smartnic_ports_copy:
+2404                             self.treat_smartnic_port(port_data)
+2405 
+2406                     # Save updated ports dict to perform rollback in
+2407                     # case resync would be needed, and then clear
+2408                     # self.updated_ports. As the greenthread should not yield
+2409                     # between these two statements, this will be thread-safe
+2410                     updated_ports_copy = self.updated_ports
+2411                     self.updated_ports = set()
+2412                     activated_bindings_copy = self.activated_bindings
+2413                     self.activated_bindings = set()
+2414                     (port_info, ancillary_port_info, consecutive_resyncs,
+2415                      ports_not_ready_yet) = (self.process_port_info(
+2416                             start, polling_manager, sync, ovs_restarted,
+2417                             ports, ancillary_ports, updated_ports_copy,
+2418                             consecutive_resyncs, ports_not_ready_yet,
+2419                             failed_devices, failed_ancillary_devices))
+2420                     sync = False
+2421                     self.process_deleted_ports(port_info)
+2422                     self.process_deactivated_bindings(port_info)
+2423                     self.process_activated_bindings(port_info,
+2424                                                     activated_bindings_copy)
+2425                     ofport_changed_ports = self.update_stale_ofport_rules()
+2426                     if ofport_changed_ports:
+2427                         port_info.setdefault('updated', set()).update(
+2428                             ofport_changed_ports)
+2429                     LOG.info("Agent rpc_loop - iteration:%(iter_num)d - "
+2430                              "port information retrieved. "
+2431                              "Elapsed:%(elapsed).3f",
+2432                              {'iter_num': self.iter_num,
+2433                               'elapsed': time.time() - start})
+2434                     # Secure and wire/unwire VIFs and update their status
+2435                     # on Neutron server
+2436                     if (self._port_info_has_changes(port_info) or
+2437                             self.sg_agent.firewall_refresh_needed() or
+2438                             ovs_restarted):
+2439                         LOG.debug("Starting to process devices in:%s",
+2440                                   port_info)
+2441                         provisioning_needed = (
+2442                                 ovs_restarted or bridges_recreated)
+2443                         failed_devices = self.process_network_ports(
+2444                             port_info, provisioning_needed)
+2445                         if need_clean_stale_flow:
+2446                             self.cleanup_stale_flows()
+2447                             need_clean_stale_flow = False
+2448                         LOG.info("Agent rpc_loop - iteration:%(iter_num)d - "
+2449                                  "ports processed. Elapsed:%(elapsed).3f",
+2450                                  {'iter_num': self.iter_num,
+2451                                   'elapsed': time.time() - start})
+2452 
+2453                     ports = port_info['current']
+2454                     self.last_cycle_added = port_info.get('added', set())
+2455 
+2456                     if self.ancillary_brs:
+2457                         failed_ancillary_devices = (
+2458                             self.process_ancillary_network_ports(
+2459                                 ancillary_port_info))
+2460                         LOG.info("Agent rpc_loop - iteration: "
+2461                                  "%(iter_num)d - ancillary ports "
+2462                                  "processed. Elapsed:%(elapsed).3f",
+2463                                  {'iter_num': self.iter_num,
+2464                                   'elapsed': time.time() - start})
+2465                         ancillary_ports = ancillary_port_info['current']
+2466 
+2467                     polling_manager.polling_completed()
+2468                     failed_devices_retries_map = (
+2469                         self.update_retries_map_and_remove_devs_not_to_retry(
+2470                             failed_devices, failed_ancillary_devices,
+2471                             failed_devices_retries_map))
+2472                     # Keep this flag in the last line of "try" block,
+2473                     # so we can sure that no other Exception occurred.
+2474                     ovs_restarted = False
+2475                     self._dispose_local_vlan_hints()
+2476                 except Exception:
+2477                     LOG.exception("Error while processing VIF ports")
+2478                     # Put the ports back in self.updated_port
+2479                     self.updated_ports |= updated_ports_copy
+2480                     self.activated_bindings |= activated_bindings_copy
+2481                     sync = True
+2482             port_stats = self.get_port_stats(port_info, ancillary_port_info)
+2483             self.loop_count_and_wait(start, port_stats)
+2484 
+2485     def daemon_loop(self):
+2486         # Start everything.
+2487         LOG.info("Agent initialized successfully, now running... ")
+2488         signal.signal(signal.SIGTERM, self._handle_sigterm)
+2489         if hasattr(signal, 'SIGHUP'):
+2490             signal.signal(signal.SIGHUP, self._handle_sighup)
+2491         br_names = [br.br_name for br in self.phys_brs.values()]
+2492 
+2493         self.ovs.ovsdb.idl_monitor.start_bridge_monitor(br_names)
+2494         with polling.get_polling_manager(
+2495                 self.minimize_polling,
+2496                 self.ovsdb_monitor_respawn_interval) as pm:
+2497             self.rpc_loop(polling_manager=pm)
+2498 
+2499     def _handle_sigterm(self, signum, frame):
+2500         self.catch_sigterm = True
+2501         if self.quitting_rpc_timeout:
+2502             LOG.info(
+2503                 'SIGTERM received, capping RPC timeout by %d seconds.',
+2504                 self.quitting_rpc_timeout)
+2505             self.set_rpc_timeout(self.quitting_rpc_timeout)
+2506 
+2507     def _handle_sighup(self, signum, frame):
+2508         self.catch_sighup = True
+2509 
+2510     def _check_and_handle_signal(self):
+2511         if self.catch_sigterm:
+2512             LOG.info("Agent caught SIGTERM, quitting daemon loop.")
+2513             self.run_daemon_loop = False
+2514             self.catch_sigterm = False
+2515         if self.catch_sighup:
+2516             LOG.info("Agent caught SIGHUP, resetting.")
+2517             self.conf.mutate_config_files()
+2518             config.setup_logging()
+2519             LOG.debug('Full set of CONF:')
+2520             self.conf.log_opt_values(LOG, logging.DEBUG)
+2521             self.catch_sighup = False
+2522         return self.run_daemon_loop
+2523 
+2524     def set_rpc_timeout(self, timeout):
+2525         for rpc_api in (self.plugin_rpc, self.sg_plugin_rpc,
+2526                         self.dvr_plugin_rpc, self.state_rpc):
+2527             rpc_api.client.set_max_timeout(timeout)
+2528 
+2529     def _check_agent_configurations(self):
+2530         if (self.enable_distributed_routing and self.enable_tunneling and
+2531                 not self.l2_pop):
+2532 
+2533             raise ValueError(_("DVR deployments for VXLAN/GRE/Geneve "
+2534                                "underlays require L2-pop to be enabled, "
+2535                                "in both the Agent and Server side."))
+2536 
+2537 
+2538 def validate_local_ip(local_ip):
+2539     """Verify if the ip exists on the agent's host."""
+2540     if not ip_lib.IPWrapper().get_device_by_ip(local_ip):
+2541         LOG.error("Tunneling can't be enabled with invalid local_ip '%s'."
+2542                   " IP couldn't be found on this host's interfaces.",
+2543                   local_ip)
+2544         raise SystemExit(1)
+2545 
+2546 
+2547 def validate_tunnel_config(tunnel_types, local_ip):
+2548     """Verify local ip and tunnel config if tunneling is enabled."""
+2549     if not tunnel_types:
+2550         return
+2551 
+2552     validate_local_ip(local_ip)
+2553     for tun in tunnel_types:
+2554         if tun not in constants.TUNNEL_NETWORK_TYPES:
+2555             LOG.error('Invalid tunnel type specified: %s', tun)
+2556             raise SystemExit(1)
+2557 
+2558 
+2559 def prepare_xen_compute():
+2560     is_xen_compute_host = 'rootwrap-xen-dom0' in cfg.CONF.AGENT.root_helper \
+2561         or xenapi_root_helper.ROOT_HELPER_DAEMON_TOKEN == \
+2562         cfg.CONF.AGENT.root_helper_daemon
+2563     if is_xen_compute_host:
+2564         xenapi_conf.register_xenapi_opts()
+2565         # Force ip_lib to always use the root helper to ensure that ip
+2566         # commands target xen dom0 rather than domU.
+2567         cfg.CONF.register_opts(ip_lib.OPTS)
+2568         cfg.CONF.set_default('ip_lib_force_root', True)
+2569 
+2570 
+2571 def main(bridge_classes):
+2572     prepare_xen_compute()
+2573     ovs_capabilities.register()
+2574     ext_manager.register_opts(cfg.CONF)
+2575     agent_config.setup_privsep()
+2576     service_conf.register_service_opts(service_conf.RPC_EXTRA_OPTS, cfg.CONF)
+2577 
+2578     ext_mgr = ext_manager.L2AgentExtensionsManager(cfg.CONF)
+2579 
+2580     # now that all extensions registered their options, we can log them
+2581     n_utils.log_opt_values(LOG)
+2582 
+2583     validate_tunnel_config(cfg.CONF.AGENT.tunnel_types, cfg.CONF.OVS.local_ip)
+2584 
+2585     init_try = 1
+2586     while True:
+2587         try:
+2588             agent = OVSNeutronAgent(bridge_classes, ext_mgr, cfg.CONF)
+2589             capabilities.notify_init_event(n_const.AGENT_TYPE_OVS, agent)
+2590             break
+2591         except ovs_exceptions.TimeoutException as e:
+2592             if init_try < INIT_MAX_TRIES:
+2593                 LOG.warning("Ovsdb command timeout!")
+2594                 init_try += 1
+2595             else:
+2596                 LOG.error("%(err)s agent terminated after %(attempts)s "
+2597                           "initialization attempts!",
+2598                           {'err': e, 'attempts': init_try})
+2599                 sys.exit(1)
+2600         except (RuntimeError, ValueError) as e:
+2601             LOG.error("%s agent terminated!", e)
+2602             sys.exit(1)
+2603     agent.daemon_loop()

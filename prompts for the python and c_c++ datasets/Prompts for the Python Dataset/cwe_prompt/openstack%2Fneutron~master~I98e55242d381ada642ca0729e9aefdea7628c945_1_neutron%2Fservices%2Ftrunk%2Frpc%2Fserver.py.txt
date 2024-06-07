@@ -1,0 +1,217 @@
+Please review the code below for security defects using the CWE (Common Weakness Enumeration) as a reference standard. If any are found, please describe the security defect in detail and indicate the corresponding line number of code and solution. If none are detected, state: 'No security defects are detected in the code'.
+
+1 # Copyright 2016 Hewlett Packard Enterprise Development LP
+2 #
+3 # Licensed under the Apache License, Version 2.0 (the "License"); you may
+4 # not use this file except in compliance with the License. You may obtain
+5 # a copy of the License at
+6 #
+7 #     http://www.apache.org/licenses/LICENSE-2.0
+8 #
+9 # Unless required by applicable law or agreed to in writing, software
+10 # distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+11 # WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+12 # License for the specific language governing permissions and limitations
+13 # under the License.
+14 
+15 import collections
+16 
+17 from neutron_lib.api.definitions import portbindings
+18 from neutron_lib.db import api as db_api
+19 from neutron_lib.plugins import directory
+20 from neutron_lib import rpc as n_rpc
+21 from neutron_lib.services.trunk import constants as trunk_consts
+22 from oslo_log import helpers as log_helpers
+23 from oslo_log import log as logging
+24 import oslo_messaging
+25 from sqlalchemy.orm import exc
+26 
+27 from neutron.api.rpc.callbacks import events
+28 from neutron.api.rpc.callbacks.producer import registry
+29 from neutron.api.rpc.callbacks import resources
+30 from neutron.api.rpc.handlers import resources_rpc
+31 from neutron.objects import trunk as trunk_objects
+32 from neutron.services.trunk import exceptions as trunk_exc
+33 from neutron.services.trunk.rpc import constants
+34 
+35 LOG = logging.getLogger(__name__)
+36 
+37 # This module contains stub (client-side) and skeleton (server-side)
+38 # proxy code that executes in the Neutron server process space. This
+39 # is needed if any of the trunk service plugin drivers has a remote
+40 # component (e.g. agent), that needs to communicate with the Neutron
+41 # Server.
+42 
+43 # The Server side exposes the following remote methods:
+44 #
+45 # - lookup method to retrieve trunk details: used by the agent to learn
+46 #   about the trunk.
+47 # - update methods for trunk and its subports: used by the agent to
+48 #   inform the server about local trunk status changes.
+49 #
+50 # For agent-side stub and skeleton proxy code, please look at agent.py
+51 
+52 
+53 def trunk_by_port_provider(resource, port_id, context, **kwargs):
+54     """Provider callback to supply trunk information by parent port."""
+55     return trunk_objects.Trunk.get_object(context, port_id=port_id)
+56 
+57 
+58 class TrunkSkeleton(object):
+59     """Skeleton proxy code for agent->server communication."""
+60 
+61     # API version history:
+62     # 1.0 Initial version
+63     target = oslo_messaging.Target(version='1.0',
+64                                    namespace=constants.TRUNK_BASE_NAMESPACE)
+65 
+66     _core_plugin = None
+67 
+68     def __init__(self):
+69         # Used to provide trunk lookups for the agent.
+70         registry.provide(trunk_by_port_provider, resources.TRUNK)
+71         self._connection = n_rpc.Connection()
+72         self._connection.create_consumer(
+73             constants.TRUNK_BASE_TOPIC, [self], fanout=False)
+74         self._connection.consume_in_threads()
+75 
+76     @property
+77     def core_plugin(self):
+78         if not self._core_plugin:
+79             self._core_plugin = directory.get_plugin()
+80         return self._core_plugin
+81 
+82     @log_helpers.log_method_call
+83     def update_subport_bindings(self, context, subports):
+84         """Update subport bindings to match trunk host binding."""
+85         el = context.elevated()
+86         ports_by_trunk_id = collections.defaultdict(list)
+87         updated_ports = collections.defaultdict(list)
+88 
+89         for s in subports:
+90             ports_by_trunk_id[s['trunk_id']].append(s['port_id'])
+91         for trunk_id, subport_ids in ports_by_trunk_id.items():
+92             trunk = trunk_objects.Trunk.get_object(el, id=trunk_id)
+93             if not trunk:
+94                 LOG.debug("Trunk not found. id: %s", trunk_id)
+95                 continue
+96 
+97             trunk_updated_ports = self._process_trunk_subport_bindings(
+98                                                                   el,
+99                                                                   trunk,
+100                                                                   subport_ids)
+101             updated_ports[trunk.id].extend(trunk_updated_ports)
+102 
+103         return updated_ports
+104 
+105     def _safe_update_trunk(self, trunk, **kwargs):
+106         for try_cnt in range(db_api.MAX_RETRIES):
+107             try:
+108                 trunk.update(**kwargs)
+109                 break
+110             except exc.StaleDataError as e:
+111                 if try_cnt < db_api.MAX_RETRIES - 1:
+112                     LOG.debug("Got StaleDataError exception: %s", e)
+113                     continue
+114                 # re-raise when all tries failed
+115                 raise
+116 
+117     def update_trunk_status(self, context, trunk_id, status):
+118         """Update the trunk status to reflect outcome of data plane wiring."""
+119         with db_api.CONTEXT_WRITER.using(context):
+120             trunk = trunk_objects.Trunk.get_object(context, id=trunk_id)
+121             if trunk:
+122                 self._safe_update_trunk(trunk, status=status)
+123 
+124     def _process_trunk_subport_bindings(self, context, trunk, port_ids):
+125         """Process port bindings for subports on the given trunk."""
+126         updated_ports = []
+127         trunk_port_id = trunk.port_id
+128         trunk_port = self.core_plugin.get_port(context, trunk_port_id)
+129         trunk_host = trunk_port.get(portbindings.HOST_ID)
+130         migrating_to_host = trunk_port.get(
+131             portbindings.PROFILE, {}).get('migrating_to')
+132         if migrating_to_host and trunk_host != migrating_to_host:
+133             # Trunk is migrating now, so lets update host of the subports
+134             # to the new host already
+135             trunk_host = migrating_to_host
+136 
+137         # NOTE(status_police) Set the trunk in BUILD state before
+138         # processing subport bindings. The trunk will stay in BUILD
+139         # state until an attempt has been made to bind all subports
+140         # passed here and the agent acknowledges the operation was
+141         # successful.
+142         self._safe_update_trunk(
+143             trunk, status=trunk_consts.TRUNK_BUILD_STATUS)
+144 
+145         for port_id in port_ids:
+146             try:
+147                 updated_port = self._handle_port_binding(context, port_id,
+148                                                          trunk, trunk_host)
+149                 # NOTE(fitoduarte): consider trimming down the content
+150                 # of the port data structure.
+151                 updated_ports.append(updated_port)
+152             except trunk_exc.SubPortBindingError as e:
+153                 LOG.error("Failed to bind subport: %s", e)
+154 
+155                 # NOTE(status_police) The subport binding has failed in a
+156                 # manner in which we cannot proceed and the user must take
+157                 # action to bring the trunk back to a sane state.
+158                 self._safe_update_trunk(
+159                     trunk, status=trunk_consts.TRUNK_ERROR_STATUS)
+160                 return []
+161             except Exception as e:
+162                 msg = ("Failed to bind subport port %(port)s on trunk "
+163                        "%(trunk)s: %(exc)s")
+164                 LOG.error(msg, {'port': port_id, 'trunk': trunk.id, 'exc': e})
+165 
+166         if len(port_ids) != len(updated_ports):
+167             self._safe_update_trunk(
+168                 trunk, status=trunk_consts.TRUNK_DEGRADED_STATUS)
+169 
+170         return updated_ports
+171 
+172     def _handle_port_binding(self, context, port_id, trunk, trunk_host):
+173         """Bind the given port to the given host.
+174 
+175            :param context: The context to use for the operation
+176            :param port_id: The UUID of the port to be bound
+177            :param trunk: The trunk that the given port belongs to
+178            :param trunk_host: The host to bind the given port to
+179         """
+180         port = self.core_plugin.update_port(
+181             context, port_id,
+182             {'port': {portbindings.HOST_ID: trunk_host,
+183                       'device_owner': trunk_consts.TRUNK_SUBPORT_OWNER}})
+184         vif_type = port.get(portbindings.VIF_TYPE)
+185         if vif_type == portbindings.VIF_TYPE_BINDING_FAILED:
+186             raise trunk_exc.SubPortBindingError(port_id=port_id,
+187                                                 trunk_id=trunk.id)
+188         return port
+189 
+190 
+191 class TrunkStub(object):
+192     """Stub proxy code for server->agent communication."""
+193 
+194     def __init__(self):
+195         self._resource_rpc = resources_rpc.ResourcesPushRpcApi()
+196 
+197     @log_helpers.log_method_call
+198     def trunk_created(self, context, trunk):
+199         """Tell the agent about a trunk being created."""
+200         self._resource_rpc.push(context, [trunk], events.CREATED)
+201 
+202     @log_helpers.log_method_call
+203     def trunk_deleted(self, context, trunk):
+204         """Tell the agent about a trunk being deleted."""
+205         self._resource_rpc.push(context, [trunk], events.DELETED)
+206 
+207     @log_helpers.log_method_call
+208     def subports_added(self, context, subports):
+209         """Tell the agent about new subports to add."""
+210         self._resource_rpc.push(context, subports, events.CREATED)
+211 
+212     @log_helpers.log_method_call
+213     def subports_deleted(self, context, subports):
+214         """Tell the agent about existing subports to remove."""
+215         self._resource_rpc.push(context, subports, events.DELETED)

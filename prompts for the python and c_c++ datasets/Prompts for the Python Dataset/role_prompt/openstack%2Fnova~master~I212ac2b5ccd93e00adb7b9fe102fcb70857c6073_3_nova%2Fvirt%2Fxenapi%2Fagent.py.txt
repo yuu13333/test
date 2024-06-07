@@ -1,0 +1,444 @@
+I want you to act as a code reviewer of Nova in OpenStack. Please review the code below to detect security defects. If any are found, please describe the security defect in detail and indicate the corresponding line number of code and solution. If none are found, please state '''No security defects are detected in the code'''.
+
+1 # Copyright (c) 2010 Citrix Systems, Inc.
+2 # Copyright 2010-2012 OpenStack Foundation
+3 #
+4 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
+5 #    not use this file except in compliance with the License. You may obtain
+6 #    a copy of the License at
+7 #
+8 #         http://www.apache.org/licenses/LICENSE-2.0
+9 #
+10 #    Unless required by applicable law or agreed to in writing, software
+11 #    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+12 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+13 #    License for the specific language governing permissions and limitations
+14 #    under the License.
+15 
+16 import binascii
+17 from distutils import version
+18 import os
+19 import sys
+20 import time
+21 
+22 from os_xenapi.client import host_agent
+23 from os_xenapi.client import XenAPI
+24 from oslo_concurrency import processutils
+25 from oslo_log import log as logging
+26 from oslo_serialization import base64
+27 from oslo_serialization import jsonutils
+28 from oslo_utils import encodeutils
+29 from oslo_utils import strutils
+30 from oslo_utils import uuidutils
+31 
+32 from nova.api.metadata import password
+33 from nova.compute import utils as compute_utils
+34 import nova.conf
+35 from nova import context
+36 from nova import crypto
+37 from nova import exception
+38 from nova.i18n import _
+39 from nova import objects
+40 from nova import utils
+41 
+42 
+43 USE_AGENT_KEY = "xenapi_use_agent"
+44 USE_AGENT_SM_KEY = utils.SM_IMAGE_PROP_PREFIX + USE_AGENT_KEY
+45 SKIP_SSH_KEY = "xenapi_skip_agent_inject_ssh"
+46 SKIP_SSH_SM_KEY = utils.SM_IMAGE_PROP_PREFIX + SKIP_SSH_KEY
+47 SKIP_FILES_AT_BOOT_KEY = "xenapi_skip_agent_inject_files_at_boot"
+48 SKIP_FILES_AT_BOOT_SM_KEY = utils.SM_IMAGE_PROP_PREFIX \
+49                                         + SKIP_FILES_AT_BOOT_KEY
+50 
+51 LOG = logging.getLogger(__name__)
+52 CONF = nova.conf.CONF
+53 
+54 
+55 def _call_agent(session, instance, vm_ref, method, addl_args=None,
+56                 timeout=None, success_codes=None):
+57     """Abstracts out the interaction with the agent xenapi plugin."""
+58     if addl_args is None:
+59         addl_args = {}
+60     if timeout is None:
+61         timeout = CONF.xenserver.agent_timeout
+62     if success_codes is None:
+63         success_codes = ['0']
+64 
+65     # always fetch domid because VM may have rebooted
+66     dom_id = session.VM.get_domid(vm_ref)
+67     uuid = uuidutils.generate_uuid()
+68     args = {
+69         'id': uuid,
+70         'dom_id': str(dom_id),
+71         'timeout': str(timeout),
+72     }
+73 
+74     try:
+75         ret = method(session, uuid, dom_id, timeout, **addl_args)
+76     except XenAPI.Failure as e:
+77         err_msg = e.details[-1].splitlines()[-1]
+78         if 'TIMEOUT:' in err_msg:
+79             LOG.error('TIMEOUT: The call to %(method)s timed out. '
+80                       'args=%(args)r',
+81                       {'method': method, 'args': args}, instance=instance)
+82             raise exception.AgentTimeout(method=method.__name__)
+83         elif 'REBOOT:' in err_msg:
+84             LOG.debug('REBOOT: The call to %(method)s detected a reboot. '
+85                       'args=%(args)r',
+86                       {'method': method, 'args': args}, instance=instance)
+87             _wait_for_new_dom_id(session, vm_ref, dom_id, method)
+88             return _call_agent(session, instance, vm_ref, method,
+89                                addl_args, timeout, success_codes)
+90         elif 'NOT IMPLEMENTED:' in err_msg:
+91             LOG.error('NOT IMPLEMENTED: The call to %(method)s is not '
+92                       'supported by the agent. args=%(args)r',
+93                       {'method': method, 'args': args}, instance=instance)
+94             raise exception.AgentNotImplemented(method=method.__name__)
+95         else:
+96             LOG.error('The call to %(method)s returned an error: %(e)s. '
+97                       'args=%(args)r',
+98                       {'method': method, 'args': args, 'e': e},
+99                       instance=instance)
+100             raise exception.AgentError(method=method.__name__)
+101 
+102     if not isinstance(ret, dict):
+103         try:
+104             ret = jsonutils.loads(ret)
+105         except TypeError:
+106             LOG.error('The agent call to %(method)s returned an invalid '
+107                       'response: %(ret)r. args=%(args)r',
+108                       {'method': method, 'ret': ret, 'args': args},
+109                       instance=instance)
+110             raise exception.AgentError(method=method.__name__)
+111 
+112     if ret['returncode'] not in success_codes:
+113         LOG.error('The agent call to %(method)s returned '
+114                   'an error: %(ret)r. args=%(args)r',
+115                   {'method': method, 'ret': ret, 'args': args},
+116                   instance=instance)
+117         raise exception.AgentError(method=method.__name__)
+118 
+119     LOG.debug('The agent call to %(method)s was successful: '
+120               '%(ret)r. args=%(args)r',
+121               {'method': method, 'ret': ret, 'args': args},
+122               instance=instance)
+123 
+124     # Some old versions of the Windows agent have a trailing \\r\\n
+125     # (ie CRLF escaped) for some reason. Strip that off.
+126     return ret['message'].replace('\\r\\n', '')
+127 
+128 
+129 def _wait_for_new_dom_id(session, vm_ref, old_dom_id, method):
+130     expiration = time.time() + CONF.xenserver.agent_timeout
+131     while True:
+132         dom_id = session.VM.get_domid(vm_ref)
+133 
+134         if dom_id and dom_id != "-1" and dom_id != old_dom_id:
+135             LOG.debug("Found new dom_id %s", dom_id)
+136             return
+137 
+138         if time.time() > expiration:
+139             LOG.debug("Timed out waiting for new dom_id %s", dom_id)
+140             raise exception.AgentTimeout(method=method.__name__)
+141 
+142         time.sleep(1)
+143 
+144 
+145 def is_upgrade_required(current_version, available_version):
+146     # NOTE(johngarbutt): agent version numbers are four part,
+147     # so we need to use the loose version to compare them
+148     current = version.LooseVersion(current_version)
+149     available = version.LooseVersion(available_version)
+150     return available > current
+151 
+152 
+153 class XenAPIBasedAgent(object):
+154     def __init__(self, session, virtapi, instance, vm_ref):
+155         self.session = session
+156         self.virtapi = virtapi
+157         self.instance = instance
+158         self.vm_ref = vm_ref
+159 
+160     def _add_instance_fault(self, error, exc_info):
+161         LOG.warning("Ignoring error while configuring instance with agent: %s",
+162                     error, instance=self.instance, exc_info=True)
+163         try:
+164             ctxt = context.get_admin_context()
+165             compute_utils.add_instance_fault_from_exc(
+166                     ctxt, self.instance, error, exc_info=exc_info)
+167         except Exception:
+168             LOG.debug("Error setting instance fault.", exc_info=True)
+169 
+170     def _call_agent(self, method, addl_args=None, timeout=None,
+171                     success_codes=None, ignore_errors=True):
+172         try:
+173             return _call_agent(self.session, self.instance, self.vm_ref,
+174                                method, addl_args, timeout, success_codes)
+175         except exception.AgentError as error:
+176             if ignore_errors:
+177                 self._add_instance_fault(error, sys.exc_info())
+178             else:
+179                 raise
+180 
+181     def get_version(self):
+182         LOG.debug('Querying agent version', instance=self.instance)
+183 
+184         # The agent can be slow to start for a variety of reasons. On Windows,
+185         # it will generally perform a setup process on first boot that can
+186         # take a couple of minutes and then reboot. On Linux, the system can
+187         # also take a while to boot.
+188         expiration = time.time() + CONF.xenserver.agent_version_timeout
+189         while True:
+190             try:
+191                 # NOTE(johngarbutt): we can't use the xapi plugin
+192                 # timeout, because the domid may change when
+193                 # the server is rebooted
+194                 return self._call_agent(host_agent.version,
+195                                         ignore_errors=False)
+196             except exception.AgentError as error:
+197                 if time.time() > expiration:
+198                     self._add_instance_fault(error, sys.exc_info())
+199                     return
+200 
+201     def _get_expected_build(self):
+202         ctxt = context.get_admin_context()
+203         agent_build = objects.Agent.get_by_triple(
+204             ctxt, 'xen', self.instance['os_type'],
+205             self.instance['architecture'])
+206         if agent_build:
+207             LOG.debug('Latest agent build for %(hypervisor)s/%(os)s'
+208                       '/%(architecture)s is %(version)s', {
+209                             'hypervisor': agent_build.hypervisor,
+210                             'os': agent_build.os,
+211                             'architecture': agent_build.architecture,
+212                             'version': agent_build.version})
+213         else:
+214             LOG.debug('No agent build found for %(hypervisor)s/%(os)s'
+215                       '/%(architecture)s', {
+216                             'hypervisor': 'xen',
+217                             'os': self.instance['os_type'],
+218                             'architecture': self.instance['architecture']})
+219         return agent_build
+220 
+221     def update_if_needed(self, version):
+222         agent_build = self._get_expected_build()
+223         if version and agent_build and \
+224                 is_upgrade_required(version, agent_build.version):
+225             LOG.debug('Updating agent to %s', agent_build.version,
+226                       instance=self.instance)
+227             self._perform_update(agent_build)
+228         else:
+229             LOG.debug('Skipping agent update.', instance=self.instance)
+230 
+231     def _perform_update(self, agent_build):
+232         args = {'url': agent_build.url, 'md5sum': agent_build.md5hash}
+233         try:
+234             self._call_agent(host_agent.agent_update, args)
+235         except exception.AgentError as exc:
+236             # Silently fail for agent upgrades
+237             LOG.warning("Unable to update the agent due to: %(exc)s",
+238                         dict(exc=exc), instance=self.instance)
+239 
+240     def _exchange_key_with_agent(self):
+241         dh = SimpleDH()
+242         args = {'pub': str(dh.get_public())}
+243         resp = self._call_agent(host_agent.key_init, args,
+244                                 success_codes=['D0'], ignore_errors=False)
+245         agent_pub = int(resp)
+246         dh.compute_shared(agent_pub)
+247         return dh
+248 
+249     def _save_instance_password_if_sshkey_present(self, new_pass):
+250         sshkey = self.instance.get('key_data')
+251         if sshkey and sshkey.startswith("ssh-rsa"):
+252             ctxt = context.get_admin_context()
+253             enc = crypto.ssh_encrypt_text(sshkey, new_pass)
+254             self.instance.system_metadata.update(
+255                 password.convert_password(ctxt, base64.encode_as_text(enc)))
+256             self.instance.save()
+257 
+258     def set_admin_password(self, new_pass):
+259         """Set the root/admin password on the VM instance.
+260 
+261         This is done via an agent running on the VM. Communication between nova
+262         and the agent is done via writing xenstore records. Since communication
+263         is done over the XenAPI RPC calls, we need to encrypt the password.
+264         We're using a simple Diffie-Hellman class instead of a more advanced
+265         library (such as M2Crypto) for compatibility with the agent code.
+266         """
+267         LOG.debug('Setting admin password', instance=self.instance)
+268 
+269         try:
+270             dh = self._exchange_key_with_agent()
+271         except exception.AgentError as error:
+272             self._add_instance_fault(error, sys.exc_info())
+273             return
+274 
+275         # Some old versions of Linux and Windows agent expect trailing \n
+276         # on password to work correctly.
+277         enc_pass = dh.encrypt(new_pass + '\n')
+278 
+279         args = {'enc_pass': enc_pass}
+280         self._call_agent(host_agent.password, args)
+281         self._save_instance_password_if_sshkey_present(new_pass)
+282 
+283     def inject_ssh_key(self):
+284         sshkey = self.instance.get('key_data')
+285         if not sshkey:
+286             return
+287 
+288         if self.instance['os_type'] == 'windows':
+289             LOG.debug("Skipping setting of ssh key for Windows.",
+290                       instance=self.instance)
+291             return
+292 
+293         if self._skip_ssh_key_inject():
+294             LOG.debug("Skipping agent ssh key injection for this image.",
+295                       instance=self.instance)
+296             return
+297 
+298         sshkey = str(sshkey)
+299         keyfile = '/root/.ssh/authorized_keys'
+300         key_data = ''.join([
+301             '\n',
+302             '# The following ssh key was injected by Nova',
+303             '\n',
+304             sshkey.strip(),
+305             '\n',
+306         ])
+307         return self.inject_file(keyfile, key_data)
+308 
+309     def inject_files(self, injected_files):
+310         if self._skip_inject_files_at_boot():
+311             LOG.debug("Skipping agent file injection for this image.",
+312                       instance=self.instance)
+313         else:
+314             for path, contents in injected_files:
+315                 self.inject_file(path, contents)
+316 
+317     def inject_file(self, path, contents):
+318         LOG.debug('Injecting file path: %r', path, instance=self.instance)
+319 
+320         # Files/paths must be base64-encoded for transmission to agent
+321         b64_path = base64.encode_as_bytes(path)
+322         b64_contents = base64.encode_as_bytes(contents)
+323 
+324         args = {'b64_path': b64_path, 'b64_contents': b64_contents}
+325         return self._call_agent(host_agent.inject_file, args)
+326 
+327     def resetnetwork(self):
+328         LOG.debug('Resetting network', instance=self.instance)
+329 
+330         # NOTE(johngarbutt) old FreeBSD and Gentoo agents return 500 on success
+331         return self._call_agent(host_agent.reset_network,
+332                             timeout=CONF.xenserver.agent_resetnetwork_timeout,
+333                             success_codes=['0', '500'])
+334 
+335     def _skip_ssh_key_inject(self):
+336         return self._get_sys_meta_key(SKIP_SSH_SM_KEY)
+337 
+338     def _skip_inject_files_at_boot(self):
+339         return self._get_sys_meta_key(SKIP_FILES_AT_BOOT_SM_KEY)
+340 
+341     def _get_sys_meta_key(self, key):
+342         sys_meta = utils.instance_sys_meta(self.instance)
+343         raw_value = sys_meta.get(key, 'False')
+344         return strutils.bool_from_string(raw_value, strict=False)
+345 
+346 
+347 def find_guest_agent(base_dir):
+348     """tries to locate a guest agent at the path
+349     specified by agent_rel_path
+350     """
+351     if CONF.xenserver.disable_agent:
+352         return False
+353 
+354     agent_rel_path = CONF.xenserver.agent_path
+355     agent_path = os.path.join(base_dir, agent_rel_path)
+356     if os.path.isfile(agent_path):
+357         # The presence of the guest agent
+358         # file indicates that this instance can
+359         # reconfigure the network from xenstore data,
+360         # so manipulation of files in /etc is not
+361         # required
+362         LOG.info('XenServer tools installed in this '
+363                  'image are capable of network injection.  '
+364                  'Networking files will not be manipulated')
+365         return True
+366     xe_daemon_filename = os.path.join(base_dir,
+367         'usr', 'sbin', 'xe-daemon')
+368     if os.path.isfile(xe_daemon_filename):
+369         LOG.info('XenServer tools are present '
+370                  'in this image but are not capable '
+371                  'of network injection')
+372     else:
+373         LOG.info('XenServer tools are not installed in this image')
+374     return False
+375 
+376 
+377 def should_use_agent(instance):
+378     sys_meta = utils.instance_sys_meta(instance)
+379     if USE_AGENT_SM_KEY not in sys_meta:
+380         return CONF.xenserver.use_agent_default
+381     else:
+382         use_agent_raw = sys_meta[USE_AGENT_SM_KEY]
+383         try:
+384             return strutils.bool_from_string(use_agent_raw, strict=True)
+385         except ValueError:
+386             LOG.warning("Invalid 'agent_present' value. "
+387                         "Falling back to the default.",
+388                         instance=instance)
+389             return CONF.xenserver.use_agent_default
+390 
+391 
+392 class SimpleDH(object):
+393     """This class wraps all the functionality needed to implement
+394     basic Diffie-Hellman-Merkle key exchange in Python. It features
+395     intelligent defaults for the prime and base numbers needed for the
+396     calculation, while allowing you to supply your own. It requires that
+397     the openssl binary be installed on the system on which this is run,
+398     as it uses that to handle the encryption and decryption. If openssl
+399     is not available, a RuntimeError will be raised.
+400     """
+401     def __init__(self):
+402         self._prime = 162259276829213363391578010288127
+403         self._base = 5
+404         self._public = None
+405         self._shared = None
+406         self.generate_private()
+407 
+408     def generate_private(self):
+409         self._private = int(binascii.hexlify(os.urandom(10)), 16)
+410         return self._private
+411 
+412     def get_public(self):
+413         self._public = pow(self._base, self._private, self._prime)
+414         return self._public
+415 
+416     def compute_shared(self, other):
+417         self._shared = pow(other, self._private, self._prime)
+418         return self._shared
+419 
+420     def _run_ssl(self, text, decrypt=False):
+421         cmd = ['openssl', 'aes-128-cbc', '-A', '-a', '-pass',
+422                'pass:%s' % self._shared, '-nosalt']
+423         if decrypt:
+424             cmd.append('-d')
+425         try:
+426             out, err = processutils.execute(
+427                 *cmd,
+428                 process_input=encodeutils.safe_encode(text),
+429                 check_exit_code=True)
+430             if err:
+431                 LOG.warning("OpenSSL stderr: %s", err)
+432             return out
+433         except processutils.ProcessExecutionError as e:
+434             raise RuntimeError(
+435                 _('OpenSSL errored with exit code %(exit_code)d: %(stderr)s') %
+436                  {'exit_code': e.exit_code, 'stderr': e.stderr})
+437 
+438     def encrypt(self, text):
+439         return self._run_ssl(text).strip('\n')
+440 
+441     def decrypt(self, text):
+442         return self._run_ssl(text, decrypt=True)

@@ -1,0 +1,1202 @@
+Please review the code below for security defects using the CWE (Common Weakness Enumeration) as a reference standard. If any are found, please describe the security defect in detail and indicate the corresponding line number of code and solution. If none are detected, state: 'No security defects are detected in the code'.
+
+1 # Copyright 2015
+2 # All Rights Reserved.
+3 #
+4 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
+5 #    not use this file except in compliance with the License. You may obtain
+6 #    a copy of the License at
+7 #
+8 #         http://www.apache.org/licenses/LICENSE-2.0
+9 #
+10 #    Unless required by applicable law or agreed to in writing, software
+11 #    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+12 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+13 #    License for the specific language governing permissions and limitations
+14 #    under the License.
+15 
+16 import collections
+17 import contextlib
+18 import copy
+19 
+20 import netaddr
+21 from neutron_lib.callbacks import events as callbacks_events
+22 from neutron_lib.callbacks import registry as callbacks_registry
+23 from neutron_lib.callbacks import resources as callbacks_resources
+24 from neutron_lib import constants as lib_const
+25 from oslo_log import log as logging
+26 from oslo_utils import netutils
+27 
+28 from neutron._i18n import _
+29 from neutron.agent import firewall
+30 from neutron.agent.linux.openvswitch_firewall import constants as ovsfw_consts
+31 from neutron.agent.linux.openvswitch_firewall import exceptions
+32 from neutron.agent.linux.openvswitch_firewall import iptables
+33 from neutron.agent.linux.openvswitch_firewall import rules
+34 from neutron.common import constants
+35 from neutron.plugins.ml2.drivers.openvswitch.agent.common import constants \
+36         as ovs_consts
+37 
+38 LOG = logging.getLogger(__name__)
+39 
+40 
+41 def _replace_register(flow_params, register_number, register_value):
+42     """Replace value from flows to given register number
+43 
+44     'register_value' key in dictionary will be replaced by register number
+45     given by 'register_number'
+46 
+47     :param flow_params: Dictionary containing defined flows
+48     :param register_number: The number of register where value will be stored
+49     :param register_value: Key to be replaced by register number
+50 
+51     """
+52     try:
+53         reg_port = flow_params[register_value]
+54         del flow_params[register_value]
+55         flow_params['reg{:d}'.format(register_number)] = reg_port
+56     except KeyError:
+57         pass
+58 
+59 
+60 def create_reg_numbers(flow_params):
+61     """Replace reg_(port|net) values with defined register numbers"""
+62     _replace_register(flow_params, ovsfw_consts.REG_PORT, 'reg_port')
+63     _replace_register(flow_params, ovsfw_consts.REG_NET, 'reg_net')
+64     _replace_register(
+65         flow_params, ovsfw_consts.REG_REMOTE_GROUP, 'reg_remote_group')
+66 
+67 
+68 def get_tag_from_other_config(bridge, port_name):
+69     """Return tag stored in OVSDB other_config metadata.
+70 
+71     :param bridge: OVSBridge instance where port is.
+72     :param port_name: Name of the port.
+73     :raises OVSFWTagNotFound: In case tag cannot be found in OVSDB.
+74     """
+75     other_config = None
+76     try:
+77         other_config = bridge.db_get_val(
+78             'Port', port_name, 'other_config')
+79         return int(other_config['tag'])
+80     except (KeyError, TypeError, ValueError):
+81         raise exceptions.OVSFWTagNotFound(
+82             port_name=port_name, other_config=other_config)
+83 
+84 
+85 class SecurityGroup(object):
+86     def __init__(self, id_):
+87         self.id = id_
+88         self.raw_rules = []
+89         self.remote_rules = []
+90         self.members = {}
+91         self.ports = set()
+92 
+93     def update_rules(self, rules):
+94         """Separate raw and remote rules.
+95         If a rule has a protocol field, it is normalized to a number
+96         here in order to ease later processing.
+97         """
+98         self.raw_rules = []
+99         self.remote_rules = []
+100         for rule in copy.deepcopy(rules):
+101             protocol = rule.get('protocol')
+102             if protocol is not None:
+103                 if protocol.isdigit():
+104                     rule['protocol'] = int(protocol)
+105                 elif (rule.get('ethertype') == lib_const.IPv6 and
+106                       protocol == lib_const.PROTO_NAME_ICMP):
+107                     rule['protocol'] = lib_const.PROTO_NUM_IPV6_ICMP
+108                 else:
+109                     rule['protocol'] = lib_const.IP_PROTOCOL_MAP.get(
+110                         protocol, protocol)
+111             if 'remote_group_id' in rule:
+112                 self.remote_rules.append(rule)
+113             else:
+114                 self.raw_rules.append(rule)
+115 
+116     def get_ethertype_filtered_addresses(self, ethertype):
+117         return self.members.get(ethertype, [])
+118 
+119 
+120 class OFPort(object):
+121     def __init__(self, port_dict, ovs_port, vlan_tag):
+122         self.id = port_dict['device']
+123         self.vlan_tag = vlan_tag
+124         self.mac = ovs_port.vif_mac
+125         self.lla_address = str(netutils.get_ipv6_addr_by_EUI64(
+126             lib_const.IPv6_LLA_PREFIX, self.mac))
+127         self.ofport = ovs_port.ofport
+128         self.sec_groups = list()
+129         self.fixed_ips = port_dict.get('fixed_ips', [])
+130         self.neutron_port_dict = port_dict.copy()
+131         self.allowed_pairs_v4 = self._get_allowed_pairs(port_dict, version=4)
+132         self.allowed_pairs_v6 = self._get_allowed_pairs(port_dict, version=6)
+133 
+134     @staticmethod
+135     def _get_allowed_pairs(port_dict, version):
+136         aap_dict = port_dict.get('allowed_address_pairs', set())
+137         return {(aap['mac_address'], aap['ip_address']) for aap in aap_dict
+138                 if netaddr.IPNetwork(aap['ip_address']).version == version}
+139 
+140     @property
+141     def all_allowed_macs(self):
+142         macs = {item[0] for item in self.allowed_pairs_v4.union(
+143             self.allowed_pairs_v6)}
+144         macs.add(self.mac)
+145         return macs
+146 
+147     @property
+148     def ipv4_addresses(self):
+149         return [ip_addr for ip_addr in self.fixed_ips
+150                 if netaddr.IPAddress(ip_addr).version == 4]
+151 
+152     @property
+153     def ipv6_addresses(self):
+154         return [ip_addr for ip_addr in self.fixed_ips
+155                 if netaddr.IPAddress(ip_addr).version == 6]
+156 
+157     def update(self, port_dict):
+158         self.allowed_pairs_v4 = self._get_allowed_pairs(port_dict,
+159                                                         version=4)
+160         self.allowed_pairs_v6 = self._get_allowed_pairs(port_dict,
+161                                                         version=6)
+162         # Neighbour discovery uses LLA
+163         self.allowed_pairs_v6.add((self.mac, self.lla_address))
+164         self.fixed_ips = port_dict.get('fixed_ips', [])
+165         self.neutron_port_dict = port_dict.copy()
+166 
+167 
+168 class SGPortMap(object):
+169     def __init__(self):
+170         self.ports = {}
+171         self.sec_groups = {}
+172         # Maps port_id to ofport number
+173         self.unfiltered = {}
+174 
+175     def get_sg(self, sg_id):
+176         return self.sec_groups.get(sg_id, None)
+177 
+178     def get_or_create_sg(self, sg_id):
+179         try:
+180             sec_group = self.sec_groups[sg_id]
+181         except KeyError:
+182             sec_group = SecurityGroup(sg_id)
+183             self.sec_groups[sg_id] = sec_group
+184         return sec_group
+185 
+186     def delete_sg(self, sg_id):
+187         del self.sec_groups[sg_id]
+188 
+189     def create_port(self, port, port_dict):
+190         self.ports[port.id] = port
+191         self.update_port(port, port_dict)
+192 
+193     def update_port(self, port, port_dict):
+194         for sec_group in self.sec_groups.values():
+195             sec_group.ports.discard(port)
+196 
+197         port.sec_groups = [self.get_or_create_sg(sg_id)
+198                            for sg_id in port_dict['security_groups']]
+199         for sec_group in port.sec_groups:
+200             sec_group.ports.add(port)
+201         port.update(port_dict)
+202 
+203     def remove_port(self, port):
+204         for sec_group in port.sec_groups:
+205             sec_group.ports.discard(port)
+206         del self.ports[port.id]
+207 
+208     def update_rules(self, sg_id, rules):
+209         sec_group = self.get_or_create_sg(sg_id)
+210         sec_group.update_rules(rules)
+211 
+212     def update_members(self, sg_id, members):
+213         sec_group = self.get_or_create_sg(sg_id)
+214         sec_group.members = members
+215 
+216 
+217 class ConjIdMap(object):
+218     """Handle conjunction ID allocations and deallocations."""
+219 
+220     def __new__(cls):
+221         if not hasattr(cls, '_instance'):
+222             cls._instance = super(ConjIdMap, cls).__new__(cls)
+223         return cls._instance
+224 
+225     def __init__(self):
+226         self.id_map = collections.defaultdict(self._conj_id_factory)
+227         self.id_free = collections.deque()
+228         self.max_id = 0
+229 
+230     def _conj_id_factory(self):
+231         # If there is any freed ID, use one.
+232         if self.id_free:
+233             return self.id_free.popleft()
+234         # Allocate new one. It must be divisible by 8. (See the next function.)
+235         self.max_id += 8
+236         return self.max_id
+237 
+238     def get_conj_id(self, sg_id, remote_sg_id, direction, ethertype):
+239         """Return a conjunction ID specified by the arguments.
+240         Allocate one if necessary.  The returned ID is divisible by 8,
+241         as there are 4 priority levels (see rules.flow_priority_offset)
+242         and 2 conjunction IDs are needed per priority.
+243         """
+244         if direction not in [lib_const.EGRESS_DIRECTION,
+245                              lib_const.INGRESS_DIRECTION]:
+246             raise ValueError(_("Invalid direction '%s'") % direction)
+247         if ethertype not in [lib_const.IPv4, lib_const.IPv6]:
+248             raise ValueError(_("Invalid ethertype '%s'") % ethertype)
+249 
+250         return self.id_map[(sg_id, remote_sg_id, direction, ethertype)]
+251 
+252     def delete_sg(self, sg_id):
+253         """Free all conj_ids associated with the sg_id and
+254         return a list of (remote_sg_id, conj_id), which are no longer
+255         in use.
+256         """
+257         result = []
+258         for k in list(self.id_map.keys()):
+259             if sg_id in k[0:2]:
+260                 conj_id = self.id_map.pop(k)
+261                 result.append((k[1], conj_id))
+262                 self.id_free.append(conj_id)
+263 
+264         return result
+265 
+266 
+267 class ConjIPFlowManager(object):
+268     """Manage conj_id allocation and remote securitygroups derived
+269     conjunction flows.
+270 
+271     Flows managed by this class is of form:
+272 
+273         nw_src=10.2.3.4,reg_net=0xf00 actions=conjunction(123,1/2)
+274 
+275     These flows are managed per network and are usually per remote_group_id,
+276     but flows from different remote_group need to be merged on shared networks,
+277     where the complexity arises and this manager is needed.
+278 
+279     """
+280 
+281     def __init__(self, driver):
+282         self.conj_id_map = ConjIdMap()
+283         self.driver = driver
+284         # The following two are dict of dicts and are indexed like:
+285         #     self.x[vlan_tag][(direction, ethertype)]
+286         self.conj_ids = collections.defaultdict(dict)
+287         self.flow_state = collections.defaultdict(
+288             lambda: collections.defaultdict(dict))
+289 
+290     def _build_addr_conj_id_map(self, ethertype, sg_conj_id_map):
+291         """Build a map of addr -> list of conj_ids."""
+292         addr_to_conj = collections.defaultdict(list)
+293         for remote_id, conj_id_set in sg_conj_id_map.items():
+294             remote_group = self.driver.sg_port_map.get_sg(remote_id)
+295             if not remote_group:
+296                 LOG.debug('No member for SG %s', remote_id)
+297                 continue
+298             for addr in remote_group.get_ethertype_filtered_addresses(
+299                     ethertype):
+300                 addr_to_conj[addr].extend(conj_id_set)
+301 
+302         return addr_to_conj
+303 
+304     def _update_flows_for_vlan_subr(self, direction, ethertype, vlan_tag,
+305                                     flow_state, addr_to_conj):
+306         """Do the actual flow updates for given direction and ethertype."""
+307         current_ips = set(flow_state.keys())
+308         self.driver.delete_flows_for_ip_addresses(
+309             current_ips - set(addr_to_conj.keys()),
+310             direction, ethertype, vlan_tag)
+311         for addr, conj_ids in addr_to_conj.items():
+312             conj_ids.sort()
+313             if flow_state.get(addr) == conj_ids:
+314                 continue
+315             for flow in rules.create_flows_for_ip_address(
+316                     addr, direction, ethertype, vlan_tag, conj_ids):
+317                 self.driver._add_flow(**flow)
+318 
+319     def update_flows_for_vlan(self, vlan_tag):
+320         """Install action=conjunction(conj_id, 1/2) flows,
+321         which depend on IP addresses of remote_group_id.
+322         """
+323         for (direction, ethertype), sg_conj_id_map in (
+324                 self.conj_ids[vlan_tag].items()):
+325             # TODO(toshii): optimize when remote_groups have
+326             # no address overlaps.
+327             addr_to_conj = self._build_addr_conj_id_map(
+328                 ethertype, sg_conj_id_map)
+329             self._update_flows_for_vlan_subr(direction, ethertype, vlan_tag,
+330                 self.flow_state[vlan_tag][(direction, ethertype)],
+331                 addr_to_conj)
+332             self.flow_state[vlan_tag][(direction, ethertype)] = addr_to_conj
+333 
+334     def add(self, vlan_tag, sg_id, remote_sg_id, direction, ethertype,
+335             priority_offset):
+336         """Get conj_id specified by the arguments
+337         and notify the manager that
+338         (remote_sg_id, direction, ethertype, conj_id) flows need to be
+339         populated on the vlan_tag network.
+340 
+341         A caller must call update_flows_for_vlan to have the change in effect.
+342 
+343         """
+344         conj_id = self.conj_id_map.get_conj_id(
+345             sg_id, remote_sg_id, direction, ethertype) + priority_offset * 2
+346 
+347         if (direction, ethertype) not in self.conj_ids[vlan_tag]:
+348             self.conj_ids[vlan_tag][(direction, ethertype)] = (
+349                 collections.defaultdict(set))
+350         self.conj_ids[vlan_tag][(direction, ethertype)][remote_sg_id].add(
+351             conj_id)
+352         return conj_id
+353 
+354     def sg_removed(self, sg_id):
+355         """Handle SG removal events.
+356 
+357         Free all conj_ids associated with the sg_id and clean up
+358         obsolete entries from the self.conj_ids map.  Unlike the add
+359         method, it also updates flows.
+360         """
+361         id_list = self.conj_id_map.delete_sg(sg_id)
+362         unused_dict = collections.defaultdict(set)
+363         for remote_sg_id, conj_id in id_list:
+364             unused_dict[remote_sg_id].add(conj_id)
+365 
+366         for vlan_tag, vlan_conj_id_map in self.conj_ids.items():
+367             update = False
+368             for sg_conj_id_map in vlan_conj_id_map.values():
+369                 for remote_sg_id, unused in unused_dict.items():
+370                     if (remote_sg_id in sg_conj_id_map and
+371                             sg_conj_id_map[remote_sg_id] & unused):
+372                         sg_conj_id_map[remote_sg_id] -= unused
+373                         if not sg_conj_id_map[remote_sg_id]:
+374                             del sg_conj_id_map[remote_sg_id]
+375                         update = True
+376             if update:
+377                 self.update_flows_for_vlan(vlan_tag)
+378 
+379 
+380 class OVSFirewallDriver(firewall.FirewallDriver):
+381     REQUIRED_PROTOCOLS = [
+382         ovs_consts.OPENFLOW10,
+383         ovs_consts.OPENFLOW11,
+384         ovs_consts.OPENFLOW12,
+385         ovs_consts.OPENFLOW13,
+386         ovs_consts.OPENFLOW14,
+387     ]
+388 
+389     provides_arp_spoofing_protection = True
+390 
+391     def __init__(self, integration_bridge):
+392         """Initialize object
+393 
+394         :param integration_bridge: Bridge on which openflow rules will be
+395                                    applied
+396 
+397         """
+398         self.int_br = self.initialize_bridge(integration_bridge)
+399         self.sg_port_map = SGPortMap()
+400         self.conj_ip_manager = ConjIPFlowManager(self)
+401         self.sg_to_delete = set()
+402         self._update_cookie = None
+403         self._deferred = False
+404         self.iptables_helper = iptables.Helper(self.int_br.br)
+405         self.iptables_helper.load_driver_if_needed()
+406         self._initialize_firewall()
+407 
+408         callbacks_registry.subscribe(
+409             self._init_firewall_callback,
+410             callbacks_resources.AGENT,
+411             callbacks_events.OVS_RESTARTED)
+412 
+413     def _init_firewall_callback(self, resource, event, trigger, **kwargs):
+414         LOG.info("Reinitialize Openvswitch firewall after OVS restart.")
+415         self._initialize_firewall()
+416 
+417     def _initialize_firewall(self):
+418         self._drop_all_unmatched_flows()
+419         self._initialize_common_flows()
+420         self._initialize_third_party_tables()
+421 
+422     @contextlib.contextmanager
+423     def update_cookie_context(self):
+424         try:
+425             self._update_cookie = self.int_br.br.request_cookie()
+426             yield
+427         finally:
+428             self.int_br.br.unset_cookie(self._update_cookie)
+429             self._update_cookie = None
+430 
+431     def security_group_updated(self, action_type, sec_group_ids,
+432                                device_ids=None):
+433         """The current driver doesn't make use of this method.
+434 
+435         It exists here to avoid NotImplementedError raised from the parent
+436         class's method.
+437         """
+438 
+439     def _accept_flow(self, **flow):
+440         for f in rules.create_accept_flows(flow):
+441             self._add_flow(**f)
+442 
+443     def _add_flow(self, **kwargs):
+444         dl_type = kwargs.get('dl_type')
+445         create_reg_numbers(kwargs)
+446         if isinstance(dl_type, int):
+447             kwargs['dl_type'] = "0x{:04x}".format(dl_type)
+448         if self._update_cookie:
+449             kwargs['cookie'] = self._update_cookie
+450         if self._deferred:
+451             self.int_br.add_flow(**kwargs)
+452         else:
+453             self.int_br.br.add_flow(**kwargs)
+454 
+455     def _delete_flows(self, **kwargs):
+456         create_reg_numbers(kwargs)
+457         if self._deferred:
+458             self.int_br.delete_flows(**kwargs)
+459         else:
+460             self.int_br.br.delete_flows(**kwargs)
+461 
+462     def _strict_delete_flow(self, **kwargs):
+463         """Delete given flow right away even if bridge is deferred.
+464 
+465         Delete command will use strict delete.
+466         """
+467         create_reg_numbers(kwargs)
+468         self.int_br.br.delete_flows(strict=True, **kwargs)
+469 
+470     @staticmethod
+471     def initialize_bridge(int_br):
+472         int_br.add_protocols(*OVSFirewallDriver.REQUIRED_PROTOCOLS)
+473         return int_br.deferred(full_ordered=True, use_bundle=True)
+474 
+475     def _drop_all_unmatched_flows(self):
+476         for table in ovs_consts.OVS_FIREWALL_TABLES:
+477             self.int_br.br.add_flow(table=table, priority=0, actions='drop')
+478 
+479     def _initialize_common_flows(self):
+480         # Remove conntrack information from tracked packets
+481         self._add_flow(
+482             table=ovs_consts.BASE_EGRESS_TABLE,
+483             priority=110,
+484             ct_state=ovsfw_consts.OF_STATE_TRACKED,
+485             actions='ct_clear,'
+486                     'resubmit(,%d)' % ovs_consts.BASE_EGRESS_TABLE,
+487         )
+488 
+489     def _initialize_third_party_tables(self):
+490         self.int_br.br.add_flow(
+491             table=ovs_consts.ACCEPTED_EGRESS_TRAFFIC_NORMAL_TABLE,
+492             priority=1,
+493             actions='normal')
+494         self.int_br.br.add_flow(
+495             table=ovs_consts.ACCEPTED_EGRESS_TRAFFIC_TABLE,
+496             priority=1,
+497             actions='resubmit(,%d)' % (
+498                 ovs_consts.ACCEPTED_EGRESS_TRAFFIC_NORMAL_TABLE)
+499         )
+500         for table in (ovs_consts.ACCEPTED_INGRESS_TRAFFIC_TABLE,
+501                       ovs_consts.DROPPED_TRAFFIC_TABLE):
+502             self.int_br.br.add_flow(
+503                 table=table, priority=0, actions='drop')
+504 
+505     def get_ovs_port(self, port_id):
+506         ovs_port = self.int_br.br.get_vif_port_by_id(port_id)
+507         if not ovs_port:
+508             raise exceptions.OVSFWPortNotFound(port_id=port_id)
+509         return ovs_port
+510 
+511     def _get_port_vlan_tag(self, port_name):
+512         return get_tag_from_other_config(self.int_br.br, port_name)
+513 
+514     def get_ofport(self, port):
+515         port_id = port['device']
+516         return self.sg_port_map.ports.get(port_id)
+517 
+518     def get_or_create_ofport(self, port):
+519         """Get ofport specified by port['device'], checking and reflecting
+520         ofport changes.
+521         If ofport is nonexistent, create and return one.
+522         """
+523         port_id = port['device']
+524         ovs_port = self.get_ovs_port(port_id)
+525         try:
+526             of_port = self.sg_port_map.ports[port_id]
+527         except KeyError:
+528             port_vlan_id = self._get_port_vlan_tag(ovs_port.port_name)
+529             of_port = OFPort(port, ovs_port, port_vlan_id)
+530             self.sg_port_map.create_port(of_port, port)
+531         else:
+532             if of_port.ofport != ovs_port.ofport:
+533                 self.sg_port_map.remove_port(of_port)
+534                 of_port = OFPort(port, ovs_port, of_port.vlan_tag)
+535             self.sg_port_map.update_port(of_port, port)
+536 
+537         return of_port
+538 
+539     def is_port_managed(self, port):
+540         return port['device'] in self.sg_port_map.ports
+541 
+542     def prepare_port_filter(self, port):
+543         self.iptables_helper.cleanup_port(port)
+544         if not firewall.port_sec_enabled(port):
+545             self._initialize_egress_no_port_security(port['device'])
+546             return
+547 
+548         try:
+549             old_of_port = self.get_ofport(port)
+550             of_port = self.get_or_create_ofport(port)
+551             if old_of_port:
+552                 LOG.info("Initializing port %s that was already initialized.",
+553                          port['device'])
+554                 self._update_flows_for_port(of_port, old_of_port)
+555             else:
+556                 self._set_port_filters(of_port)
+557         except exceptions.OVSFWTagNotFound as not_found_error:
+558             LOG.info("port %(port_id)s does not exist in ovsdb: %(err)s.",
+559                      {'port_id': port['device'],
+560                       'err': not_found_error})
+561 
+562     def update_port_filter(self, port):
+563         """Update rules for given port
+564 
+565         Current existing filtering rules are removed and new ones are generated
+566         based on current loaded security group rules and members.
+567 
+568         """
+569         if not firewall.port_sec_enabled(port):
+570             self.remove_port_filter(port)
+571             self._initialize_egress_no_port_security(port['device'])
+572             return
+573         elif not self.is_port_managed(port):
+574             try:
+575                 self._remove_egress_no_port_security(port['device'])
+576             except exceptions.OVSFWPortNotHandled as e:
+577                 LOG.debug(e)
+578             else:
+579                 self.prepare_port_filter(port)
+580                 return
+581         try:
+582             # Make sure delete old allowed_address_pair MACs because
+583             # allowed_address_pair MACs will be updated in
+584             # self.get_or_create_ofport(port)
+585             old_of_port = self.get_ofport(port)
+586             of_port = self.get_or_create_ofport(port)
+587             if old_of_port:
+588                 self._update_flows_for_port(of_port, old_of_port)
+589             else:
+590                 self._set_port_filters(of_port)
+591 
+592         except (exceptions.OVSFWPortNotFound,
+593                 exceptions.OVSFWTagNotFound) as not_found_error:
+594             LOG.info("port %(port_id)s does not exist in ovsdb: %(err)s.",
+595                      {'port_id': port['device'],
+596                       'err': not_found_error})
+597 
+598     def _set_port_filters(self, of_port):
+599         self.initialize_port_flows(of_port)
+600         self.add_flows_from_rules(of_port)
+601 
+602     def _update_flows_for_port(self, of_port, old_of_port):
+603         with self.update_cookie_context():
+604             self._set_port_filters(of_port)
+605         # Flush the flows caused by changes made to deferred bridge. The reason
+606         # is that following delete_all_port_flows() call uses --strict
+607         # parameter that cannot be combined with other non-strict rules, hence
+608         # all parameters with --strict are applied right away. In order to
+609         # avoid applying delete rules with --strict *before*
+610         # _set_port_filters() we dump currently cached flows here.
+611         self.int_br.apply_flows()
+612         self.delete_all_port_flows(old_of_port)
+613         # Rewrite update cookie with default cookie
+614         self._set_port_filters(of_port)
+615 
+616     def remove_port_filter(self, port):
+617         """Remove port from firewall
+618 
+619         All flows related to this port are removed from ovs. Port is also
+620         removed from ports managed by this firewall.
+621 
+622         """
+623         if self.is_port_managed(port):
+624             of_port = self.get_ofport(port)
+625             self.delete_all_port_flows(of_port)
+626             self.sg_port_map.remove_port(of_port)
+627             for sec_group in of_port.sec_groups:
+628                 self._schedule_sg_deletion_maybe(sec_group.id)
+629 
+630     def update_security_group_rules(self, sg_id, rules):
+631         self.sg_port_map.update_rules(sg_id, rules)
+632 
+633     def update_security_group_members(self, sg_id, member_ips):
+634         self.sg_port_map.update_members(sg_id, member_ips)
+635         if not member_ips:
+636             self._schedule_sg_deletion_maybe(sg_id)
+637 
+638     def _schedule_sg_deletion_maybe(self, sg_id):
+639         """Schedule possible deletion of the given SG.
+640 
+641         This function must be called when the number of ports
+642         associated to sg_id drops to zero, as it isn't possible
+643         to know SG deletions from agents due to RPC API design.
+644         """
+645         sec_group = self.sg_port_map.get_or_create_sg(sg_id)
+646         if not sec_group.members or not sec_group.ports:
+647             self.sg_to_delete.add(sg_id)
+648 
+649     def _cleanup_stale_sg(self):
+650         sg_to_delete = self.sg_to_delete
+651         self.sg_to_delete = set()
+652 
+653         for sg_id in sg_to_delete:
+654             sec_group = self.sg_port_map.get_sg(sg_id)
+655             if sec_group.members and sec_group.ports:
+656                 # sec_group is still in use
+657                 continue
+658 
+659             self.conj_ip_manager.sg_removed(sg_id)
+660             self.sg_port_map.delete_sg(sg_id)
+661 
+662     def process_trusted_ports(self, port_ids):
+663         """Pass packets from these ports directly to ingress pipeline."""
+664         for port_id in port_ids:
+665             self._initialize_egress_no_port_security(port_id)
+666 
+667     def remove_trusted_ports(self, port_ids):
+668         for port_id in port_ids:
+669             try:
+670                 self._remove_egress_no_port_security(port_id)
+671             except exceptions.OVSFWPortNotHandled as e:
+672                 LOG.debug(e)
+673 
+674     def filter_defer_apply_on(self):
+675         self._deferred = True
+676 
+677     def filter_defer_apply_off(self):
+678         if self._deferred:
+679             self._cleanup_stale_sg()
+680             self.int_br.apply_flows()
+681             self._deferred = False
+682 
+683     @property
+684     def ports(self):
+685         return {id_: port.neutron_port_dict
+686                 for id_, port in self.sg_port_map.ports.items()}
+687 
+688     def initialize_port_flows(self, port):
+689         """Set base flows for port
+690 
+691         :param port: OFPort instance
+692 
+693         """
+694         # Identify egress flow
+695         self._add_flow(
+696             table=ovs_consts.TRANSIENT_TABLE,
+697             priority=100,
+698             in_port=port.ofport,
+699             actions='set_field:{:d}->reg{:d},'
+700                     'set_field:{:d}->reg{:d},'
+701                     'resubmit(,{:d})'.format(
+702                         port.ofport,
+703                         ovsfw_consts.REG_PORT,
+704                         port.vlan_tag,
+705                         ovsfw_consts.REG_NET,
+706                         ovs_consts.BASE_EGRESS_TABLE)
+707         )
+708 
+709         # Identify ingress flows
+710         for mac_addr in port.all_allowed_macs:
+711             self._add_flow(
+712                 table=ovs_consts.TRANSIENT_TABLE,
+713                 priority=90,
+714                 dl_dst=mac_addr,
+715                 dl_vlan='0x%x' % port.vlan_tag,
+716                 actions='set_field:{:d}->reg{:d},'
+717                         'set_field:{:d}->reg{:d},'
+718                         'strip_vlan,resubmit(,{:d})'.format(
+719                             port.ofport,
+720                             ovsfw_consts.REG_PORT,
+721                             port.vlan_tag,
+722                             ovsfw_consts.REG_NET,
+723                             ovs_consts.BASE_INGRESS_TABLE),
+724             )
+725 
+726         self._initialize_egress(port)
+727         self._initialize_ingress(port)
+728 
+729     def _initialize_egress_ipv6_icmp(self, port):
+730         for icmp_type in firewall.ICMPV6_ALLOWED_EGRESS_TYPES:
+731             self._add_flow(
+732                 table=ovs_consts.BASE_EGRESS_TABLE,
+733                 priority=95,
+734                 in_port=port.ofport,
+735                 reg_port=port.ofport,
+736                 dl_type=constants.ETHERTYPE_IPV6,
+737                 nw_proto=lib_const.PROTO_NUM_IPV6_ICMP,
+738                 icmp_type=icmp_type,
+739                 actions='resubmit(,%d)' % (
+740                     ovs_consts.ACCEPTED_EGRESS_TRAFFIC_NORMAL_TABLE)
+741             )
+742 
+743     def _initialize_egress_no_port_security(self, port_id):
+744         try:
+745             ovs_port = self.get_ovs_port(port_id)
+746             vlan_tag = self._get_port_vlan_tag(ovs_port.port_name)
+747         except exceptions.OVSFWTagNotFound:
+748             # It's a patch port, don't set anything
+749             return
+750         except exceptions.OVSFWPortNotFound as not_found_e:
+751             LOG.error("Initializing unfiltered port %(port_id)s that does not "
+752                       "exist in ovsdb: %(err)s.",
+753                       {'port_id': port_id,
+754                        'err': not_found_e})
+755             return
+756         self.sg_port_map.unfiltered[port_id] = ovs_port.ofport
+757         self._add_flow(
+758             table=ovs_consts.TRANSIENT_TABLE,
+759             priority=100,
+760             in_port=ovs_port.ofport,
+761             actions='set_field:%d->reg%d,'
+762                     'set_field:%d->reg%d,'
+763                     'resubmit(,%d)' % (
+764                         ovs_port.ofport,
+765                         ovsfw_consts.REG_PORT,
+766                         vlan_tag,
+767                         ovsfw_consts.REG_NET,
+768                         ovs_consts.ACCEPT_OR_INGRESS_TABLE)
+769         )
+770         self._add_flow(
+771             table=ovs_consts.ACCEPT_OR_INGRESS_TABLE,
+772             priority=80,
+773             reg_port=ovs_port.ofport,
+774             actions='resubmit(,%d)' % (
+775                 ovs_consts.ACCEPTED_EGRESS_TRAFFIC_NORMAL_TABLE)
+776         )
+777 
+778     def _remove_egress_no_port_security(self, port_id):
+779         try:
+780             ofport = self.sg_port_map.unfiltered[port_id]
+781         except KeyError:
+782             raise exceptions.OVSFWPortNotHandled(port_id=port_id)
+783 
+784         self._delete_flows(
+785             table=ovs_consts.TRANSIENT_TABLE,
+786             in_port=ofport
+787         )
+788         self._delete_flows(
+789             table=ovs_consts.ACCEPT_OR_INGRESS_TABLE,
+790             reg_port=ofport
+791         )
+792         del self.sg_port_map.unfiltered[port_id]
+793 
+794     def _initialize_egress(self, port):
+795         """Identify egress traffic and send it to egress base"""
+796         self._initialize_egress_ipv6_icmp(port)
+797 
+798         # Apply mac/ip pairs for IPv4
+799         allowed_pairs = port.allowed_pairs_v4.union(
+800             {(port.mac, ip_addr) for ip_addr in port.ipv4_addresses})
+801         for mac_addr, ip_addr in allowed_pairs:
+802             self._add_flow(
+803                 table=ovs_consts.BASE_EGRESS_TABLE,
+804                 priority=95,
+805                 in_port=port.ofport,
+806                 reg_port=port.ofport,
+807                 dl_src=mac_addr,
+808                 dl_type=constants.ETHERTYPE_ARP,
+809                 arp_spa=ip_addr,
+810                 actions='resubmit(,%d)' % (
+811                     ovs_consts.ACCEPTED_EGRESS_TRAFFIC_NORMAL_TABLE)
+812             )
+813             self._add_flow(
+814                 table=ovs_consts.BASE_EGRESS_TABLE,
+815                 priority=65,
+816                 reg_port=port.ofport,
+817                 dl_type=constants.ETHERTYPE_IP,
+818                 in_port=port.ofport,
+819                 dl_src=mac_addr,
+820                 nw_src=ip_addr,
+821                 actions='ct(table={:d},zone=NXM_NX_REG{:d}[0..15])'.format(
+822                     ovs_consts.RULES_EGRESS_TABLE,
+823                     ovsfw_consts.REG_NET)
+824             )
+825 
+826         # Apply mac/ip pairs for IPv6
+827         allowed_pairs = port.allowed_pairs_v6.union(
+828             {(port.mac, ip_addr) for ip_addr in port.ipv6_addresses})
+829         for mac_addr, ip_addr in allowed_pairs:
+830             self._add_flow(
+831                 table=ovs_consts.BASE_EGRESS_TABLE,
+832                 priority=65,
+833                 reg_port=port.ofport,
+834                 in_port=port.ofport,
+835                 dl_type=constants.ETHERTYPE_IPV6,
+836                 dl_src=mac_addr,
+837                 ipv6_src=ip_addr,
+838                 actions='ct(table={:d},zone=NXM_NX_REG{:d}[0..15])'.format(
+839                     ovs_consts.RULES_EGRESS_TABLE,
+840                     ovsfw_consts.REG_NET)
+841             )
+842 
+843         # DHCP discovery
+844         for dl_type, src_port, dst_port in (
+845                 (constants.ETHERTYPE_IP, 68, 67),
+846                 (constants.ETHERTYPE_IPV6, 546, 547)):
+847             self._add_flow(
+848                 table=ovs_consts.BASE_EGRESS_TABLE,
+849                 priority=80,
+850                 reg_port=port.ofport,
+851                 in_port=port.ofport,
+852                 dl_type=dl_type,
+853                 nw_proto=lib_const.PROTO_NUM_UDP,
+854                 tp_src=src_port,
+855                 tp_dst=dst_port,
+856                 actions='resubmit(,{:d})'.format(
+857                     ovs_consts.ACCEPT_OR_INGRESS_TABLE)
+858             )
+859         # Ban dhcp service running on an instance
+860         for dl_type, src_port, dst_port in (
+861                 (constants.ETHERTYPE_IP, 67, 68),
+862                 (constants.ETHERTYPE_IPV6, 547, 546)):
+863             self._add_flow(
+864                 table=ovs_consts.BASE_EGRESS_TABLE,
+865                 priority=70,
+866                 in_port=port.ofport,
+867                 reg_port=port.ofport,
+868                 dl_type=dl_type,
+869                 nw_proto=lib_const.PROTO_NUM_UDP,
+870                 tp_src=src_port,
+871                 tp_dst=dst_port,
+872                 actions='resubmit(,%d)' % ovs_consts.DROPPED_TRAFFIC_TABLE
+873             )
+874 
+875         # Drop Router Advertisements from instances
+876         self._add_flow(
+877             table=ovs_consts.BASE_EGRESS_TABLE,
+878             priority=70,
+879             in_port=port.ofport,
+880             reg_port=port.ofport,
+881             dl_type=constants.ETHERTYPE_IPV6,
+882             nw_proto=lib_const.PROTO_NUM_IPV6_ICMP,
+883             icmp_type=lib_const.ICMPV6_TYPE_RA,
+884             actions='resubmit(,%d)' % ovs_consts.DROPPED_TRAFFIC_TABLE
+885         )
+886 
+887         # Drop all remaining egress connections
+888         self._add_flow(
+889             table=ovs_consts.BASE_EGRESS_TABLE,
+890             priority=10,
+891             in_port=port.ofport,
+892             reg_port=port.ofport,
+893             actions='ct_clear,'
+894                     'resubmit(,%d)' % ovs_consts.DROPPED_TRAFFIC_TABLE
+895         )
+896 
+897         # Fill in accept_or_ingress table by checking that traffic is ingress
+898         # and if not, accept it
+899         for mac_addr in port.all_allowed_macs:
+900             self._add_flow(
+901                 table=ovs_consts.ACCEPT_OR_INGRESS_TABLE,
+902                 priority=100,
+903                 dl_dst=mac_addr,
+904                 reg_net=port.vlan_tag,
+905                 actions='set_field:{:d}->reg{:d},resubmit(,{:d})'.format(
+906                     port.ofport,
+907                     ovsfw_consts.REG_PORT,
+908                     ovs_consts.BASE_INGRESS_TABLE),
+909             )
+910         for ethertype in [constants.ETHERTYPE_IP, constants.ETHERTYPE_IPV6]:
+911             self._add_flow(
+912                 table=ovs_consts.ACCEPT_OR_INGRESS_TABLE,
+913                 priority=90,
+914                 dl_type=ethertype,
+915                 reg_port=port.ofport,
+916                 ct_state=ovsfw_consts.OF_STATE_NEW_NOT_ESTABLISHED,
+917                 actions='ct(commit,zone=NXM_NX_REG{:d}[0..15]),'
+918                         'resubmit(,{:d})'.format(
+919                             ovsfw_consts.REG_NET,
+920                             ovs_consts.ACCEPTED_EGRESS_TRAFFIC_TABLE)
+921             )
+922         self._add_flow(
+923             table=ovs_consts.ACCEPT_OR_INGRESS_TABLE,
+924             priority=80,
+925             reg_port=port.ofport,
+926             actions='resubmit(,%d)' % (
+927                 ovs_consts.ACCEPTED_EGRESS_TRAFFIC_NORMAL_TABLE)
+928         )
+929 
+930     def _initialize_tracked_egress(self, port):
+931         # Drop invalid packets
+932         self._add_flow(
+933             table=ovs_consts.RULES_EGRESS_TABLE,
+934             priority=50,
+935             ct_state=ovsfw_consts.OF_STATE_INVALID,
+936             actions='resubmit(,%d)' % ovs_consts.DROPPED_TRAFFIC_TABLE
+937         )
+938         # Drop traffic for removed sg rules
+939         self._add_flow(
+940             table=ovs_consts.RULES_EGRESS_TABLE,
+941             priority=50,
+942             reg_port=port.ofport,
+943             ct_mark=ovsfw_consts.CT_MARK_INVALID,
+944             actions='resubmit(,%d)' % ovs_consts.DROPPED_TRAFFIC_TABLE
+945         )
+946 
+947         for state in (
+948             ovsfw_consts.OF_STATE_ESTABLISHED_REPLY,
+949             ovsfw_consts.OF_STATE_RELATED,
+950         ):
+951             self._add_flow(
+952                 table=ovs_consts.RULES_EGRESS_TABLE,
+953                 priority=50,
+954                 ct_state=state,
+955                 ct_mark=ovsfw_consts.CT_MARK_NORMAL,
+956                 reg_port=port.ofport,
+957                 ct_zone=port.vlan_tag,
+958                 actions='resubmit(,%d)' % (
+959                     ovs_consts.ACCEPTED_EGRESS_TRAFFIC_NORMAL_TABLE)
+960             )
+961         self._add_flow(
+962             table=ovs_consts.RULES_EGRESS_TABLE,
+963             priority=40,
+964             reg_port=port.ofport,
+965             ct_state=ovsfw_consts.OF_STATE_NOT_ESTABLISHED,
+966             actions='resubmit(,%d)' % ovs_consts.DROPPED_TRAFFIC_TABLE
+967         )
+968         for ethertype in [constants.ETHERTYPE_IP, constants.ETHERTYPE_IPV6]:
+969             self._add_flow(
+970                 table=ovs_consts.RULES_EGRESS_TABLE,
+971                 priority=40,
+972                 dl_type=ethertype,
+973                 reg_port=port.ofport,
+974                 ct_state=ovsfw_consts.OF_STATE_ESTABLISHED,
+975                 actions="ct(commit,zone=NXM_NX_REG{:d}[0..15],"
+976                         "exec(set_field:{:s}->ct_mark))".format(
+977                             ovsfw_consts.REG_NET,
+978                             ovsfw_consts.CT_MARK_INVALID)
+979             )
+980 
+981     def _initialize_ingress_ipv6_icmp(self, port):
+982         for icmp_type in firewall.ICMPV6_ALLOWED_INGRESS_TYPES:
+983             self._add_flow(
+984                 table=ovs_consts.BASE_INGRESS_TABLE,
+985                 priority=100,
+986                 reg_port=port.ofport,
+987                 dl_type=constants.ETHERTYPE_IPV6,
+988                 nw_proto=lib_const.PROTO_NUM_IPV6_ICMP,
+989                 icmp_type=icmp_type,
+990                 actions='output:{:d}'.format(port.ofport)
+991             )
+992 
+993     def _initialize_ingress(self, port):
+994         # Allow incoming ARPs
+995         self._add_flow(
+996             table=ovs_consts.BASE_INGRESS_TABLE,
+997             priority=100,
+998             dl_type=constants.ETHERTYPE_ARP,
+999             reg_port=port.ofport,
+1000             actions='output:{:d}'.format(port.ofport)
+1001         )
+1002         self._initialize_ingress_ipv6_icmp(port)
+1003 
+1004         # DHCP offers
+1005         for dl_type, src_port, dst_port in (
+1006                 (constants.ETHERTYPE_IP, 67, 68),
+1007                 (constants.ETHERTYPE_IPV6, 547, 546)):
+1008             self._add_flow(
+1009                 table=ovs_consts.BASE_INGRESS_TABLE,
+1010                 priority=95,
+1011                 reg_port=port.ofport,
+1012                 dl_type=dl_type,
+1013                 nw_proto=lib_const.PROTO_NUM_UDP,
+1014                 tp_src=src_port,
+1015                 tp_dst=dst_port,
+1016                 actions='output:{:d}'.format(port.ofport)
+1017             )
+1018 
+1019         # Track untracked
+1020         for dl_type in (constants.ETHERTYPE_IP, constants.ETHERTYPE_IPV6):
+1021             self._add_flow(
+1022                 table=ovs_consts.BASE_INGRESS_TABLE,
+1023                 priority=90,
+1024                 reg_port=port.ofport,
+1025                 dl_type=dl_type,
+1026                 ct_state=ovsfw_consts.OF_STATE_NOT_TRACKED,
+1027                 actions='ct(table={:d},zone=NXM_NX_REG{:d}[0..15])'.format(
+1028                     ovs_consts.RULES_INGRESS_TABLE,
+1029                     ovsfw_consts.REG_NET)
+1030             )
+1031         self._add_flow(
+1032             table=ovs_consts.BASE_INGRESS_TABLE,
+1033             ct_state=ovsfw_consts.OF_STATE_TRACKED,
+1034             priority=80,
+1035             reg_port=port.ofport,
+1036             actions='resubmit(,{:d})'.format(ovs_consts.RULES_INGRESS_TABLE)
+1037         )
+1038 
+1039     def _initialize_tracked_ingress(self, port):
+1040         # Drop invalid packets
+1041         self._add_flow(
+1042             table=ovs_consts.RULES_INGRESS_TABLE,
+1043             priority=50,
+1044             ct_state=ovsfw_consts.OF_STATE_INVALID,
+1045             actions='resubmit(,%d)' % ovs_consts.DROPPED_TRAFFIC_TABLE
+1046         )
+1047         # Drop traffic for removed sg rules
+1048         self._add_flow(
+1049             table=ovs_consts.RULES_INGRESS_TABLE,
+1050             priority=50,
+1051             reg_port=port.ofport,
+1052             ct_mark=ovsfw_consts.CT_MARK_INVALID,
+1053             actions='resubmit(,%d)' % ovs_consts.DROPPED_TRAFFIC_TABLE
+1054         )
+1055 
+1056         # Allow established and related connections
+1057         for state in (ovsfw_consts.OF_STATE_ESTABLISHED_REPLY,
+1058                       ovsfw_consts.OF_STATE_RELATED):
+1059             self._add_flow(
+1060                 table=ovs_consts.RULES_INGRESS_TABLE,
+1061                 priority=50,
+1062                 reg_port=port.ofport,
+1063                 ct_state=state,
+1064                 ct_mark=ovsfw_consts.CT_MARK_NORMAL,
+1065                 ct_zone=port.vlan_tag,
+1066                 actions='output:{:d}'.format(port.ofport)
+1067             )
+1068         self._add_flow(
+1069             table=ovs_consts.RULES_INGRESS_TABLE,
+1070             priority=40,
+1071             reg_port=port.ofport,
+1072             ct_state=ovsfw_consts.OF_STATE_NOT_ESTABLISHED,
+1073             actions='resubmit(,%d)' % ovs_consts.DROPPED_TRAFFIC_TABLE
+1074         )
+1075         for ethertype in [constants.ETHERTYPE_IP, constants.ETHERTYPE_IPV6]:
+1076             self._add_flow(
+1077                 table=ovs_consts.RULES_INGRESS_TABLE,
+1078                 priority=40,
+1079                 dl_type=ethertype,
+1080                 reg_port=port.ofport,
+1081                 ct_state=ovsfw_consts.OF_STATE_ESTABLISHED,
+1082                 actions="ct(commit,zone=NXM_NX_REG{:d}[0..15],"
+1083                         "exec(set_field:{:s}->ct_mark))".format(
+1084                             ovsfw_consts.REG_NET,
+1085                             ovsfw_consts.CT_MARK_INVALID)
+1086             )
+1087 
+1088     def _add_non_ip_conj_flows(self, port):
+1089         """Install conjunction flows that don't depend on IP address of remote
+1090         groups, which consist of actions=conjunction(conj_id, 2/2) flows and
+1091         actions=accept flows.
+1092 
+1093         The remaining part is done by ConjIPFlowManager.
+1094         """
+1095         port_rules = collections.defaultdict(list)
+1096         for sec_group_id, rule in (
+1097                 self._create_remote_rules_generator_for_port(port)):
+1098             direction = rule['direction']
+1099             ethertype = rule['ethertype']
+1100             protocol = rule.get('protocol')
+1101             priority_offset = rules.flow_priority_offset(rule)
+1102 
+1103             conj_id = self.conj_ip_manager.add(port.vlan_tag, sec_group_id,
+1104                                                rule['remote_group_id'],
+1105                                                direction, ethertype,
+1106                                                priority_offset)
+1107 
+1108             rule1 = rule.copy()
+1109             del rule1['remote_group_id']
+1110             port_rules_key = (direction, ethertype, protocol)
+1111             port_rules[port_rules_key].append((rule1, conj_id))
+1112 
+1113         for (direction, ethertype, protocol), rule_conj_list in (
+1114                 port_rules.items()):
+1115             all_conj_ids = set()
+1116             for rule, conj_id in rule_conj_list:
+1117                 all_conj_ids.add(conj_id)
+1118 
+1119             if protocol in [lib_const.PROTO_NUM_SCTP,
+1120                             lib_const.PROTO_NUM_TCP,
+1121                             lib_const.PROTO_NUM_UDP]:
+1122                 rule_conj_list = rules.merge_port_ranges(rule_conj_list)
+1123             else:
+1124                 rule_conj_list = rules.merge_common_rules(rule_conj_list)
+1125 
+1126             for rule, conj_ids in rule_conj_list:
+1127                 flows = rules.create_flows_from_rule_and_port(
+1128                     rule, port, conjunction=True)
+1129                 for flow in rules.substitute_conjunction_actions(
+1130                         flows, 2, conj_ids):
+1131                     self._add_flow(**flow)
+1132 
+1133             # Install accept flows and store conj_id to reg7 for future process
+1134             for conj_id in all_conj_ids:
+1135                 for flow in rules.create_conj_flows(
+1136                         port, conj_id, direction, ethertype):
+1137                     flow['actions'] = "set_field:{:d}->reg{:d},{:s}".format(
+1138                         flow['conj_id'],
+1139                         ovsfw_consts.REG_REMOTE_GROUP,
+1140                         flow['actions']
+1141                     )
+1142                     self._add_flow(**flow)
+1143 
+1144     def add_flows_from_rules(self, port):
+1145         self._initialize_tracked_ingress(port)
+1146         self._initialize_tracked_egress(port)
+1147         LOG.debug('Creating flow rules for port %s that is port %d in OVS',
+1148                   port.id, port.ofport)
+1149         for rule in self._create_rules_generator_for_port(port):
+1150             # NOTE(toshii): A better version of merge_common_rules and
+1151             # its friend should be applied here in order to avoid
+1152             # overlapping flows.
+1153             flows = rules.create_flows_from_rule_and_port(rule, port)
+1154             LOG.debug("RULGEN: Rules generated for flow %s are %s",
+1155                       rule, flows)
+1156             for flow in flows:
+1157                 self._accept_flow(**flow)
+1158 
+1159         self._add_non_ip_conj_flows(port)
+1160 
+1161         self.conj_ip_manager.update_flows_for_vlan(port.vlan_tag)
+1162 
+1163     def _create_rules_generator_for_port(self, port):
+1164         for sec_group in port.sec_groups:
+1165             for rule in sec_group.raw_rules:
+1166                 yield rule
+1167 
+1168     def _create_remote_rules_generator_for_port(self, port):
+1169         for sec_group in port.sec_groups:
+1170             for rule in sec_group.remote_rules:
+1171                 yield sec_group.id, rule
+1172 
+1173     def delete_all_port_flows(self, port):
+1174         """Delete all flows for given port"""
+1175         for mac_addr in port.all_allowed_macs:
+1176             self._strict_delete_flow(priority=90,
+1177                                      table=ovs_consts.TRANSIENT_TABLE,
+1178                                      dl_dst=mac_addr,
+1179                                      dl_vlan=port.vlan_tag)
+1180             self._delete_flows(table=ovs_consts.ACCEPT_OR_INGRESS_TABLE,
+1181                                dl_dst=mac_addr, reg_net=port.vlan_tag)
+1182         self._strict_delete_flow(priority=100,
+1183                                  table=ovs_consts.TRANSIENT_TABLE,
+1184                                  in_port=port.ofport)
+1185         self._delete_flows(reg_port=port.ofport)
+1186 
+1187     def delete_flows_for_ip_addresses(
+1188             self, ip_addresses, direction, ethertype, vlan_tag):
+1189         for ip_addr in ip_addresses:
+1190             # Generate deletion template with bogus conj_id.
+1191             flows = rules.create_flows_for_ip_address(
+1192                 ip_addr, direction, ethertype, vlan_tag, [0])
+1193             for f in flows:
+1194                 # The following del statements are partly for
+1195                 # complying the OpenFlow spec. It forbids the use of
+1196                 # these field in non-strict delete flow messages, and
+1197                 # the actions field is bogus anyway.
+1198                 del f['actions']
+1199                 del f['priority']
+1200                 self._delete_flows(**f)

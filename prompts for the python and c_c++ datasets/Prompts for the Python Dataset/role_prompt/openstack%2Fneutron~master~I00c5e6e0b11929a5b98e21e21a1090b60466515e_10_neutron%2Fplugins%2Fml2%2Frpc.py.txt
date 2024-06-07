@@ -1,0 +1,462 @@
+I want you to act as a code reviewer of Neutron in OpenStack. Please review the code below to detect security defects. If any are found, please describe the security defect in detail and indicate the corresponding line number of code and solution. If none are found, please state '''No security defects are detected in the code'''.
+
+1 # Copyright (c) 2013 OpenStack Foundation
+2 # All Rights Reserved.
+3 #
+4 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
+5 #    not use this file except in compliance with the License. You may obtain
+6 #    a copy of the License at
+7 #
+8 #         http://www.apache.org/licenses/LICENSE-2.0
+9 #
+10 #    Unless required by applicable law or agreed to in writing, software
+11 #    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+12 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+13 #    License for the specific language governing permissions and limitations
+14 #    under the License.
+15 
+16 from neutron_lib.agent import topics
+17 from neutron_lib.api.definitions import port_security as psec
+18 from neutron_lib.api.definitions import portbindings
+19 from neutron_lib.api.definitions import uplink_status_propagation as usp
+20 from neutron_lib.callbacks import resources
+21 from neutron_lib import constants as n_const
+22 from neutron_lib.plugins import directory
+23 from neutron_lib.plugins.ml2 import api
+24 from neutron_lib import rpc as n_rpc
+25 from neutron_lib.services.qos import constants as qos_consts
+26 from oslo_log import log
+27 import oslo_messaging
+28 from sqlalchemy.orm import exc
+29 
+30 from neutron.agent import _topics as n_topics
+31 from neutron.api.rpc.handlers import dvr_rpc
+32 from neutron.api.rpc.handlers import securitygroups_rpc as sg_rpc
+33 from neutron.common import constants as c_const
+34 from neutron.db import l3_dvr_db
+35 from neutron.db import l3_hamode_db
+36 from neutron.db import provisioning_blocks
+37 from neutron.plugins.ml2 import db as ml2_db
+38 from neutron.plugins.ml2.drivers import type_tunnel
+39 # REVISIT(kmestery): Allow the type and mechanism drivers to supply the
+40 # mixins and eventually remove the direct dependencies on type_tunnel.
+41 
+42 LOG = log.getLogger(__name__)
+43 
+44 
+45 class RpcCallbacks(type_tunnel.TunnelRpcCallbackMixin):
+46 
+47     # history
+48     #   1.0 Initial version (from openvswitch/linuxbridge)
+49     #   1.1 Support Security Group RPC
+50     #   1.2 Support get_devices_details_list
+51     #   1.3 get_device_details rpc signature upgrade to obtain 'host' and
+52     #       return value to include fixed_ips and device_owner for
+53     #       the device port
+54     #   1.4 tunnel_sync rpc signature upgrade to obtain 'host'
+55     #   1.5 Support update_device_list and
+56     #       get_devices_details_list_and_failed_devices
+57     target = oslo_messaging.Target(version='1.5')
+58 
+59     def __init__(self, notifier, type_manager):
+60         self.setup_tunnel_callback_mixin(notifier, type_manager)
+61         super(RpcCallbacks, self).__init__()
+62 
+63     def _get_new_status(self, host, port_context):
+64         port = port_context.current
+65         if not host or host == port_context.host:
+66             new_status = (n_const.PORT_STATUS_BUILD if port['admin_state_up']
+67                           else n_const.PORT_STATUS_DOWN)
+68             if port['status'] != new_status:
+69                 return new_status
+70 
+71     @staticmethod
+72     def _get_request_details(kwargs):
+73         return (kwargs.get('agent_id'),
+74                 kwargs.get('host'),
+75                 kwargs.get('device'))
+76 
+77     def get_device_details(self, rpc_context, **kwargs):
+78         """Agent requests device details."""
+79         agent_id, host, device = self._get_request_details(kwargs)
+80 
+81         # cached networks used for reducing number of network db calls
+82         # for server internal usage only
+83         cached_networks = kwargs.get('cached_networks')
+84         LOG.debug("Device %(device)s details requested by agent "
+85                   "%(agent_id)s with host %(host)s",
+86                   {'device': device, 'agent_id': agent_id, 'host': host})
+87 
+88         plugin = directory.get_plugin()
+89         port_id = plugin._device_to_port_id(rpc_context, device)
+90         port_context = plugin.get_bound_port_context(rpc_context,
+91                                                      port_id,
+92                                                      host,
+93                                                      cached_networks)
+94         if not port_context:
+95             LOG.debug("Device %(device)s requested by agent "
+96                       "%(agent_id)s not found in database",
+97                       {'device': device, 'agent_id': agent_id})
+98             return {'device': device}
+99 
+100         port = port_context.current
+101         # caching information about networks for future use
+102         if cached_networks is not None:
+103             if port['network_id'] not in cached_networks:
+104                 cached_networks[port['network_id']] = (
+105                     port_context.network.current)
+106         result = self._get_device_details(rpc_context, agent_id=agent_id,
+107                                           host=host, device=device,
+108                                           port_context=port_context)
+109         if 'network_id' in result:
+110             # success so we update status
+111             new_status = self._get_new_status(host, port_context)
+112             if new_status:
+113                 plugin.update_port_status(rpc_context,
+114                                           port_id,
+115                                           new_status,
+116                                           host,
+117                                           port_context.network.current)
+118         return result
+119 
+120     def _get_device_details(self, rpc_context, agent_id, host, device,
+121                             port_context):
+122         segment = port_context.bottom_bound_segment
+123         port = port_context.current
+124 
+125         if not segment:
+126             LOG.warning("Device %(device)s requested by agent "
+127                         "%(agent_id)s on network %(network_id)s not "
+128                         "bound, vif_type: %(vif_type)s",
+129                         {'device': device,
+130                          'agent_id': agent_id,
+131                          'network_id': port['network_id'],
+132                          'vif_type': port_context.vif_type})
+133             return {'device': device}
+134 
+135         if (port['device_owner'].startswith(
+136                 n_const.DEVICE_OWNER_COMPUTE_PREFIX) and
+137                 port[portbindings.HOST_ID] != host):
+138             LOG.debug("Device %(device)s has no active binding in host "
+139                       "%(host)s", {'device': device,
+140                                    'host': host})
+141             return {'device': device,
+142                     c_const.NO_ACTIVE_BINDING: True}
+143 
+144         network_qos_policy_id = port_context.network._network.get(
+145             qos_consts.QOS_POLICY_ID)
+146         entry = {'device': device,
+147                  'network_id': port['network_id'],
+148                  'port_id': port['id'],
+149                  'mac_address': port['mac_address'],
+150                  'admin_state_up': port['admin_state_up'],
+151                  'network_type': segment[api.NETWORK_TYPE],
+152                  'segmentation_id': segment[api.SEGMENTATION_ID],
+153                  'physical_network': segment[api.PHYSICAL_NETWORK],
+154                  'mtu': port_context.network._network.get('mtu'),
+155                  'fixed_ips': port['fixed_ips'],
+156                  'device_owner': port['device_owner'],
+157                  'allowed_address_pairs': port['allowed_address_pairs'],
+158                  'port_security_enabled': port.get(psec.PORTSECURITY, True),
+159                  'qos_policy_id': port.get(qos_consts.QOS_POLICY_ID),
+160                  'network_qos_policy_id': network_qos_policy_id,
+161                  'profile': port[portbindings.PROFILE],
+162                  'propagate_uplink_status': port.get(
+163                      usp.PROPAGATE_UPLINK_STATUS, False)}
+164         LOG.debug("Returning: %s", entry)
+165         return entry
+166 
+167     def get_devices_details_list(self, rpc_context, **kwargs):
+168         # cached networks used for reducing number of network db calls
+169         cached_networks = {}
+170         return [
+171             self.get_device_details(
+172                 rpc_context,
+173                 device=device,
+174                 cached_networks=cached_networks,
+175                 **kwargs
+176             )
+177             for device in kwargs.pop('devices', [])
+178         ]
+179 
+180     def get_devices_details_list_and_failed_devices(self,
+181                                                     rpc_context,
+182                                                     **kwargs):
+183         devices = []
+184         failed_devices = []
+185         devices_to_fetch = kwargs.pop('devices', [])
+186         plugin = directory.get_plugin()
+187         host = kwargs.get('host')
+188         bound_contexts = plugin.get_bound_ports_contexts(rpc_context,
+189                                                          devices_to_fetch,
+190                                                          host)
+191         for device in devices_to_fetch:
+192             if not bound_contexts.get(device):
+193                 # unbound bound
+194                 LOG.debug("Device %(device)s requested by agent "
+195                           "%(agent_id)s not found in database",
+196                           {'device': device,
+197                            'agent_id': kwargs.get('agent_id')})
+198                 devices.append({'device': device})
+199                 continue
+200             try:
+201                 devices.append(self._get_device_details(
+202                                rpc_context,
+203                                agent_id=kwargs.get('agent_id'),
+204                                host=host,
+205                                device=device,
+206                                port_context=bound_contexts[device]))
+207             except Exception:
+208                 LOG.exception("Failed to get details for device %s",
+209                               device)
+210                 failed_devices.append(device)
+211         new_status_map = {ctxt.current['id']: self._get_new_status(host, ctxt)
+212                           for ctxt in bound_contexts.values() if ctxt}
+213         # filter out any without status changes
+214         new_status_map = {p: s for p, s in new_status_map.items() if s}
+215         try:
+216             plugin.update_port_statuses(rpc_context, new_status_map, host)
+217         except Exception:
+218             LOG.exception("Failure updating statuses, retrying all")
+219             failed_devices = devices_to_fetch
+220             devices = []
+221 
+222         return {'devices': devices,
+223                 'failed_devices': failed_devices}
+224 
+225     def update_device_down(self, rpc_context, **kwargs):
+226         """Device no longer exists on agent."""
+227         # TODO(garyk) - live migration and port status
+228         agent_id, host, device = self._get_request_details(kwargs)
+229         LOG.debug("Device %(device)s no longer exists at agent "
+230                   "%(agent_id)s",
+231                   {'device': device, 'agent_id': agent_id})
+232         plugin = directory.get_plugin()
+233         port_id = plugin._device_to_port_id(rpc_context, device)
+234         port_exists = True
+235         if (host and not plugin.port_bound_to_host(rpc_context,
+236                                                    port_id, host)):
+237             LOG.debug("Device %(device)s not bound to the"
+238                       " agent host %(host)s",
+239                       {'device': device, 'host': host})
+240         else:
+241             try:
+242                 port_exists = bool(plugin.update_port_status(
+243                     rpc_context, port_id, n_const.PORT_STATUS_DOWN, host))
+244             except exc.StaleDataError:
+245                 port_exists = False
+246                 LOG.debug("delete_port and update_device_down are being "
+247                           "executed concurrently. Ignoring StaleDataError.")
+248                 return {'device': device,
+249                         'exists': port_exists}
+250         self.notify_l2pop_port_wiring(port_id, rpc_context,
+251                                       n_const.PORT_STATUS_DOWN, host)
+252 
+253         return {'device': device,
+254                 'exists': port_exists}
+255 
+256     def update_device_up(self, rpc_context, **kwargs):
+257         """Device is up on agent."""
+258         agent_id, host, device = self._get_request_details(kwargs)
+259         LOG.debug("Device %(device)s up at agent %(agent_id)s",
+260                   {'device': device, 'agent_id': agent_id})
+261         plugin = directory.get_plugin()
+262         port_id = plugin._device_to_port_id(rpc_context, device)
+263         port = plugin.port_bound_to_host(rpc_context, port_id, host)
+264         if host and not port:
+265             LOG.debug("Device %(device)s not bound to the"
+266                       " agent host %(host)s",
+267                       {'device': device, 'host': host})
+268             # this might mean that a VM is in the process of live migration
+269             # and vif was plugged on the destination compute node;
+270             # need to notify nova explicitly
+271             port = ml2_db.get_port(rpc_context, port_id)
+272             # _device_to_port_id may have returned a truncated UUID if the
+273             # agent did not provide a full one (e.g. Linux Bridge case).
+274             if not port:
+275                 LOG.debug("Port %s not found, will not notify nova.", port_id)
+276                 return
+277             else:
+278                 if port.device_owner.startswith(
+279                         n_const.DEVICE_OWNER_COMPUTE_PREFIX):
+280                     plugin.nova_notifier.notify_port_active_direct(port)
+281                     return
+282         else:
+283             self.update_port_status_to_active(port, rpc_context, port_id, host)
+284         self.notify_l2pop_port_wiring(port_id, rpc_context,
+285                                       n_const.PORT_STATUS_ACTIVE, host)
+286 
+287     def update_port_status_to_active(self, port, rpc_context, port_id, host):
+288         plugin = directory.get_plugin()
+289         if port and port['device_owner'] == n_const.DEVICE_OWNER_DVR_INTERFACE:
+290             # NOTE(kevinbenton): we have to special case DVR ports because of
+291             # the special multi-binding status update logic they have that
+292             # depends on the host
+293             plugin.update_port_status(rpc_context, port_id,
+294                                       n_const.PORT_STATUS_ACTIVE, host)
+295         else:
+296             # _device_to_port_id may have returned a truncated UUID if the
+297             # agent did not provide a full one (e.g. Linux Bridge case). We
+298             # need to look up the full one before calling provisioning_complete
+299             if not port:
+300                 port = ml2_db.get_port(rpc_context, port_id)
+301             if not port:
+302                 # port doesn't exist, no need to add a provisioning block
+303                 return
+304             l3_dvr_db.check_l3_dvr_router_is_up(rpc_context, port, host)
+305             provisioning_blocks.provisioning_complete(
+306                 rpc_context, port['id'], resources.PORT,
+307                 provisioning_blocks.L2_AGENT_ENTITY)
+308 
+309     def notify_l2pop_port_wiring(self, port_id, rpc_context,
+310                                  status, host):
+311         """Notify the L2pop driver that a port has been wired/unwired.
+312 
+313         The L2pop driver uses this notification to broadcast forwarding
+314         entries to other agents on the same network as the port for port_id.
+315         """
+316         plugin = directory.get_plugin()
+317         l2pop_driver = plugin.mechanism_manager.mech_drivers.get(
+318                 'l2population')
+319         if not l2pop_driver:
+320             return
+321         port = ml2_db.get_port(rpc_context, port_id)
+322         if not port:
+323             return
+324         port_context = plugin.get_bound_port_context(
+325                 rpc_context, port_id, host)
+326         if not port_context:
+327             # port deleted
+328             return
+329         # NOTE: DVR ports are already handled and updated through l2pop
+330         # and so we don't need to update it again here. But, l2pop did not
+331         # handle DVR ports while restart neutron-*-agent, we need to handle
+332         # it here.
+333         if (port['device_owner'] == n_const.DEVICE_OWNER_DVR_INTERFACE and
+334                 not l2pop_driver.obj.agent_restarted(port_context)):
+335             return
+336         port = port_context.current
+337         if (port['device_owner'] != n_const.DEVICE_OWNER_DVR_INTERFACE and
+338                 status == n_const.PORT_STATUS_ACTIVE and
+339                 port[portbindings.HOST_ID] != host and
+340                 not l3_hamode_db.is_ha_router_port(rpc_context,
+341                                                    port['device_owner'],
+342                                                    port['device_id'])):
+343             # don't setup ACTIVE forwarding entries unless bound to this
+344             # host or if it's an HA or DVR port (which is special-cased in
+345             # the mech driver)
+346             return
+347         port_context.current['status'] = status
+348         port_context.current[portbindings.HOST_ID] = host
+349         if status == n_const.PORT_STATUS_ACTIVE:
+350             l2pop_driver.obj.update_port_up(port_context)
+351         else:
+352             l2pop_driver.obj.update_port_down(port_context)
+353 
+354     def update_device_list(self, rpc_context, **kwargs):
+355         devices_up = []
+356         failed_devices_up = []
+357         devices_down = []
+358         failed_devices_down = []
+359         devices = kwargs.get('devices_up')
+360         if devices:
+361             for device in devices:
+362                 try:
+363                     self.update_device_up(
+364                         rpc_context,
+365                         device=device,
+366                         **kwargs)
+367                 except Exception:
+368                     failed_devices_up.append(device)
+369                     LOG.error("Failed to update device %s up", device)
+370                 else:
+371                     devices_up.append(device)
+372 
+373         devices = kwargs.get('devices_down')
+374         if devices:
+375             for device in devices:
+376                 try:
+377                     dev = self.update_device_down(
+378                         rpc_context,
+379                         device=device,
+380                         **kwargs)
+381                 except Exception:
+382                     failed_devices_down.append(device)
+383                     LOG.error("Failed to update device %s down", device)
+384                 else:
+385                     devices_down.append(dev)
+386 
+387         return {'devices_up': devices_up,
+388                 'failed_devices_up': failed_devices_up,
+389                 'devices_down': devices_down,
+390                 'failed_devices_down': failed_devices_down}
+391 
+392 
+393 class AgentNotifierApi(dvr_rpc.DVRAgentRpcApiMixin,
+394                        sg_rpc.SecurityGroupAgentRpcApiMixin,
+395                        type_tunnel.TunnelAgentRpcApiMixin):
+396     """Agent side of the openvswitch rpc API.
+397 
+398     API version history:
+399         1.0 - Initial version.
+400         1.1 - Added get_active_networks_info, create_dhcp_port,
+401               update_dhcp_port, and removed get_dhcp_port methods.
+402         1.4 - Added network_update
+403         1.5 - Added binding_activate and binding_deactivate
+404     """
+405 
+406     def __init__(self, topic):
+407         self.topic = topic
+408         self.topic_network_delete = topics.get_topic_name(topic,
+409                                                           topics.NETWORK,
+410                                                           topics.DELETE)
+411         self.topic_port_update = topics.get_topic_name(topic,
+412                                                        topics.PORT,
+413                                                        topics.UPDATE)
+414         self.topic_port_delete = topics.get_topic_name(topic,
+415                                                        topics.PORT,
+416                                                        topics.DELETE)
+417         self.topic_network_update = topics.get_topic_name(topic,
+418                                                           topics.NETWORK,
+419                                                           topics.UPDATE)
+420         self.topic_port_binding_deactivate = topics.get_topic_name(
+421             topic, n_topics.PORT_BINDING, n_topics.DEACTIVATE)
+422         self.topic_port_binding_activate = topics.get_topic_name(
+423             topic, n_topics.PORT_BINDING, n_topics.ACTIVATE)
+424 
+425         target = oslo_messaging.Target(topic=topic, version='1.0')
+426         self.client = n_rpc.get_client(target)
+427 
+428     def network_delete(self, context, network_id):
+429         cctxt = self.client.prepare(topic=self.topic_network_delete,
+430                                     fanout=True)
+431         cctxt.cast(context, 'network_delete', network_id=network_id)
+432 
+433     def port_update(self, context, port, network_type, segmentation_id,
+434                     physical_network):
+435         cctxt = self.client.prepare(topic=self.topic_port_update,
+436                                     fanout=True)
+437         cctxt.cast(context, 'port_update', port=port,
+438                    network_type=network_type, segmentation_id=segmentation_id,
+439                    physical_network=physical_network)
+440 
+441     def port_delete(self, context, port_id):
+442         cctxt = self.client.prepare(topic=self.topic_port_delete,
+443                                     fanout=True)
+444         cctxt.cast(context, 'port_delete', port_id=port_id)
+445 
+446     def network_update(self, context, network):
+447         cctxt = self.client.prepare(topic=self.topic_network_update,
+448                                     fanout=True, version='1.4')
+449         cctxt.cast(context, 'network_update', network=network)
+450 
+451     def binding_deactivate(self, context, port_id, host, network_id):
+452         cctxt = self.client.prepare(topic=self.topic_port_binding_deactivate,
+453                                     fanout=True, version='1.5')
+454         cctxt.cast(context, 'binding_deactivate', port_id=port_id, host=host,
+455                    network_id=network_id)
+456 
+457     def binding_activate(self, context, port_id, host):
+458         cctxt = self.client.prepare(topic=self.topic_port_binding_activate,
+459                                     fanout=True, version='1.5')
+460         cctxt.cast(context, 'binding_activate', port_id=port_id, host=host)

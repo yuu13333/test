@@ -1,0 +1,392 @@
+I want you to act as a code reviewer of Qt Creator in Qt. Please review the code below to detect security defects. If any are found, please describe the security defect in detail and indicate the corresponding line number of code and solution. If none are found, please state '''No security defects are detected in the code'''.
+
+1 /****************************************************************************
+2 **
+3 ** Copyright (C) 2016 The Qt Company Ltd.
+4 ** Contact: https://www.qt.io/licensing/
+5 **
+6 ** This file is part of Qt Creator.
+7 **
+8 ** Commercial License Usage
+9 ** Licensees holding valid commercial Qt licenses may use this file in
+10 ** accordance with the commercial license agreement provided with the
+11 ** Software or, alternatively, in accordance with the terms contained in
+12 ** a written agreement between you and The Qt Company. For licensing terms
+13 ** and conditions see https://www.qt.io/terms-conditions. For further
+14 ** information use the contact form at https://www.qt.io/contact-us.
+15 **
+16 ** GNU General Public License Usage
+17 ** Alternatively, this file may be used under the terms of the GNU
+18 ** General Public License version 3 as published by the Free Software
+19 ** Foundation with exceptions as appearing in the file LICENSE.GPL3-EXCEPT
+20 ** included in the packaging of this file. Please review the following
+21 ** information to ensure the GNU General Public License requirements will
+22 ** be met: https://www.gnu.org/licenses/gpl-3.0.html.
+23 **
+24 ****************************************************************************/
+25 
+26 #include "sshconnection.h"
+27 
+28 #include "sftpsession.h"
+29 #include "sftptransfer.h"
+30 #include "sshlogging_p.h"
+31 #include "sshprocess_p.h"
+32 #include "sshremoteprocess.h"
+33 #include "sshsettings.h"
+34 
+35 #include <utils/filesystemwatcher.h>
+36 #include <utils/fileutils.h>
+37 #include <utils/qtcassert.h>
+38 #include <utils/hostosinfo.h>
+39 
+40 #include <QByteArrayList>
+41 #include <QDir>
+42 #include <QFileInfo>
+43 #include <QTemporaryDir>
+44 #include <QTimer>
+45 
+46 #include <memory>
+47 
+48 /*!
+49     \class QSsh::SshConnection
+50 
+51     \brief The SshConnection class provides an SSH connection via an OpenSSH client
+52            running in master mode.
+53 
+54     It operates asynchronously (non-blocking) and is not thread-safe.
+55 
+56     If connection sharing is turned off, the class operates as a simple factory
+57     for processes etc and "connecting" always succeeds. The actual connection
+58     is then established later, e.g. when starting the remote process.
+59 
+60 */
+61 
+62 namespace QSsh {
+63 using namespace Internal;
+64 using namespace Utils;
+65 
+66 SshConnectionParameters::SshConnectionParameters()
+67 {
+68     url.setPort(0);
+69 }
+70 
+71 static inline bool equals(const SshConnectionParameters &p1, const SshConnectionParameters &p2)
+72 {
+73     return p1.url == p2.url
+74             && p1.authenticationType == p2.authenticationType
+75             && p1.privateKeyFile == p2.privateKeyFile
+76             && p1.hostKeyCheckingMode == p2.hostKeyCheckingMode
+77             && p1.displayName == p2.displayName
+78             && p1.timeout == p2.timeout;
+79 }
+80 
+81 bool operator==(const SshConnectionParameters &p1, const SshConnectionParameters &p2)
+82 {
+83     return equals(p1, p2);
+84 }
+85 
+86 bool operator!=(const SshConnectionParameters &p1, const SshConnectionParameters &p2)
+87 {
+88     return !equals(p1, p2);
+89 }
+90 
+91 struct SshConnection::SshConnectionPrivate
+92 {
+93     QString fullProcessError()
+94     {
+95         QString error;
+96         if (masterProcess.exitStatus() != QProcess::NormalExit)
+97             error = masterProcess.errorString();
+98         const QByteArray stdErr = masterProcess.readAllStandardError();
+99         if (!stdErr.isEmpty()) {
+100             if (!error.isEmpty())
+101                 error.append('\n');
+102             error.append(QString::fromLocal8Bit(stdErr));
+103         }
+104         return error;
+105     }
+106 
+107     QString socketFilePath() const
+108     {
+109         QTC_ASSERT(masterSocketDir, return QString());
+110         return masterSocketDir->path() + "/control_socket";
+111     }
+112 
+113     QStringList connectionArgs() const
+114     {
+115         QString hostKeyCheckingString;
+116         switch (connParams.hostKeyCheckingMode) {
+117         case SshHostKeyCheckingNone:
+118         case SshHostKeyCheckingAllowNoMatch:
+119             // There is "accept-new" as well, but only since 7.6.
+120             hostKeyCheckingString = "no";
+121             break;
+122         case SshHostKeyCheckingStrict:
+123             hostKeyCheckingString = "yes";
+124             break;
+125         }
+126         QStringList args{"-o", "StrictHostKeyChecking=" + hostKeyCheckingString,
+127                     "-o", "User=" + connParams.userName(),
+128                     "-o", "Port=" + QString::number(connParams.port())};
+129         const bool keyOnly = connParams.authenticationType ==
+130                 SshConnectionParameters::AuthenticationTypeSpecificKey;
+131         if (keyOnly)
+132             args << "-i" << connParams.privateKeyFile;
+133         if (keyOnly || SshSettings::askpassFilePath().isEmpty())
+134             args << "-o" << "BatchMode=yes";
+135         if (sharingEnabled)
+136             args << "-o" << ("ControlPath=" + socketFilePath());
+137         if (connParams.timeout != 0)
+138             args << "-o" << ("ConnectTimeout=" + QString::number(connParams.timeout));
+139         return args << connParams.host();
+140     }
+141 
+142     SshConnectionParameters connParams;
+143     SshConnectionInfo connInfo;
+144     SshProcess masterProcess;
+145     QString errorString;
+146     QTimer socketWatcherTimer;
+147     std::unique_ptr<QTemporaryDir> masterSocketDir;
+148     FileSystemWatcher *socketWatcher = nullptr;
+149     State state = Unconnected;
+150     const bool sharingEnabled = SshSettings::connectionSharingEnabled();
+151 };
+152 
+153 
+154 SshConnection::SshConnection(const SshConnectionParameters &serverInfo, QObject *parent)
+155     : QObject(parent), d(new SshConnectionPrivate)
+156 {
+157     qRegisterMetaType<QSsh::SftpFileInfo>("QSsh::SftpFileInfo");
+158     qRegisterMetaType<QList <QSsh::SftpFileInfo> >("QList<QSsh::SftpFileInfo>");
+159     d->connParams = serverInfo;
+160     d->socketWatcher = new FileSystemWatcher(this);
+161     connect(&d->masterProcess, &QProcess::started, [this] {
+162         QFileInfo socketInfo(d->socketFilePath());
+163         if (socketInfo.exists()) {
+164             emitConnected();
+165             return;
+166         }
+167         const auto socketFileChecker = [this] {
+168             if (!QFileInfo::exists(d->socketFilePath()))
+169                 return;
+170             d->socketWatcher->disconnect();
+171             d->socketWatcher->removeDirectory(QFileInfo(d->socketFilePath()).path());
+172             d->socketWatcherTimer.disconnect();
+173             d->socketWatcherTimer.stop();
+174             emitConnected();
+175         };
+176         connect(d->socketWatcher, &FileSystemWatcher::directoryChanged, socketFileChecker);
+177         d->socketWatcher->addDirectory(socketInfo.path(), FileSystemWatcher::WatchAllChanges);
+178         if (HostOsInfo::isMacHost()) {
+179             // QFileSystemWatcher::directoryChanged() does not trigger on creation of special
+180             // files on macOS, so we need to poll.
+181             d->socketWatcherTimer.setInterval(1000);
+182             connect(&d->socketWatcherTimer, &QTimer::timeout, socketFileChecker);
+183             d->socketWatcherTimer.start();
+184         }
+185     });
+186     connect(&d->masterProcess, &QProcess::errorOccurred, [this] (QProcess::ProcessError error) {
+187         switch (error) {
+188         case QProcess::FailedToStart:
+189             emitError(tr("Cannot establish SSH connection: Control process failed to start: %1")
+190                       .arg(d->fullProcessError()));
+191             break;
+192         case QProcess::Crashed: // Handled by finished() handler.
+193         case QProcess::Timedout:
+194         case QProcess::ReadError:
+195         case QProcess::WriteError:
+196         case QProcess::UnknownError:
+197             break; // Cannot happen.
+198         }
+199     });
+200     connect(&d->masterProcess, static_cast<void (QProcess::*)(int)>(&QProcess::finished), [this] {
+201         if (d->state == Disconnecting) {
+202             emitDisconnected();
+203             return;
+204         }
+205         const QString procError = d->fullProcessError();
+206         QString errorMsg = tr("SSH connection failure.");
+207         if (!procError.isEmpty())
+208             errorMsg.append('\n').append(procError);
+209         emitError(errorMsg);
+210     });
+211     if (!d->connParams.displayName.isEmpty()) {
+212         QProcessEnvironment env = d->masterProcess.processEnvironment();
+213         env.insert("DISPLAY", d->connParams.displayName);
+214         d->masterProcess.setProcessEnvironment(env);
+215     }
+216 }
+217 
+218 void SshConnection::connectToHost()
+219 {
+220     d->state = Connecting;
+221     QTimer::singleShot(0, this, &SshConnection::doConnectToHost);
+222 }
+223 
+224 void SshConnection::disconnectFromHost()
+225 {
+226     switch (d->state) {
+227     case Connecting:
+228     case Connected:
+229         if (!d->sharingEnabled) {
+230             emitDisconnected();
+231             return;
+232         }
+233         d->state = Disconnecting;
+234         if (HostOsInfo::isWindowsHost())
+235             d->masterProcess.kill();
+236         else
+237             d->masterProcess.terminate();
+238         break;
+239     case Unconnected:
+240     case Disconnecting:
+241         break;
+242     }
+243 }
+244 
+245 SshConnection::State SshConnection::state() const
+246 {
+247     return d->state;
+248 }
+249 
+250 QString SshConnection::errorString() const
+251 {
+252     return d->errorString;
+253 }
+254 
+255 SshConnectionParameters SshConnection::connectionParameters() const
+256 {
+257     return d->connParams;
+258 }
+259 
+260 SshConnectionInfo SshConnection::connectionInfo() const
+261 {
+262     QTC_ASSERT(state() == Connected, return SshConnectionInfo());
+263     if (d->connInfo.isValid())
+264         return d->connInfo;
+265     QProcess p;
+266     p.start(SshSettings::sshFilePath().toString(), d->connectionArgs() << "echo" << "-n"
+267             << "$SSH_CLIENT");
+268     if (!p.waitForStarted() || !p.waitForFinished()) {
+269         qCWarning(Internal::sshLog) << "failed to retrieve connection info:" << p.errorString();
+270         return SshConnectionInfo();
+271     }
+272     const QByteArrayList data = p.readAllStandardOutput().split(' ');
+273     if (data.size() != 3) {
+274         qCWarning(Internal::sshLog) << "failed to retrieve connection info: unexpected output";
+275         return SshConnectionInfo();
+276     }
+277     d->connInfo.localPort = data.at(1).toInt();
+278     if (d->connInfo.localPort == 0) {
+279         qCWarning(Internal::sshLog) << "failed to retrieve connection info: unexpected output";
+280         return SshConnectionInfo();
+281     }
+282     if (!d->connInfo.localAddress.setAddress(QString::fromLatin1(data.first()))) {
+283         qCWarning(Internal::sshLog) << "failed to retrieve connection info: unexpected output";
+284         return SshConnectionInfo();
+285     }
+286     d->connInfo.peerPort = d->connParams.port();
+287     d->connInfo.peerAddress.setAddress(d->connParams.host());
+288     return d->connInfo;
+289 }
+290 
+291 bool SshConnection::sharingEnabled() const
+292 {
+293     return d->sharingEnabled;
+294 }
+295 
+296 SshConnection::~SshConnection()
+297 {
+298     disconnect();
+299     disconnectFromHost();
+300     delete d;
+301 }
+302 
+303 SshRemoteProcessPtr SshConnection::createRemoteProcess(const QByteArray &command)
+304 {
+305     QTC_ASSERT(state() == Connected, return SshRemoteProcessPtr());
+306     return SshRemoteProcessPtr(new SshRemoteProcess(command, d->connectionArgs()));
+307 }
+308 
+309 SshRemoteProcessPtr SshConnection::createRemoteShell()
+310 {
+311     return createRemoteProcess(QByteArray());
+312 }
+313 
+314 SftpTransferPtr SshConnection::createUpload(const FilesToTransfer &files,
+315                                             FileTransferErrorHandling errorHandlingMode)
+316 {
+317     return setupTransfer(files, Internal::FileTransferType::Upload, errorHandlingMode);
+318 }
+319 
+320 SftpTransferPtr SshConnection::createDownload(const FilesToTransfer &files,
+321                                               FileTransferErrorHandling errorHandlingMode)
+322 {
+323     return setupTransfer(files, Internal::FileTransferType::Download, errorHandlingMode);
+324 }
+325 
+326 SftpSessionPtr SshConnection::createSftpSession()
+327 {
+328     QTC_ASSERT(state() == Connected, return SftpSessionPtr());
+329     return SftpSessionPtr(new SftpSession(d->connectionArgs()));
+330 }
+331 
+332 void SshConnection::doConnectToHost()
+333 {
+334     if (d->state != Connecting)
+335         return;
+336     const FileName sshBinary = SshSettings::sshFilePath();
+337     if (!sshBinary.exists()) {
+338         emitError(tr("Cannot establish SSH connection: ssh binary \"%1\" does not exist.")
+339                   .arg(sshBinary.toUserOutput()));
+340         return;
+341     }
+342     if (!d->sharingEnabled)
+343         emitConnected();
+344     const QString baseDir = QDir::homePath() + "/.qtc_ssh";
+345     QDir::root().mkpath(baseDir);
+346     d->masterSocketDir.reset(new QTemporaryDir(baseDir + "/socket_dir"));
+347     if (!d->masterSocketDir->isValid()) {
+348         emitError(tr("Cannot establish SSH connection: Failed to create temporary "
+349                      "directory for control socket: %1")
+350                   .arg(d->masterSocketDir->errorString()));
+351         return;
+352     }
+353     QStringList args = QStringList{"-M", "-N", "-o", "ControlPersist=no"} << d->connectionArgs();
+354     if (!d->connParams.displayName.isEmpty())
+355         args.prepend("-X");
+356     qCDebug(sshLog) << "establishing connection:" << sshBinary.toUserOutput() << args;
+357     d->masterProcess.start(sshBinary.toString(), args);
+358 }
+359 
+360 void SshConnection::emitError(const QString &reason)
+361 {
+362     const State oldState = d->state;
+363     d->state = Unconnected;
+364     d->errorString = reason;
+365     emit errorOccurred();
+366     if (oldState == Connected)
+367         emitDisconnected();
+368 }
+369 
+370 void SshConnection::emitConnected()
+371 {
+372     d->state = Connected;
+373     emit connected();
+374 }
+375 
+376 void SshConnection::emitDisconnected()
+377 {
+378     d->state = Unconnected;
+379     emit disconnected();
+380 }
+381 
+382 SftpTransferPtr SshConnection::setupTransfer(
+383         const FilesToTransfer &files, Internal::FileTransferType type,
+384         FileTransferErrorHandling errorHandlingMode)
+385 {
+386     QTC_ASSERT(state() == Connected, return SftpTransferPtr());
+387     return SftpTransferPtr(new SftpTransfer(files, type, errorHandlingMode, d->connectionArgs()));
+388 }
+389 
+390 } // namespace QSsh

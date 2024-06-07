@@ -1,0 +1,1767 @@
+Based on the given code from a commit, please generate supplementary code files according to the commit message.
+####commit message
+Retry in CellDatabases fixture when global DB state changes
+
+There is a NOTE in the CellDatabases code about an unlikely but
+possible race that can occur between taking the writer lock to set
+the last DB context manager and taking the reader lock to call
+target_cell(). When the race is detected, a RuntimeError is raised.
+
+We can handle the race by retrying setting the last DB context manager
+when the race is detected, as described in the NOTE.
+
+Closes-Bug: #1959677
+
+Change-Id: I5c0607ce5910dce581ab9360cc7fc69ba9673f35
+
+####code 
+1 # Copyright 2010 United States Government as represented by the
+2 # Administrator of the National Aeronautics and Space Administration.
+3 # All Rights Reserved.
+4 #
+5 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
+6 #    not use this file except in compliance with the License. You may obtain
+7 #    a copy of the License at
+8 #
+9 #         http://www.apache.org/licenses/LICENSE-2.0
+10 #
+11 #    Unless required by applicable law or agreed to in writing, software
+12 #    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+13 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+14 #    License for the specific language governing permissions and limitations
+15 #    under the License.
+16 
+17 """Fixtures for Nova tests."""
+18 
+19 import collections
+20 import contextlib
+21 from contextlib import contextmanager
+22 import functools
+23 import logging as std_logging
+24 import os
+25 import warnings
+26 
+27 import eventlet
+28 import fixtures
+29 import futurist
+30 import mock
+31 from openstack import service_description
+32 from oslo_concurrency import lockutils
+33 from oslo_config import cfg
+34 from oslo_db import exception as db_exc
+35 from oslo_db.sqlalchemy import enginefacade
+36 from oslo_db.sqlalchemy import test_fixtures as db_fixtures
+37 from oslo_log import log as logging
+38 import oslo_messaging as messaging
+39 from oslo_messaging import conffixture as messaging_conffixture
+40 from oslo_privsep import daemon as privsep_daemon
+41 from oslo_utils.fixture import uuidsentinel
+42 from requests import adapters
+43 from sqlalchemy import exc as sqla_exc
+44 from wsgi_intercept import interceptor
+45 
+46 from nova.api.openstack import wsgi_app
+47 from nova.api import wsgi
+48 from nova.compute import multi_cell_list
+49 from nova.compute import rpcapi as compute_rpcapi
+50 from nova import context
+51 from nova.db.api import api as api_db_api
+52 from nova.db.main import api as main_db_api
+53 from nova.db import migration
+54 from nova import exception
+55 from nova import objects
+56 from nova.objects import base as obj_base
+57 from nova.objects import service as service_obj
+58 import nova.privsep
+59 from nova import quota as nova_quota
+60 from nova import rpc
+61 from nova.scheduler import weights
+62 from nova import service
+63 from nova.tests.functional.api import client
+64 from nova import utils
+65 
+66 CONF = cfg.CONF
+67 LOG = logging.getLogger(__name__)
+68 
+69 DB_SCHEMA = collections.defaultdict(str)
+70 PROJECT_ID = '6f70656e737461636b20342065766572'
+71 
+72 
+73 class ServiceFixture(fixtures.Fixture):
+74     """Run a service as a test fixture."""
+75 
+76     def __init__(self, name, host=None, cell=None, **kwargs):
+77         name = name
+78         # If not otherwise specified, the host will default to the
+79         # name of the service. Some things like aggregates care that
+80         # this is stable.
+81         host = host or name
+82         kwargs.setdefault('host', host)
+83         kwargs.setdefault('binary', 'nova-%s' % name)
+84         self.cell = cell
+85         self.kwargs = kwargs
+86 
+87     def setUp(self):
+88         super(ServiceFixture, self).setUp()
+89         self.ctxt = context.get_admin_context()
+90         if self.cell:
+91             context.set_target_cell(self.ctxt, self.cell)
+92 
+93         with mock.patch('nova.context.get_admin_context',
+94                         return_value=self.ctxt):
+95             self.service = service.Service.create(**self.kwargs)
+96             self.service.start()
+97         self.addCleanup(self.service.kill)
+98 
+99 
+100 class NullHandler(std_logging.Handler):
+101     """custom default NullHandler to attempt to format the record.
+102 
+103     Used in conjunction with
+104     log_fixture.get_logging_handle_error_fixture to detect formatting errors in
+105     debug level logs without saving the logs.
+106     """
+107 
+108     def handle(self, record):
+109         self.format(record)
+110 
+111     def emit(self, record):
+112         pass
+113 
+114     def createLock(self):
+115         self.lock = None
+116 
+117 
+118 class StandardLogging(fixtures.Fixture):
+119     """Setup Logging redirection for tests.
+120 
+121     There are a number of things we want to handle with logging in tests:
+122 
+123     * Redirect the logging to somewhere that we can test or dump it later.
+124 
+125     * Ensure that as many DEBUG messages as possible are actually
+126        executed, to ensure they are actually syntactically valid (they
+127        often have not been).
+128 
+129     * Ensure that we create useful output for tests that doesn't
+130       overwhelm the testing system (which means we can't capture the
+131       100 MB of debug logging on every run).
+132 
+133     To do this we create a logger fixture at the root level, which
+134     defaults to INFO and create a Null Logger at DEBUG which lets
+135     us execute log messages at DEBUG but not keep the output.
+136 
+137     To support local debugging OS_DEBUG=True can be set in the
+138     environment, which will print out the full debug logging.
+139 
+140     There are also a set of overrides for particularly verbose
+141     modules to be even less than INFO.
+142 
+143     """
+144 
+145     def setUp(self):
+146         super(StandardLogging, self).setUp()
+147 
+148         # set root logger to debug
+149         root = std_logging.getLogger()
+150         root.setLevel(std_logging.DEBUG)
+151 
+152         # supports collecting debug level for local runs
+153         if os.environ.get('OS_DEBUG') in ('True', 'true', '1', 'yes'):
+154             level = std_logging.DEBUG
+155         else:
+156             level = std_logging.INFO
+157 
+158         # Collect logs
+159         fs = '%(asctime)s %(levelname)s [%(name)s] %(message)s'
+160         self.logger = self.useFixture(
+161             fixtures.FakeLogger(format=fs, level=None))
+162         # TODO(sdague): why can't we send level through the fake
+163         # logger? Tests prove that it breaks, but it's worth getting
+164         # to the bottom of.
+165         root.handlers[0].setLevel(level)
+166 
+167         if level > std_logging.DEBUG:
+168             # Just attempt to format debug level logs, but don't save them
+169             handler = NullHandler()
+170             self.useFixture(fixtures.LogHandler(handler, nuke_handlers=False))
+171             handler.setLevel(std_logging.DEBUG)
+172 
+173             # Don't log every single DB migration step
+174             std_logging.getLogger(
+175                 'migrate.versioning.api').setLevel(std_logging.WARNING)
+176             # Or alembic for model comparisons.
+177             std_logging.getLogger('alembic').setLevel(std_logging.WARNING)
+178             # Or oslo_db provisioning steps
+179             std_logging.getLogger('oslo_db.sqlalchemy').setLevel(
+180                 std_logging.WARNING)
+181 
+182         # At times we end up calling back into main() functions in
+183         # testing. This has the possibility of calling logging.setup
+184         # again, which completely unwinds the logging capture we've
+185         # created here. Once we've setup the logging the way we want,
+186         # disable the ability for the test to change this.
+187         def fake_logging_setup(*args):
+188             pass
+189 
+190         self.useFixture(
+191             fixtures.MonkeyPatch('oslo_log.log.setup', fake_logging_setup))
+192 
+193     def delete_stored_logs(self):
+194         # NOTE(gibi): this depends on the internals of the fixtures.FakeLogger.
+195         # This could be enhanced once the PR
+196         # https://github.com/testing-cabal/fixtures/pull/42 merges
+197         self.logger._output.truncate(0)
+198 
+199 
+200 class DatabasePoisonFixture(fixtures.Fixture):
+201     def setUp(self):
+202         super(DatabasePoisonFixture, self).setUp()
+203         self.useFixture(fixtures.MonkeyPatch(
+204             'oslo_db.sqlalchemy.enginefacade._TransactionFactory.'
+205             '_create_session',
+206             self._poison_configure))
+207 
+208         # NOTE(gibi): not just _create_session indicates a manipulation on the
+209         # DB but actually any operation that actually initializes (starts) a
+210         # transaction factory. If a test does this without using the Database
+211         # fixture then that test i) actually a database test and should declare
+212         # it so ii) actually manipulates a global state without proper cleanup
+213         # and test isolation. This could lead that later tests are failing with
+214         # the error: oslo_db.sqlalchemy.enginefacade.AlreadyStartedError: this
+215         # TransactionFactory is already started
+216         self.useFixture(fixtures.MonkeyPatch(
+217            'oslo_db.sqlalchemy.enginefacade._TransactionFactory._start',
+218            self._poison_configure))
+219 
+220     def _poison_configure(self, *a, **k):
+221         # If you encounter this error, you might be tempted to just not
+222         # inherit from NoDBTestCase. Bug #1568414 fixed a few hundred of these
+223         # errors, and not once was that the correct solution. Instead,
+224         # consider some of the following tips (when applicable):
+225         #
+226         # - mock at the object layer rather than the db layer, for example:
+227         #       nova.objects.instance.Instance.get
+228         #            vs.
+229         #       nova.db.instance_get
+230         #
+231         # - mock at the api layer rather than the object layer, for example:
+232         #       nova.api.openstack.common.get_instance
+233         #           vs.
+234         #       nova.objects.instance.Instance.get
+235         #
+236         # - mock code that requires the database but is otherwise tangential
+237         #   to the code you're testing (for example: EventReporterStub)
+238         #
+239         # - peruse some of the other database poison warning fixes here:
+240         #   https://review.opendev.org/#/q/topic:bug/1568414
+241         raise Exception('This test uses methods that set internal oslo_db '
+242                         'state, but it does not claim to use the database. '
+243                         'This will conflict with the setup of tests that '
+244                         'do use the database and cause failures later.')
+245 
+246 
+247 class SingleCellSimple(fixtures.Fixture):
+248     """Setup the simplest cells environment possible
+249 
+250     This should be used when you do not care about multiple cells,
+251     or having a "real" environment for tests that should not care.
+252     This will give you a single cell, and map any and all accesses
+253     to that cell (even things that would go to cell0).
+254 
+255     If you need to distinguish between cell0 and cellN, then you
+256     should use the CellDatabases fixture.
+257 
+258     If instances should appear to still be in scheduling state, pass
+259     instances_created=False to init.
+260     """
+261 
+262     def __init__(
+263         self, instances_created=True, project_id=PROJECT_ID,
+264     ):
+265         self.instances_created = instances_created
+266         self.project_id = project_id
+267 
+268     def setUp(self):
+269         super(SingleCellSimple, self).setUp()
+270         self.useFixture(fixtures.MonkeyPatch(
+271             'nova.objects.CellMappingList._get_all_from_db',
+272             self._fake_cell_list))
+273         self.useFixture(fixtures.MonkeyPatch(
+274             'nova.objects.CellMappingList._get_by_project_id_from_db',
+275             self._fake_cell_list))
+276         self.useFixture(fixtures.MonkeyPatch(
+277             'nova.objects.CellMapping._get_by_uuid_from_db',
+278             self._fake_cell_get))
+279         self.useFixture(fixtures.MonkeyPatch(
+280             'nova.objects.HostMapping._get_by_host_from_db',
+281             self._fake_hostmapping_get))
+282         self.useFixture(fixtures.MonkeyPatch(
+283             'nova.objects.InstanceMapping._get_by_instance_uuid_from_db',
+284             self._fake_instancemapping_get))
+285         self.useFixture(fixtures.MonkeyPatch(
+286             'nova.objects.InstanceMappingList._get_by_instance_uuids_from_db',
+287             self._fake_instancemapping_get_uuids))
+288         self.useFixture(fixtures.MonkeyPatch(
+289             'nova.objects.InstanceMapping._save_in_db',
+290             self._fake_instancemapping_get_save))
+291         self.useFixture(fixtures.MonkeyPatch(
+292             'nova.context.target_cell',
+293             self._fake_target_cell))
+294         self.useFixture(fixtures.MonkeyPatch(
+295             'nova.context.set_target_cell',
+296             self._fake_set_target_cell))
+297 
+298     def _fake_hostmapping_get(self, *args):
+299         return {'id': 1,
+300                 'updated_at': None,
+301                 'created_at': None,
+302                 'host': 'host1',
+303                 'cell_mapping': self._fake_cell_list()[0]}
+304 
+305     def _fake_instancemapping_get_common(self, instance_uuid):
+306         return {
+307             'id': 1,
+308             'updated_at': None,
+309             'created_at': None,
+310             'instance_uuid': instance_uuid,
+311             'cell_id': (self.instances_created and 1 or None),
+312             'project_id': self.project_id,
+313             'cell_mapping': (
+314                 self.instances_created and self._fake_cell_get() or None),
+315         }
+316 
+317     def _fake_instancemapping_get_save(self, *args):
+318         return self._fake_instancemapping_get_common(args[-2])
+319 
+320     def _fake_instancemapping_get(self, *args):
+321         return self._fake_instancemapping_get_common(args[-1])
+322 
+323     def _fake_instancemapping_get_uuids(self, *args):
+324         return [self._fake_instancemapping_get(uuid)
+325                 for uuid in args[-1]]
+326 
+327     def _fake_cell_get(self, *args):
+328         return self._fake_cell_list()[0]
+329 
+330     def _fake_cell_list(self, *args):
+331         return [{'id': 1,
+332                  'updated_at': None,
+333                  'created_at': None,
+334                  'uuid': uuidsentinel.cell1,
+335                  'name': 'onlycell',
+336                  'transport_url': 'fake://nowhere/',
+337                  'database_connection': 'sqlite:///',
+338                  'disabled': False}]
+339 
+340     @contextmanager
+341     def _fake_target_cell(self, context, target_cell):
+342         # Just do something simple and set/unset the cell_uuid on the context.
+343         if target_cell:
+344             context.cell_uuid = getattr(target_cell, 'uuid',
+345                                         uuidsentinel.cell1)
+346         else:
+347             context.cell_uuid = None
+348         yield context
+349 
+350     def _fake_set_target_cell(self, context, cell_mapping):
+351         # Just do something simple and set/unset the cell_uuid on the context.
+352         if cell_mapping:
+353             context.cell_uuid = getattr(cell_mapping, 'uuid',
+354                                         uuidsentinel.cell1)
+355         else:
+356             context.cell_uuid = None
+357 
+358 
+359 class CheatingSerializer(rpc.RequestContextSerializer):
+360     """A messaging.RequestContextSerializer that helps with cells.
+361 
+362     Our normal serializer does not pass in the context like db_connection
+363     and mq_connection, for good reason. We don't really want/need to
+364     force a remote RPC server to use our values for this. However,
+365     during unit and functional tests, since we're all in the same
+366     process, we want cell-targeted RPC calls to preserve these values.
+367     Unless we had per-service config and database layer state for
+368     the fake services we start, this is a reasonable cheat.
+369     """
+370 
+371     def serialize_context(self, context):
+372         """Serialize context with the db_connection inside."""
+373         values = super(CheatingSerializer, self).serialize_context(context)
+374         values['db_connection'] = context.db_connection
+375         values['mq_connection'] = context.mq_connection
+376         return values
+377 
+378     def deserialize_context(self, values):
+379         """Deserialize context and honor db_connection if present."""
+380         ctxt = super(CheatingSerializer, self).deserialize_context(values)
+381         ctxt.db_connection = values.pop('db_connection', None)
+382         ctxt.mq_connection = values.pop('mq_connection', None)
+383         return ctxt
+384 
+385 
+386 class CellDatabases(fixtures.Fixture):
+387     """Create per-cell databases for testing.
+388 
+389     How to use::
+390 
+391       fix = CellDatabases()
+392       fix.add_cell_database('connection1')
+393       fix.add_cell_database('connection2', default=True)
+394       self.useFixture(fix)
+395 
+396     Passing default=True tells the fixture which database should
+397     be given to code that doesn't target a specific cell.
+398     """
+399 
+400     def __init__(self):
+401         self._ctxt_mgrs = {}
+402         self._last_ctxt_mgr = None
+403         self._default_ctxt_mgr = None
+404 
+405         # NOTE(danms): Use a ReaderWriterLock to synchronize our
+406         # global database muckery here. If we change global db state
+407         # to point to a cell, we need to take an exclusive lock to
+408         # prevent any other calls to get_context_manager() until we
+409         # reset to the default.
+410         self._cell_lock = ReaderWriterLock()
+411 
+412     def _cache_schema(self, connection_str):
+413         # NOTE(melwitt): See the regular Database fixture for why
+414         # we do this.
+415         global DB_SCHEMA
+416         if not DB_SCHEMA[('main', None)]:
+417             ctxt_mgr = self._ctxt_mgrs[connection_str]
+418             engine = ctxt_mgr.writer.get_engine()
+419             conn = engine.connect()
+420             migration.db_sync(database='main')
+421             DB_SCHEMA[('main', None)] = "".join(line for line
+422                                         in conn.connection.iterdump())
+423             engine.dispose()
+424 
+425     @contextmanager
+426     def _wrap_target_cell(self, context, cell_mapping):
+427         # NOTE(danms): This method is responsible for switching global
+428         # database state in a safe way such that code that doesn't
+429         # know anything about cell targeting (i.e. compute node code)
+430         # can continue to operate when called from something that has
+431         # targeted a specific cell. In order to make this safe from a
+432         # dining-philosopher-style deadlock, we need to be able to
+433         # support multiple threads talking to the same cell at the
+434         # same time and potentially recursion within the same thread
+435         # from code that would otherwise be running on separate nodes
+436         # in real life, but where we're actually recursing in the
+437         # tests.
+438         #
+439         # The basic logic here is:
+440         #  1. Grab a reader lock to see if the state is already pointing at
+441         #     the cell we want. If it is, we can yield and return without
+442         #     altering the global state further. The read lock ensures that
+443         #     global state won't change underneath us, and multiple threads
+444         #     can be working at the same time, as long as they are looking
+445         #     for the same cell.
+446         #  2. If we do need to change the global state, grab a writer lock
+447         #     to make that change, which assumes that nothing else is looking
+448         #     at a cell right now. We do only non-schedulable things while
+449         #     holding that lock to avoid the deadlock mentioned above.
+450         #  3. We then re-lock with a reader lock just as step #1 above and
+451         #     yield to do the actual work. We can do schedulable things
+452         #     here and not exclude other threads from making progress.
+453         #     If an exception is raised, we capture that and save it.
+454         #  4. If we changed state in #2, we need to change it back. So we grab
+455         #     a writer lock again and do that.
+456         #  5. Finally, if an exception was raised in #3 while state was
+457         #     changed, we raise it to the caller.
+458 
+459         if cell_mapping:
+460             desired = self._ctxt_mgrs[cell_mapping.database_connection]
+461         else:
+462             desired = self._default_ctxt_mgr
+463 
+464         with self._cell_lock.read_lock():
+465             if self._last_ctxt_mgr == desired:
+466                 with self._real_target_cell(context, cell_mapping) as c:
+467                     yield c
+468                     return
+469 
+470         raised_exc = None
+471 
+472         def set_last_ctxt_mgr():
+473             with self._cell_lock.write_lock():
+474                 if cell_mapping is not None:
+475                     # This assumes the next local DB access is the same cell
+476                     # that was targeted last time.
+477                     self._last_ctxt_mgr = desired
+478 
+479         # Set last context manager to the desired cell's context manager.
+480         set_last_ctxt_mgr()
+481 
+482         # Retry setting the last context manager if we detect that a writer
+483         # changed global DB state before we take the read lock.
+484         last_ctxt_mgr_desired = None
+485         while not last_ctxt_mgr_desired:
+486             try:
+487                 with self._cell_lock.read_lock():
+488                     if self._last_ctxt_mgr != desired:
+489                         # NOTE(danms): This is unlikely to happen, but it's
+490                         # possible another waiting writer changed the state
+491                         # between us letting it go and re-acquiring as a
+492                         # reader. If lockutils supported upgrading and
+493                         # downgrading locks, this wouldn't be a problem.
+494                         # Regardless, assert that it is still as we left it
+495                         # here so we don't hit the wrong cell. If this becomes
+496                         # a problem, we just need to retry the write section
+497                         # above until we land here with the cell we want.
+498                         raise RuntimeError(
+499                             'Global DB state changed underneath us')
+500                     last_ctxt_mgr_desired = True
+501                     try:
+502                         with self._real_target_cell(
+503                             context, cell_mapping
+504                         ) as ccontext:
+505                             yield ccontext
+506                     except Exception as exc:
+507                         raised_exc = exc
+508             except RuntimeError:
+509                 set_last_ctxt_mgr()
+510 
+511         with self._cell_lock.write_lock():
+512             # Once we have returned from the context, we need
+513             # to restore the default context manager for any
+514             # subsequent calls
+515             self._last_ctxt_mgr = self._default_ctxt_mgr
+516 
+517         if raised_exc:
+518             raise raised_exc
+519 
+520     def _wrap_create_context_manager(self, connection=None):
+521         ctxt_mgr = self._ctxt_mgrs[connection]
+522         return ctxt_mgr
+523 
+524     def _wrap_get_context_manager(self, context):
+525         try:
+526             # If already targeted, we can proceed without a lock
+527             if context.db_connection:
+528                 return context.db_connection
+529         except AttributeError:
+530             # Unit tests with None, FakeContext, etc
+531             pass
+532 
+533         # NOTE(melwitt): This is a hack to try to deal with
+534         # local accesses i.e. non target_cell accesses.
+535         with self._cell_lock.read_lock():
+536             # FIXME(mriedem): This is actually misleading and means we don't
+537             # catch things like bug 1717000 where a context should be targeted
+538             # to a cell but it's not, and the fixture here just returns the
+539             # last targeted context that was used.
+540             return self._last_ctxt_mgr
+541 
+542     def _wrap_get_server(self, target, endpoints, serializer=None):
+543         """Mirror rpc.get_server() but with our special sauce."""
+544         serializer = CheatingSerializer(serializer)
+545         return messaging.get_rpc_server(rpc.TRANSPORT,
+546                                         target,
+547                                         endpoints,
+548                                         executor='eventlet',
+549                                         serializer=serializer)
+550 
+551     def _wrap_get_client(self, target, version_cap=None, serializer=None,
+552                          call_monitor_timeout=None):
+553         """Mirror rpc.get_client() but with our special sauce."""
+554         serializer = CheatingSerializer(serializer)
+555         return messaging.RPCClient(rpc.TRANSPORT,
+556                                    target,
+557                                    version_cap=version_cap,
+558                                    serializer=serializer,
+559                                    call_monitor_timeout=call_monitor_timeout)
+560 
+561     def add_cell_database(self, connection_str, default=False):
+562         """Add a cell database to the fixture.
+563 
+564         :param connection_str: An identifier used to represent the connection
+565         string for this database. It should match the database_connection field
+566         in the corresponding CellMapping.
+567         """
+568 
+569         # NOTE(danms): Create a new context manager for the cell, which
+570         # will house the sqlite:// connection for this cell's in-memory
+571         # database. Store/index it by the connection string, which is
+572         # how we identify cells in CellMapping.
+573         ctxt_mgr = main_db_api.create_context_manager()
+574         self._ctxt_mgrs[connection_str] = ctxt_mgr
+575 
+576         # NOTE(melwitt): The first DB access through service start is
+577         # local so this initializes _last_ctxt_mgr for that and needs
+578         # to be a compute cell.
+579         self._last_ctxt_mgr = ctxt_mgr
+580 
+581         # NOTE(danms): Record which context manager should be the default
+582         # so we can restore it when we return from target-cell contexts.
+583         # If none has been provided yet, store the current one in case
+584         # no default is ever specified.
+585         if self._default_ctxt_mgr is None or default:
+586             self._default_ctxt_mgr = ctxt_mgr
+587 
+588         def get_context_manager(context):
+589             return ctxt_mgr
+590 
+591         # NOTE(danms): This is a temporary MonkeyPatch just to get
+592         # a new database created with the schema we need and the
+593         # context manager for it stashed.
+594         with fixtures.MonkeyPatch(
+595             'nova.db.main.api.get_context_manager',
+596             get_context_manager,
+597         ):
+598             engine = ctxt_mgr.writer.get_engine()
+599             engine.dispose()
+600             self._cache_schema(connection_str)
+601             conn = engine.connect()
+602             conn.connection.executescript(DB_SCHEMA[('main', None)])
+603 
+604     def setUp(self):
+605         super(CellDatabases, self).setUp()
+606         self.addCleanup(self.cleanup)
+607         self._real_target_cell = context.target_cell
+608 
+609         # NOTE(danms): These context managers are in place for the
+610         # duration of the test (unlike the temporary ones above) and
+611         # provide the actual "runtime" switching of connections for us.
+612         self.useFixture(fixtures.MonkeyPatch(
+613             'nova.db.main.api.create_context_manager',
+614             self._wrap_create_context_manager))
+615         self.useFixture(fixtures.MonkeyPatch(
+616             'nova.db.main.api.get_context_manager',
+617             self._wrap_get_context_manager))
+618         self.useFixture(fixtures.MonkeyPatch(
+619             'nova.context.target_cell',
+620             self._wrap_target_cell))
+621 
+622         self.useFixture(fixtures.MonkeyPatch(
+623             'nova.rpc.get_server',
+624             self._wrap_get_server))
+625         self.useFixture(fixtures.MonkeyPatch(
+626             'nova.rpc.get_client',
+627             self._wrap_get_client))
+628 
+629     def cleanup(self):
+630         for ctxt_mgr in self._ctxt_mgrs.values():
+631             engine = ctxt_mgr.writer.get_engine()
+632             engine.dispose()
+633 
+634 
+635 class Database(fixtures.Fixture):
+636 
+637     # TODO(stephenfin): The 'version' argument is unused and can be removed
+638     def __init__(self, database='main', version=None, connection=None):
+639         """Create a database fixture.
+640 
+641         :param database: The type of database, 'main', or 'api'
+642         :param connection: The connection string to use
+643         """
+644         super().__init__()
+645 
+646         assert database in {'main', 'api'}, f'Unrecognized database {database}'
+647         if database == 'api':
+648             assert connection is None, 'Not supported for the API database'
+649 
+650         self.database = database
+651         self.version = version
+652         self.connection = connection
+653 
+654     def setUp(self):
+655         super().setUp()
+656 
+657         if self.database == 'main':
+658 
+659             if self.connection is not None:
+660                 ctxt_mgr = main_db_api.create_context_manager(
+661                     connection=self.connection)
+662                 self.get_engine = ctxt_mgr.writer.get_engine
+663             else:
+664                 # NOTE(gibi): this injects a new factory for each test and
+665                 # cleans it up at then end of the test case. This way we can
+666                 # let each test configure the factory so we can avoid having a
+667                 # global flag guarding against factory re-configuration
+668                 new_engine = enginefacade.transaction_context()
+669                 self.useFixture(
+670                     db_fixtures.ReplaceEngineFacadeFixture(
+671                         main_db_api.context_manager, new_engine))
+672                 main_db_api.configure(CONF)
+673 
+674                 self.get_engine = main_db_api.get_engine
+675         elif self.database == 'api':
+676             # NOTE(gibi): similar note applies here as for the main_db_api
+677             # above
+678             new_engine = enginefacade.transaction_context()
+679             self.useFixture(
+680                 db_fixtures.ReplaceEngineFacadeFixture(
+681                     api_db_api.context_manager, new_engine))
+682             api_db_api.configure(CONF)
+683 
+684             self.get_engine = api_db_api.get_engine
+685 
+686         self._apply_schema()
+687 
+688         self.addCleanup(self.cleanup)
+689 
+690     def _apply_schema(self):
+691         global DB_SCHEMA
+692         if not DB_SCHEMA[(self.database, self.version)]:
+693             # apply and cache schema
+694             engine = self.get_engine()
+695             conn = engine.connect()
+696             migration.db_sync(database=self.database, version=self.version)
+697             DB_SCHEMA[(self.database, self.version)] = "".join(
+698                 line for line in conn.connection.iterdump())
+699         else:
+700             # apply the cached schema
+701             engine = self.get_engine()
+702             conn = engine.connect()
+703             conn.connection.executescript(
+704                 DB_SCHEMA[(self.database, self.version)])
+705 
+706     def cleanup(self):
+707         engine = self.get_engine()
+708         engine.dispose()
+709 
+710 
+711 class DefaultFlavorsFixture(fixtures.Fixture):
+712     def setUp(self):
+713         super(DefaultFlavorsFixture, self).setUp()
+714         ctxt = context.get_admin_context()
+715         defaults = {'rxtx_factor': 1.0, 'disabled': False, 'is_public': True,
+716                     'ephemeral_gb': 0, 'swap': 0}
+717         extra_specs = {
+718             "hw:numa_nodes": "1"
+719         }
+720         default_flavors = [
+721             objects.Flavor(context=ctxt, memory_mb=512, vcpus=1,
+722                            root_gb=1, flavorid='1', name='m1.tiny',
+723                            **defaults),
+724             objects.Flavor(context=ctxt, memory_mb=2048, vcpus=1,
+725                            root_gb=20, flavorid='2', name='m1.small',
+726                            **defaults),
+727             objects.Flavor(context=ctxt, memory_mb=4096, vcpus=2,
+728                            root_gb=40, flavorid='3', name='m1.medium',
+729                            **defaults),
+730             objects.Flavor(context=ctxt, memory_mb=8192, vcpus=4,
+731                            root_gb=80, flavorid='4', name='m1.large',
+732                            **defaults),
+733             objects.Flavor(context=ctxt, memory_mb=16384, vcpus=8,
+734                            root_gb=160, flavorid='5', name='m1.xlarge',
+735                            **defaults),
+736             objects.Flavor(context=ctxt, memory_mb=512, vcpus=1,
+737                            root_gb=1, flavorid='6', name='m1.tiny.specs',
+738                            extra_specs=extra_specs, **defaults),
+739             ]
+740         for flavor in default_flavors:
+741             flavor.create()
+742 
+743 
+744 class RPCFixture(fixtures.Fixture):
+745     def __init__(self, *exmods):
+746         super(RPCFixture, self).__init__()
+747         self.exmods = []
+748         self.exmods.extend(exmods)
+749         self._buses = {}
+750 
+751     def _fake_create_transport(self, url):
+752         # FIXME(danms): Right now, collapse all connections
+753         # to a single bus. This is how our tests expect things
+754         # to work. When the tests are fixed, this fixture can
+755         # support simulating multiple independent buses, and this
+756         # hack should be removed.
+757         url = None
+758 
+759         # NOTE(danms): This will be called with a non-None url by
+760         # cells-aware code that is requesting to contact something on
+761         # one of the many transports we're multplexing here.
+762         if url not in self._buses:
+763             exmods = rpc.get_allowed_exmods()
+764             self._buses[url] = messaging.get_rpc_transport(
+765                 CONF,
+766                 url=url,
+767                 allowed_remote_exmods=exmods)
+768         return self._buses[url]
+769 
+770     def setUp(self):
+771         super(RPCFixture, self).setUp()
+772         self.addCleanup(rpc.cleanup)
+773         rpc.add_extra_exmods(*self.exmods)
+774         self.addCleanup(rpc.clear_extra_exmods)
+775         self.messaging_conf = messaging_conffixture.ConfFixture(CONF)
+776         self.messaging_conf.transport_url = 'fake:/'
+777         self.useFixture(self.messaging_conf)
+778         self.useFixture(fixtures.MonkeyPatch(
+779             'nova.rpc.create_transport', self._fake_create_transport))
+780         # NOTE(danms): Execute the init with get_transport_url() as None,
+781         # instead of the parsed TransportURL(None) so that we can cache
+782         # it as it will be called later if the default is requested by
+783         # one of our mq-switching methods.
+784         with mock.patch('nova.rpc.get_transport_url') as mock_gtu:
+785             mock_gtu.return_value = None
+786             rpc.init(CONF)
+787 
+788         def cleanup_in_flight_rpc_messages():
+789             messaging._drivers.impl_fake.FakeExchangeManager._exchanges = {}
+790 
+791         self.addCleanup(cleanup_in_flight_rpc_messages)
+792 
+793 
+794 class WarningsFixture(fixtures.Fixture):
+795     """Filters out warnings during test runs."""
+796 
+797     def setUp(self):
+798         super(WarningsFixture, self).setUp()
+799 
+800         self._original_warning_filters = warnings.filters[:]
+801 
+802         # NOTE(sdague): Make deprecation warnings only happen once. Otherwise
+803         # this gets kind of crazy given the way that upstream python libs use
+804         # this.
+805         warnings.simplefilter("once", DeprecationWarning)
+806 
+807         # NOTE(sdague): this remains an unresolved item around the way
+808         # forward on is_admin, the deprecation is definitely really premature.
+809         warnings.filterwarnings(
+810             'ignore',
+811             message='Policy enforcement is depending on the value of is_admin.'
+812                     ' This key is deprecated. Please update your policy '
+813                     'file to use the standard policy values.')
+814 
+815         # NOTE(mriedem): Ignore scope check UserWarnings from oslo.policy.
+816         warnings.filterwarnings(
+817             'ignore',
+818             message="Policy .* failed scope check",
+819             category=UserWarning)
+820 
+821         # NOTE(gibi): The UUIDFields emits a warning if the value is not a
+822         # valid UUID. Let's escalate that to an exception in the test to
+823         # prevent adding violations.
+824         warnings.filterwarnings('error', message=".*invalid UUID.*")
+825 
+826         # NOTE(mriedem): Avoid adding anything which tries to convert an
+827         # object to a primitive which jsonutils.to_primitive() does not know
+828         # how to handle (or isn't given a fallback callback).
+829         warnings.filterwarnings(
+830             'error',
+831             message="Cannot convert <oslo_db.sqlalchemy.enginefacade"
+832                     "._Default object at ",
+833             category=UserWarning)
+834 
+835         warnings.filterwarnings(
+836             'error', message='Evaluating non-mapped column expression',
+837             category=sqla_exc.SAWarning)
+838 
+839         # Enable deprecation warnings for nova itself to capture upcoming
+840         # SQLAlchemy changes
+841 
+842         warnings.filterwarnings(
+843             'ignore',
+844             category=sqla_exc.SADeprecationWarning)
+845 
+846         warnings.filterwarnings(
+847             'error',
+848             module='nova',
+849             category=sqla_exc.SADeprecationWarning)
+850 
+851         # ...but filter everything out until we get around to fixing them
+852         # TODO(stephenfin): Fix all of these
+853 
+854         warnings.filterwarnings(
+855             'ignore',
+856             module='nova',
+857             message=r'The current statement is being autocommitted .*',
+858             category=sqla_exc.SADeprecationWarning)
+859 
+860         warnings.filterwarnings(
+861             'ignore',
+862             module='nova',
+863             message=r'The Column.copy\(\) method is deprecated .*',
+864             category=sqla_exc.SADeprecationWarning)
+865 
+866         warnings.filterwarnings(
+867             'ignore',
+868             module='nova',
+869             message=r'The Connection.connect\(\) method is considered .*',
+870             category=sqla_exc.SADeprecationWarning)
+871 
+872         warnings.filterwarnings(
+873             'ignore',
+874             module='nova',
+875             message=r'Using strings to indicate column or relationship .*',
+876             category=sqla_exc.SADeprecationWarning)
+877 
+878         warnings.filterwarnings(
+879             'ignore',
+880             module='nova',
+881             message=r'Using strings to indicate relationship names .*',
+882             category=sqla_exc.SADeprecationWarning)
+883 
+884         warnings.filterwarnings(
+885             'ignore',
+886             module='nova',
+887             message=r'Invoking and_\(\) without arguments is deprecated, .*',
+888             category=sqla_exc.SADeprecationWarning)
+889 
+890         # TODO(stephenfin): Remove once we fix this in placement 5.0.2 or 6.0.0
+891         warnings.filterwarnings(
+892             'ignore',
+893             message='Implicit coercion of SELECT and textual SELECT .*',
+894             category=sqla_exc.SADeprecationWarning)
+895 
+896         self.addCleanup(self._reset_warning_filters)
+897 
+898     def _reset_warning_filters(self):
+899         warnings.filters[:] = self._original_warning_filters
+900 
+901 
+902 class ConfPatcher(fixtures.Fixture):
+903     """Fixture to patch and restore global CONF.
+904 
+905     This also resets overrides for everything that is patched during
+906     it's teardown.
+907 
+908     """
+909 
+910     def __init__(self, **kwargs):
+911         """Constructor
+912 
+913         :params group: if specified all config options apply to that group.
+914 
+915         :params **kwargs: the rest of the kwargs are processed as a
+916         set of key/value pairs to be set as configuration override.
+917 
+918         """
+919         super(ConfPatcher, self).__init__()
+920         self.group = kwargs.pop('group', None)
+921         self.args = kwargs
+922 
+923     def setUp(self):
+924         super(ConfPatcher, self).setUp()
+925         for k, v in self.args.items():
+926             self.addCleanup(CONF.clear_override, k, self.group)
+927             CONF.set_override(k, v, self.group)
+928 
+929 
+930 class OSAPIFixture(fixtures.Fixture):
+931     """Create an OS API server as a fixture.
+932 
+933     This spawns an OS API server as a fixture in a new greenthread in
+934     the current test. The fixture has a .api parameter with is a
+935     simple rest client that can communicate with it.
+936 
+937     This fixture is extremely useful for testing REST responses
+938     through the WSGI stack easily in functional tests.
+939 
+940     Usage:
+941 
+942         api = self.useFixture(fixtures.OSAPIFixture()).api
+943         resp = api.api_request('/someurl')
+944         self.assertEqual(200, resp.status_code)
+945         resp = api.api_request('/otherurl', method='POST', body='{foo}')
+946 
+947     The resp is a requests library response. Common attributes that
+948     you'll want to use are:
+949 
+950     - resp.status_code - integer HTTP status code returned by the request
+951     - resp.content - the body of the response
+952     - resp.headers - dictionary of HTTP headers returned
+953 
+954     This fixture also has the following clients with various differences:
+955 
+956         self.admin_api - Project user with is_admin=True and the "admin" role
+957         self.reader_api - Project user with only the "reader" role
+958         self.other_api - Project user with only the "other" role
+959     """
+960 
+961     def __init__(
+962         self, api_version='v2', project_id=PROJECT_ID,
+963         use_project_id_in_urls=False, stub_keystone=True,
+964     ):
+965         """Constructor
+966 
+967         :param api_version: the API version that we're interested in
+968         using. Currently this expects 'v2' or 'v2.1' as possible
+969         options.
+970         :param project_id: the project id to use on the API.
+971         :param use_project_id_in_urls: If True, act like the "endpoint" in the
+972             "service catalog" has the legacy format including the project_id.
+973         :param stub_keystone: If True, stub keystonemiddleware and
+974             NovaKeystoneContext to simulate (but not perform) real auth.
+975         """
+976         super(OSAPIFixture, self).__init__()
+977         self.api_version = api_version
+978         self.project_id = project_id
+979         self.use_project_id_in_urls = use_project_id_in_urls
+980         self.stub_keystone = stub_keystone
+981 
+982     def setUp(self):
+983         super(OSAPIFixture, self).setUp()
+984         # A unique hostname for the wsgi-intercept.
+985         hostname = uuidsentinel.osapi_host
+986         port = 80
+987         service_name = 'osapi_compute'
+988         endpoint = 'http://%s:%s/' % (hostname, port)
+989         conf_overrides = {
+990             'osapi_compute_listen': hostname,
+991             'osapi_compute_listen_port': port,
+992             'debug': True,
+993         }
+994         self.useFixture(ConfPatcher(**conf_overrides))
+995 
+996         if self.stub_keystone:
+997             self._stub_keystone()
+998 
+999         # Turn off manipulation of socket_options in TCPKeepAliveAdapter
+1000         # to keep wsgi-intercept happy. Replace it with the method
+1001         # from its superclass.
+1002         self.useFixture(fixtures.MonkeyPatch(
+1003                 'keystoneauth1.session.TCPKeepAliveAdapter.init_poolmanager',
+1004                 adapters.HTTPAdapter.init_poolmanager))
+1005 
+1006         loader = wsgi.Loader().load_app(service_name)
+1007         app = lambda: loader
+1008 
+1009         # re-use service setup code from wsgi_app to register
+1010         # service, which is looked for in some tests
+1011         wsgi_app._setup_service(CONF.host, service_name)
+1012         intercept = interceptor.RequestsInterceptor(app, url=endpoint)
+1013         intercept.install_intercept()
+1014         self.addCleanup(intercept.uninstall_intercept)
+1015 
+1016         base_url = 'http://%(host)s:%(port)s/%(api_version)s' % ({
+1017             'host': hostname, 'port': port, 'api_version': self.api_version})
+1018         if self.use_project_id_in_urls:
+1019             base_url += '/' + self.project_id
+1020 
+1021         self.api = client.TestOpenStackClient(
+1022             'fake', base_url, project_id=self.project_id,
+1023             roles=['reader', 'member'])
+1024         self.admin_api = client.TestOpenStackClient(
+1025             'admin', base_url, project_id=self.project_id,
+1026             roles=['reader', 'member', 'admin'])
+1027         self.reader_api = client.TestOpenStackClient(
+1028             'reader', base_url, project_id=self.project_id,
+1029             roles=['reader'])
+1030         self.other_api = client.TestOpenStackClient(
+1031             'other', base_url, project_id=self.project_id,
+1032             roles=['other'])
+1033         # Provide a way to access the wsgi application to tests using
+1034         # the fixture.
+1035         self.app = app
+1036 
+1037     def _stub_keystone(self):
+1038         # Stub out authentication middleware
+1039         # TODO(efried): Use keystonemiddleware.fixtures.AuthTokenFixture
+1040         self.useFixture(fixtures.MockPatch(
+1041             'keystonemiddleware.auth_token.filter_factory',
+1042             return_value=lambda _app: _app))
+1043 
+1044         # Stub out context middleware
+1045         def fake_ctx(env, **kwargs):
+1046             user_id = env['HTTP_X_AUTH_USER']
+1047             project_id = env['HTTP_X_AUTH_PROJECT_ID']
+1048             is_admin = user_id == 'admin'
+1049             roles = env['HTTP_X_ROLES'].split(',')
+1050             return context.RequestContext(
+1051                 user_id, project_id, is_admin=is_admin, roles=roles, **kwargs)
+1052 
+1053         self.useFixture(fixtures.MonkeyPatch(
+1054             'nova.api.auth.NovaKeystoneContext._create_context', fake_ctx))
+1055 
+1056 
+1057 class OSMetadataServer(fixtures.Fixture):
+1058     """Create an OS Metadata API server as a fixture.
+1059 
+1060     This spawns an OS Metadata API server as a fixture in a new
+1061     greenthread in the current test.
+1062 
+1063     TODO(sdague): ideally for testing we'd have something like the
+1064     test client which acts like requests, but connects any of the
+1065     interactions needed.
+1066 
+1067     """
+1068 
+1069     def setUp(self):
+1070         super(OSMetadataServer, self).setUp()
+1071         # in order to run these in tests we need to bind only to local
+1072         # host, and dynamically allocate ports
+1073         conf_overrides = {
+1074             'metadata_listen': '127.0.0.1',
+1075             'metadata_listen_port': 0,
+1076             'debug': True
+1077         }
+1078         self.useFixture(ConfPatcher(**conf_overrides))
+1079 
+1080         self.metadata = service.WSGIService("metadata")
+1081         self.metadata.start()
+1082         self.addCleanup(self.metadata.stop)
+1083         self.md_url = "http://%s:%s/" % (
+1084             conf_overrides['metadata_listen'],
+1085             self.metadata.port)
+1086 
+1087 
+1088 class PoisonFunctions(fixtures.Fixture):
+1089     """Poison functions so they explode if we touch them.
+1090 
+1091     When running under a non full stack test harness there are parts
+1092     of the code that you don't want to go anywhere near. These include
+1093     things like code that spins up extra threads, which just
+1094     introduces races.
+1095 
+1096     """
+1097 
+1098     def setUp(self):
+1099         super(PoisonFunctions, self).setUp()
+1100 
+1101         try:
+1102             self._poison_libvirt_driver()
+1103         except ImportError:
+1104             # The libvirt driver uses modules that are not available
+1105             # on Windows.
+1106             if os.name != 'nt':
+1107                 raise
+1108 
+1109     def _poison_libvirt_driver(self):
+1110         # The nova libvirt driver starts an event thread which only
+1111         # causes trouble in tests. Make sure that if tests don't
+1112         # properly patch it the test explodes.
+1113 
+1114         def evloop(*args, **kwargs):
+1115             import sys
+1116             warnings.warn("Forgot to disable libvirt event thread")
+1117             sys.exit(1)
+1118 
+1119         # Don't poison the function if it's already mocked
+1120         import nova.virt.libvirt.host
+1121         if not isinstance(nova.virt.libvirt.host.Host._init_events, mock.Mock):
+1122             self.useFixture(fixtures.MockPatch(
+1123                 'nova.virt.libvirt.host.Host._init_events',
+1124                 side_effect=evloop))
+1125 
+1126 
+1127 class IndirectionAPIFixture(fixtures.Fixture):
+1128     """Patch and restore the global NovaObject indirection api."""
+1129 
+1130     def __init__(self, indirection_api):
+1131         """Constructor
+1132 
+1133         :param indirection_api: the indirection API to be used for tests.
+1134 
+1135         """
+1136         super(IndirectionAPIFixture, self).__init__()
+1137         self.indirection_api = indirection_api
+1138 
+1139     def cleanup(self):
+1140         obj_base.NovaObject.indirection_api = self.orig_indirection_api
+1141 
+1142     def setUp(self):
+1143         super(IndirectionAPIFixture, self).setUp()
+1144         self.orig_indirection_api = obj_base.NovaObject.indirection_api
+1145         obj_base.NovaObject.indirection_api = self.indirection_api
+1146         self.addCleanup(self.cleanup)
+1147 
+1148 
+1149 class _FakeGreenThread(object):
+1150     def __init__(self, func, *args, **kwargs):
+1151         self._result = func(*args, **kwargs)
+1152 
+1153     def cancel(self, *args, **kwargs):
+1154         # This method doesn't make sense for a synchronous call, it's just
+1155         # defined to satisfy the interface.
+1156         pass
+1157 
+1158     def kill(self, *args, **kwargs):
+1159         # This method doesn't make sense for a synchronous call, it's just
+1160         # defined to satisfy the interface.
+1161         pass
+1162 
+1163     def link(self, func, *args, **kwargs):
+1164         func(self, *args, **kwargs)
+1165 
+1166     def unlink(self, func, *args, **kwargs):
+1167         # This method doesn't make sense for a synchronous call, it's just
+1168         # defined to satisfy the interface.
+1169         pass
+1170 
+1171     def wait(self):
+1172         return self._result
+1173 
+1174 
+1175 class SpawnIsSynchronousFixture(fixtures.Fixture):
+1176     """Patch and restore the spawn_n utility method to be synchronous"""
+1177 
+1178     def setUp(self):
+1179         super(SpawnIsSynchronousFixture, self).setUp()
+1180         self.useFixture(fixtures.MonkeyPatch(
+1181             'nova.utils.spawn_n', _FakeGreenThread))
+1182         self.useFixture(fixtures.MonkeyPatch(
+1183             'nova.utils.spawn', _FakeGreenThread))
+1184 
+1185 
+1186 class _FakeExecutor(futurist.SynchronousExecutor):
+1187     def __init__(self, *args, **kwargs):
+1188         # Ignore kwargs (example: max_workers) that SynchronousExecutor
+1189         # does not support.
+1190         super(_FakeExecutor, self).__init__()
+1191 
+1192 
+1193 class SynchronousThreadPoolExecutorFixture(fixtures.Fixture):
+1194     """Make GreenThreadPoolExecutor synchronous.
+1195 
+1196     Replace the GreenThreadPoolExecutor with the SynchronousExecutor.
+1197     """
+1198 
+1199     def setUp(self):
+1200         super(SynchronousThreadPoolExecutorFixture, self).setUp()
+1201         self.useFixture(fixtures.MonkeyPatch(
+1202             'futurist.GreenThreadPoolExecutor', _FakeExecutor))
+1203 
+1204 
+1205 class BannedDBSchemaOperations(fixtures.Fixture):
+1206     """Ban some operations for migrations"""
+1207 
+1208     def __init__(self, banned_resources=None):
+1209         super(BannedDBSchemaOperations, self).__init__()
+1210         self._banned_resources = banned_resources or []
+1211 
+1212     @staticmethod
+1213     def _explode(resource, op):
+1214         raise exception.DBNotAllowed(
+1215             'Operation %s.%s() is not allowed in a database migration' % (
+1216                 resource, op))
+1217 
+1218     def setUp(self):
+1219         super(BannedDBSchemaOperations, self).setUp()
+1220         for thing in self._banned_resources:
+1221             self.useFixture(fixtures.MonkeyPatch(
+1222                 'sqlalchemy.%s.drop' % thing,
+1223                 lambda *a, **k: self._explode(thing, 'drop')))
+1224             self.useFixture(fixtures.MonkeyPatch(
+1225                 'sqlalchemy.%s.alter' % thing,
+1226                 lambda *a, **k: self._explode(thing, 'alter')))
+1227 
+1228 
+1229 class ForbidNewLegacyNotificationFixture(fixtures.Fixture):
+1230     """Make sure the test fails if new legacy notification is added"""
+1231 
+1232     def __init__(self):
+1233         super(ForbidNewLegacyNotificationFixture, self).__init__()
+1234         self.notifier = rpc.LegacyValidatingNotifier
+1235 
+1236     def setUp(self):
+1237         super(ForbidNewLegacyNotificationFixture, self).setUp()
+1238         self.notifier.fatal = True
+1239 
+1240         # allow the special test value used in
+1241         # nova.tests.unit.test_notifications.NotificationsTestCase
+1242         self.notifier.allowed_legacy_notification_event_types.append(
+1243                 '_decorated_function')
+1244 
+1245         self.addCleanup(self.cleanup)
+1246 
+1247     def cleanup(self):
+1248         self.notifier.fatal = False
+1249         self.notifier.allowed_legacy_notification_event_types.remove(
+1250                 '_decorated_function')
+1251 
+1252 
+1253 class AllServicesCurrent(fixtures.Fixture):
+1254     def setUp(self):
+1255         super(AllServicesCurrent, self).setUp()
+1256         self.useFixture(fixtures.MonkeyPatch(
+1257             'nova.objects.Service.get_minimum_version_multi',
+1258             self._fake_minimum))
+1259         self.useFixture(fixtures.MonkeyPatch(
+1260             'nova.objects.service.get_minimum_version_all_cells',
+1261             lambda *a, **k: service_obj.SERVICE_VERSION))
+1262         compute_rpcapi.LAST_VERSION = None
+1263 
+1264     def _fake_minimum(self, *args, **kwargs):
+1265         return service_obj.SERVICE_VERSION
+1266 
+1267 
+1268 class _NoopConductor(object):
+1269     def __getattr__(self, key):
+1270         def _noop_rpc(*args, **kwargs):
+1271             return None
+1272         return _noop_rpc
+1273 
+1274 
+1275 class NoopConductorFixture(fixtures.Fixture):
+1276     """Stub out the conductor API to do nothing"""
+1277 
+1278     def setUp(self):
+1279         super(NoopConductorFixture, self).setUp()
+1280         self.useFixture(fixtures.MonkeyPatch(
+1281             'nova.conductor.ComputeTaskAPI', _NoopConductor))
+1282         self.useFixture(fixtures.MonkeyPatch(
+1283             'nova.conductor.API', _NoopConductor))
+1284 
+1285 
+1286 class EventReporterStub(fixtures.Fixture):
+1287 
+1288     def setUp(self):
+1289         super(EventReporterStub, self).setUp()
+1290         self.useFixture(fixtures.MonkeyPatch(
+1291             'nova.compute.utils.EventReporter',
+1292             lambda *args, **kwargs: mock.MagicMock()))
+1293 
+1294 
+1295 class UnHelperfulClientChannel(privsep_daemon._ClientChannel):
+1296     def __init__(self, context):
+1297         raise Exception('You have attempted to start a privsep helper. '
+1298                         'This is not allowed in the gate, and '
+1299                         'indicates a failure to have mocked your tests.')
+1300 
+1301 
+1302 class PrivsepNoHelperFixture(fixtures.Fixture):
+1303     """A fixture to catch failures to mock privsep's rootwrap helper.
+1304 
+1305     If you fail to mock away a privsep'd method in a unit test, then
+1306     you may well end up accidentally running the privsep rootwrap
+1307     helper. This will fail in the gate, but it fails in a way which
+1308     doesn't identify which test is missing a mock. Instead, we
+1309     raise an exception so that you at least know where you've missed
+1310     something.
+1311     """
+1312 
+1313     def setUp(self):
+1314         super(PrivsepNoHelperFixture, self).setUp()
+1315 
+1316         self.useFixture(fixtures.MonkeyPatch(
+1317             'oslo_privsep.daemon.RootwrapClientChannel',
+1318             UnHelperfulClientChannel))
+1319 
+1320 
+1321 class PrivsepFixture(fixtures.Fixture):
+1322     """Disable real privsep checking so we can test the guts of methods
+1323     decorated with sys_admin_pctxt.
+1324     """
+1325 
+1326     def setUp(self):
+1327         super(PrivsepFixture, self).setUp()
+1328         self.useFixture(fixtures.MockPatchObject(
+1329             nova.privsep.sys_admin_pctxt, 'client_mode', False))
+1330 
+1331 
+1332 class NoopQuotaDriverFixture(fixtures.Fixture):
+1333     """A fixture to run tests using the NoopQuotaDriver.
+1334 
+1335     We can't simply set self.flags to the NoopQuotaDriver in tests to use the
+1336     NoopQuotaDriver because the QuotaEngine object is global. Concurrently
+1337     running tests will fail intermittently because they might get the
+1338     NoopQuotaDriver globally when they expected the default DbQuotaDriver
+1339     behavior. So instead, we can patch the _driver property of the QuotaEngine
+1340     class on a per-test basis.
+1341     """
+1342 
+1343     def setUp(self):
+1344         super(NoopQuotaDriverFixture, self).setUp()
+1345         self.useFixture(fixtures.MonkeyPatch('nova.quota.QuotaEngine._driver',
+1346                         nova_quota.NoopQuotaDriver()))
+1347         # Set the config option just so that code checking for the presence of
+1348         # the NoopQuotaDriver setting will see it as expected.
+1349         # For some reason, this does *not* work when TestCase.flags is used.
+1350         # When using self.flags, the concurrent test failures returned.
+1351         CONF.set_override('driver', 'nova.quota.NoopQuotaDriver', 'quota')
+1352         self.addCleanup(CONF.clear_override, 'driver', 'quota')
+1353 
+1354 
+1355 class DownCellFixture(fixtures.Fixture):
+1356     """A fixture to simulate when a cell is down either due to error or timeout
+1357 
+1358     This fixture will stub out the scatter_gather_cells routine and target_cell
+1359     used in various cells-related API operations like listing/showing server
+1360     details to return a ``oslo_db.exception.DBError`` per cell in the results.
+1361     Therefore it is best used with a test scenario like this:
+1362 
+1363     1. Create a server successfully.
+1364     2. Using the fixture, list/show servers. Depending on the microversion
+1365        used, the API should either return minimal results or by default skip
+1366        the results from down cells.
+1367 
+1368     Example usage::
+1369 
+1370         with nova_fixtures.DownCellFixture():
+1371             # List servers with down cells.
+1372             self.api.get_servers()
+1373             # Show a server in a down cell.
+1374             self.api.get_server(server['id'])
+1375             # List services with down cells.
+1376             self.admin_api.api_get('/os-services')
+1377     """
+1378 
+1379     def __init__(self, down_cell_mappings=None):
+1380         self.down_cell_mappings = down_cell_mappings
+1381 
+1382     def setUp(self):
+1383         super(DownCellFixture, self).setUp()
+1384 
+1385         def stub_scatter_gather_cells(ctxt, cell_mappings, timeout, fn, *args,
+1386                                       **kwargs):
+1387             # Return a dict with an entry per cell mapping where the results
+1388             # are some kind of exception.
+1389             up_cell_mappings = objects.CellMappingList()
+1390             if not self.down_cell_mappings:
+1391                 # User has not passed any down cells explicitly, so all cells
+1392                 # are considered as down cells.
+1393                 self.down_cell_mappings = cell_mappings
+1394             else:
+1395                 # User has passed down cell mappings, so the rest of the cells
+1396                 # should be up meaning we should return the right results.
+1397                 # We assume that down cells will be a subset of the
+1398                 # cell_mappings.
+1399                 down_cell_uuids = [cell.uuid
+1400                     for cell in self.down_cell_mappings]
+1401                 up_cell_mappings.objects = [cell
+1402                     for cell in cell_mappings
+1403                         if cell.uuid not in down_cell_uuids]
+1404 
+1405             def wrap(cell_uuid, thing):
+1406                 # We should embed the cell_uuid into the context before
+1407                 # wrapping since its used to calcualte the cells_timed_out and
+1408                 # cells_failed properties in the object.
+1409                 ctxt.cell_uuid = cell_uuid
+1410                 return multi_cell_list.RecordWrapper(ctxt, sort_ctx, thing)
+1411 
+1412             if fn is multi_cell_list.query_wrapper:
+1413                 # If the function called through scatter-gather utility is the
+1414                 # multi_cell_list.query_wrapper, we should wrap the exception
+1415                 # object into the multi_cell_list.RecordWrapper. This is
+1416                 # because unlike the other functions where the exception object
+1417                 # is returned directly, the query_wrapper wraps this into the
+1418                 # RecordWrapper object format. So if we do not wrap it will
+1419                 # blow up at the point of generating results from heapq further
+1420                 # down the stack.
+1421                 sort_ctx = multi_cell_list.RecordSortContext([], [])
+1422                 ret1 = {
+1423                     cell_mapping.uuid: [wrap(cell_mapping.uuid,
+1424                         db_exc.DBError())]
+1425                     for cell_mapping in self.down_cell_mappings
+1426                 }
+1427             else:
+1428                 ret1 = {
+1429                     cell_mapping.uuid: db_exc.DBError()
+1430                     for cell_mapping in self.down_cell_mappings
+1431                 }
+1432             ret2 = {}
+1433             for cell in up_cell_mappings:
+1434                 ctxt.cell_uuid = cell.uuid
+1435                 cctxt = context.RequestContext.from_dict(ctxt.to_dict())
+1436                 context.set_target_cell(cctxt, cell)
+1437                 result = fn(cctxt, *args, **kwargs)
+1438                 ret2[cell.uuid] = result
+1439             return dict(list(ret1.items()) + list(ret2.items()))
+1440 
+1441         @contextmanager
+1442         def stub_target_cell(ctxt, cell_mapping):
+1443             # This is to give the freedom to simulate down cells for each
+1444             # individual cell targeted function calls.
+1445             if not self.down_cell_mappings:
+1446                 # User has not passed any down cells explicitly, so all cells
+1447                 # are considered as down cells.
+1448                 self.down_cell_mappings = [cell_mapping]
+1449                 raise db_exc.DBError()
+1450             else:
+1451                 # if down_cell_mappings are passed, then check if this cell
+1452                 # is down or up.
+1453                 down_cell_uuids = [cell.uuid
+1454                     for cell in self.down_cell_mappings]
+1455                 if cell_mapping.uuid in down_cell_uuids:
+1456                     # its a down cell raise the exception straight away
+1457                     raise db_exc.DBError()
+1458                 else:
+1459                     # its an up cell, so yield its context
+1460                     cctxt = context.RequestContext.from_dict(ctxt.to_dict())
+1461                     context.set_target_cell(cctxt, cell_mapping)
+1462                     yield cctxt
+1463 
+1464         self.useFixture(fixtures.MonkeyPatch(
+1465             'nova.context.scatter_gather_cells', stub_scatter_gather_cells))
+1466         self.useFixture(fixtures.MonkeyPatch(
+1467             'nova.context.target_cell', stub_target_cell))
+1468 
+1469 
+1470 class AvailabilityZoneFixture(fixtures.Fixture):
+1471     """Fixture to stub out the nova.availability_zones module
+1472 
+1473     The list of ``zones`` provided to the fixture are what get returned from
+1474     ``get_availability_zones``.
+1475 
+1476     ``get_instance_availability_zone`` will return the availability_zone
+1477     requested when creating a server otherwise the instance.availabilty_zone
+1478     or default_availability_zone is returned.
+1479     """
+1480 
+1481     def __init__(self, zones):
+1482         self.zones = zones
+1483 
+1484     def setUp(self):
+1485         super(AvailabilityZoneFixture, self).setUp()
+1486 
+1487         def fake_get_availability_zones(
+1488                 ctxt, hostapi, get_only_available=False,
+1489                 with_hosts=False, services=None):
+1490             # A 2-item tuple is returned if get_only_available=False.
+1491             if not get_only_available:
+1492                 return self.zones, []
+1493             return self.zones
+1494         self.useFixture(fixtures.MonkeyPatch(
+1495             'nova.availability_zones.get_availability_zones',
+1496             fake_get_availability_zones))
+1497 
+1498         def fake_get_instance_availability_zone(ctxt, instance):
+1499             # If the server was created with a specific AZ, return it.
+1500             reqspec = objects.RequestSpec.get_by_instance_uuid(
+1501                 ctxt, instance.uuid)
+1502             requested_az = reqspec.availability_zone
+1503             if requested_az:
+1504                 return requested_az
+1505             # Otherwise return the instance.availability_zone if set else
+1506             # the default AZ.
+1507             return instance.availability_zone or CONF.default_availability_zone
+1508         self.useFixture(fixtures.MonkeyPatch(
+1509             'nova.availability_zones.get_instance_availability_zone',
+1510             fake_get_instance_availability_zone))
+1511 
+1512 
+1513 class KSAFixture(fixtures.Fixture):
+1514     """Lets us initialize an openstack.connection.Connection by stubbing the
+1515     auth plugin.
+1516     """
+1517 
+1518     def setUp(self):
+1519         super(KSAFixture, self).setUp()
+1520         self.mock_load_auth = self.useFixture(fixtures.MockPatch(
+1521             'keystoneauth1.loading.load_auth_from_conf_options')).mock
+1522         self.mock_load_sess = self.useFixture(fixtures.MockPatch(
+1523             'keystoneauth1.loading.load_session_from_conf_options')).mock
+1524         # For convenience, an attribute for the "Session" itself
+1525         self.mock_session = self.mock_load_sess.return_value
+1526 
+1527 
+1528 class OpenStackSDKFixture(fixtures.Fixture):
+1529     # This satisfies tests that happen to run through get_sdk_adapter but don't
+1530     # care about the adapter itself (default mocks are fine).
+1531     # TODO(efried): Get rid of this and use fixtures from openstacksdk once
+1532     # https://storyboard.openstack.org/#!/story/2005475 is resolved.
+1533     def setUp(self):
+1534         super(OpenStackSDKFixture, self).setUp()
+1535         self.useFixture(fixtures.MockPatch(
+1536             'openstack.proxy.Proxy.get_endpoint'))
+1537         real_make_proxy = service_description.ServiceDescription._make_proxy
+1538         _stub_service_types = {'placement'}
+1539 
+1540         def fake_make_proxy(self, instance):
+1541             if self.service_type in _stub_service_types:
+1542                 return instance.config.get_session_client(
+1543                     self.service_type,
+1544                     allow_version_hack=True,
+1545                 )
+1546             return real_make_proxy(self, instance)
+1547         self.useFixture(fixtures.MockPatchObject(
+1548             service_description.ServiceDescription, '_make_proxy',
+1549             fake_make_proxy))
+1550 
+1551 
+1552 class HostNameWeigher(weights.BaseHostWeigher):
+1553     """Weigher to make the scheduler host selection deterministic.
+1554 
+1555     Note that this weigher is supposed to be used via
+1556     HostNameWeigherFixture and will fail to instantiate if used without that
+1557     fixture.
+1558     """
+1559 
+1560     def __init__(self):
+1561         self.weights = self.get_weights()
+1562 
+1563     def get_weights(self):
+1564         raise NotImplementedError()
+1565 
+1566     def _weigh_object(self, host_state, weight_properties):
+1567         # Any unspecified host gets no weight.
+1568         return self.weights.get(host_state.host, 0)
+1569 
+1570 
+1571 class HostNameWeigherFixture(fixtures.Fixture):
+1572     """Fixture to make the scheduler host selection deterministic.
+1573 
+1574     Note that this fixture needs to be used before the scheduler service is
+1575     started as it changes the scheduler configuration.
+1576     """
+1577 
+1578     def __init__(self, weights=None):
+1579         """Create the fixture
+1580         :param weights: A dict of weights keyed by host names. Defaulted to
+1581             {'host1': 100, 'host2': 50, 'host3': 10}"
+1582         """
+1583         if weights:
+1584             self.weights = weights
+1585         else:
+1586             # default weights good for most of the functional tests
+1587             self.weights = {'host1': 100, 'host2': 50, 'host3': 10}
+1588 
+1589     def setUp(self):
+1590         super(HostNameWeigherFixture, self).setUp()
+1591         # Make sure that when the scheduler instantiate the HostNameWeigher it
+1592         # is initialized with the weights that is configured in this fixture
+1593         self.useFixture(fixtures.MockPatchObject(
+1594             HostNameWeigher, 'get_weights', return_value=self.weights))
+1595         # Make sure that the scheduler loads the HostNameWeigher and only that
+1596         self.useFixture(ConfPatcher(
+1597             weight_classes=[__name__ + '.HostNameWeigher'],
+1598             group='filter_scheduler'))
+1599 
+1600 
+1601 class GenericPoisonFixture(fixtures.Fixture):
+1602     POISON_THESE = (
+1603         (
+1604             'netifaces.interfaces',
+1605             'tests should not be inspecting real interfaces on the test node',
+1606         ),
+1607         (
+1608             'os.uname',
+1609             'tests should not be inspecting host information on the test node',
+1610         ),
+1611     )
+1612 
+1613     def setUp(self):
+1614         def poison_configure(method, reason):
+1615             def fail(*a, **k):
+1616                 raise Exception('This test invokes %s, which is bad (%s); you '
+1617                                 'should mock it.' % (method, reason))
+1618             return fail
+1619 
+1620         super(GenericPoisonFixture, self).setUp()
+1621         for meth, why in self.POISON_THESE:
+1622             # attempt to mock only if not already mocked
+1623             location, attribute = meth.rsplit('.', 1)
+1624             components = location.split('.')
+1625             try:
+1626                 current = __import__(components[0], {}, {})
+1627                 for component in components[1:]:
+1628                     current = getattr(current, component)
+1629                 if not isinstance(getattr(current, attribute), mock.Mock):
+1630                     self.useFixture(fixtures.MonkeyPatch(
+1631                         meth, poison_configure(meth, why)))
+1632             except ImportError:
+1633                 self.useFixture(fixtures.MonkeyPatch(
+1634                     meth, poison_configure(meth, why)))
+1635 
+1636 
+1637 class PropagateTestCaseIdToChildEventlets(fixtures.Fixture):
+1638     """A fixture that adds the currently running test case id to each spawned
+1639     eventlet. This information then later used by the NotificationFixture to
+1640     detect if a notification was emitted by an eventlet that was spawned by a
+1641     previous test case so such late notification can be ignored. For more
+1642     background about what issues this can prevent see
+1643     https://bugs.launchpad.net/nova/+bug/1946339
+1644 
+1645     """
+1646 
+1647     def __init__(self, test_case_id):
+1648         self.test_case_id = test_case_id
+1649 
+1650     def setUp(self):
+1651         super().setUp()
+1652 
+1653         # set the id on the main eventlet
+1654         c = eventlet.getcurrent()
+1655         c.test_case_id = self.test_case_id
+1656 
+1657         orig_spawn = utils.spawn
+1658 
+1659         def wrapped_spawn(func, *args, **kwargs):
+1660             # This is still runs before the eventlet.spawn so read the id for
+1661             # propagation
+1662             caller = eventlet.getcurrent()
+1663             # If there is no id set on us that means we were spawned with other
+1664             # than nova.utils.spawn or spawn_n so the id propagation chain got
+1665             # broken. We fall back to self.test_case_id from the fixture which
+1666             # is good enough
+1667             caller_test_case_id = getattr(
+1668                 caller, 'test_case_id', None) or self.test_case_id
+1669 
+1670             @functools.wraps(func)
+1671             def test_case_id_wrapper(*args, **kwargs):
+1672                 # This runs after the eventlet.spawn in the new child.
+1673                 # Propagate the id from our caller eventlet
+1674                 current = eventlet.getcurrent()
+1675                 current.test_case_id = caller_test_case_id
+1676                 return func(*args, **kwargs)
+1677 
+1678             # call the original spawn to create the child but with our
+1679             # new wrapper around its target
+1680             return orig_spawn(test_case_id_wrapper, *args, **kwargs)
+1681 
+1682         # let's replace nova.utils.spawn with the wrapped one that injects
+1683         # our initialization to the child eventlet
+1684         self.useFixture(
+1685             fixtures.MonkeyPatch('nova.utils.spawn', wrapped_spawn))
+1686 
+1687         # now do the same with spawn_n
+1688         orig_spawn_n = utils.spawn_n
+1689 
+1690         def wrapped_spawn_n(func, *args, **kwargs):
+1691             # This is still runs before the eventlet.spawn so read the id for
+1692             # propagation
+1693             caller = eventlet.getcurrent()
+1694             # If there is no id set on us that means we were spawned with other
+1695             # than nova.utils.spawn or spawn_n so the id propagation chain got
+1696             # broken. We fall back to self.test_case_id from the fixture which
+1697             # is good enough
+1698             caller_test_case_id = getattr(
+1699                 caller, 'test_case_id', None) or self.test_case_id
+1700 
+1701             @functools.wraps(func)
+1702             def test_case_id_wrapper(*args, **kwargs):
+1703                 # This runs after the eventlet.spawn in the new child.
+1704                 # Propagate the id from our caller eventlet
+1705                 current = eventlet.getcurrent()
+1706                 current.test_case_id = caller_test_case_id
+1707                 return func(*args, **kwargs)
+1708 
+1709             # call the original spawn_n to create the child but with our
+1710             # new wrapper around its target
+1711             return orig_spawn_n(test_case_id_wrapper, *args, **kwargs)
+1712 
+1713         # let's replace nova.utils.spawn_n with the wrapped one that injects
+1714         # our initialization to the child eventlet
+1715         self.useFixture(
+1716             fixtures.MonkeyPatch('nova.utils.spawn_n', wrapped_spawn_n))
+1717 
+1718 
+1719 class ReaderWriterLock(lockutils.ReaderWriterLock):
+1720     """Wrap oslo.concurrency lockutils.ReaderWriterLock to support eventlet.
+1721 
+1722     As of fasteners >= 0.15, the workaround code to use eventlet.getcurrent()
+1723     if eventlet patching is detected has been removed and
+1724     threading.current_thread is being used instead. Although we are running in
+1725     a greenlet in our test environment, we are not running in a greenlet of
+1726     type GreenThread. A GreenThread is created by calling eventlet.spawn() and
+1727     spawn() is not used to run our tests. At the time of this writing, the
+1728     eventlet patched threading.current_thread() method falls back to the
+1729     original unpatched current_thread() method if it is not called from a
+1730     GreenThead [1] and that breaks our tests involving this fixture.
+1731 
+1732     We can work around this by patching threading.current_thread() with
+1733     eventlet.getcurrent() during creation of the lock object, if we detect we
+1734     are eventlet patched. If we are not eventlet patched, we use a no-op
+1735     context manager.
+1736 
+1737     Note: this wrapper should be used for any ReaderWriterLock because any lock
+1738     may possibly be running inside a plain greenlet created by spawn_n().
+1739 
+1740     See https://github.com/eventlet/eventlet/issues/731 for details.
+1741 
+1742     [1] https://github.com/eventlet/eventlet/blob/v0.32.0/eventlet/green/threading.py#L128  # noqa
+1743     """
+1744 
+1745     def __init__(self, *a, **kw):
+1746         eventlet_patched = eventlet.patcher.is_monkey_patched('thread')
+1747         mpatch = fixtures.MonkeyPatch(
+1748             'threading.current_thread', eventlet.getcurrent)
+1749         with mpatch if eventlet_patched else contextlib.ExitStack():
+1750             super().__init__(*a, **kw)

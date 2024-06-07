@@ -1,0 +1,789 @@
+I want you to act as a code reviewer of Neutron in OpenStack. Please review the code below to detect security defects. If any are found, please describe the security defect in detail and indicate the corresponding line number of code and solution. If none are found, please state '''No security defects are detected in the code'''.
+
+1 # Copyright 2012 VMware, Inc.  All rights reserved.
+2 #
+3 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
+4 #    not use this file except in compliance with the License. You may obtain
+5 #    a copy of the License at
+6 #
+7 #         http://www.apache.org/licenses/LICENSE-2.0
+8 #
+9 #    Unless required by applicable law or agreed to in writing, software
+10 #    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+11 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+12 #    License for the specific language governing permissions and limitations
+13 #    under the License.
+14 
+15 import netaddr
+16 from oslo_db import exception as db_exc
+17 from oslo_log import log as logging
+18 from oslo_utils import uuidutils
+19 import sqlalchemy as sa
+20 from sqlalchemy import orm
+21 from sqlalchemy.orm import exc
+22 from sqlalchemy.orm import scoped_session
+23 
+24 from neutron._i18n import _
+25 from neutron.api.v2 import attributes
+26 from neutron.callbacks import events
+27 from neutron.callbacks import exceptions
+28 from neutron.callbacks import registry
+29 from neutron.callbacks import resources
+30 from neutron.common import constants
+31 from neutron.common import utils
+32 from neutron.db import api as db_api
+33 from neutron.db import db_base_plugin_v2
+34 from neutron.db import model_base
+35 from neutron.db import models_v2
+36 from neutron.extensions import securitygroup as ext_sg
+37 
+38 
+39 LOG = logging.getLogger(__name__)
+40 
+41 
+42 class SecurityGroup(model_base.HasStandardAttributes, model_base.BASEV2,
+43                     model_base.HasId, model_base.HasTenant):
+44     """Represents a v2 neutron security group."""
+45 
+46     name = sa.Column(sa.String(attributes.NAME_MAX_LEN))
+47     description = sa.Column(sa.String(attributes.DESCRIPTION_MAX_LEN))
+48 
+49 
+50 class DefaultSecurityGroup(model_base.BASEV2):
+51     __tablename__ = 'default_security_group'
+52 
+53     tenant_id = sa.Column(sa.String(attributes.TENANT_ID_MAX_LEN),
+54                           primary_key=True, nullable=False)
+55     security_group_id = sa.Column(sa.String(36),
+56                                   sa.ForeignKey("securitygroups.id",
+57                                                 ondelete="CASCADE"),
+58                                   nullable=False)
+59     security_group = orm.relationship(
+60         SecurityGroup, lazy='joined',
+61         backref=orm.backref('default_security_group', cascade='all,delete'),
+62         primaryjoin="SecurityGroup.id==DefaultSecurityGroup.security_group_id",
+63     )
+64 
+65 
+66 class SecurityGroupPortBinding(model_base.BASEV2):
+67     """Represents binding between neutron ports and security profiles."""
+68 
+69     port_id = sa.Column(sa.String(36),
+70                         sa.ForeignKey("ports.id",
+71                                       ondelete='CASCADE'),
+72                         primary_key=True)
+73     security_group_id = sa.Column(sa.String(36),
+74                                   sa.ForeignKey("securitygroups.id"),
+75                                   primary_key=True)
+76 
+77     # Add a relationship to the Port model in order to instruct SQLAlchemy to
+78     # eagerly load security group bindings
+79     ports = orm.relationship(
+80         models_v2.Port,
+81         backref=orm.backref("security_groups",
+82                             lazy='joined', cascade='delete'))
+83 
+84 
+85 class SecurityGroupRule(model_base.HasStandardAttributes, model_base.BASEV2,
+86                         model_base.HasId, model_base.HasTenant):
+87     """Represents a v2 neutron security group rule."""
+88 
+89     security_group_id = sa.Column(sa.String(36),
+90                                   sa.ForeignKey("securitygroups.id",
+91                                                 ondelete="CASCADE"),
+92                                   nullable=False)
+93 
+94     remote_group_id = sa.Column(sa.String(36),
+95                                 sa.ForeignKey("securitygroups.id",
+96                                               ondelete="CASCADE"),
+97                                 nullable=True)
+98 
+99     direction = sa.Column(sa.Enum('ingress', 'egress',
+100                                   name='securitygrouprules_direction'))
+101     ethertype = sa.Column(sa.String(40))
+102     protocol = sa.Column(sa.String(40))
+103     port_range_min = sa.Column(sa.Integer)
+104     port_range_max = sa.Column(sa.Integer)
+105     remote_ip_prefix = sa.Column(sa.String(255))
+106     security_group = orm.relationship(
+107         SecurityGroup,
+108         backref=orm.backref('rules', cascade='all,delete', lazy='joined'),
+109         primaryjoin="SecurityGroup.id==SecurityGroupRule.security_group_id")
+110     source_group = orm.relationship(
+111         SecurityGroup,
+112         backref=orm.backref('source_rules', cascade='all,delete'),
+113         primaryjoin="SecurityGroup.id==SecurityGroupRule.remote_group_id")
+114 
+115 
+116 class SecurityGroupDbMixin(ext_sg.SecurityGroupPluginBase):
+117     """Mixin class to add security group to db_base_plugin_v2."""
+118 
+119     __native_bulk_support = True
+120 
+121     def create_security_group_bulk(self, context, security_group_rule):
+122         return self._create_bulk('security_group', context,
+123                                  security_group_rule)
+124 
+125     def _registry_notify(self, res, event, id=None, exc_cls=None, **kwargs):
+126         # NOTE(armax): a callback exception here will prevent the request
+127         # from being processed. This is a hook point for backend's validation;
+128         # we raise to propagate the reason for the failure.
+129         try:
+130             registry.notify(res, event, self, **kwargs)
+131         except exceptions.CallbackFailure as e:
+132             if exc_cls:
+133                 reason = _('cannot perform %(event)s due to %(reason)s'), {
+134                            'event': event, 'reason': e}
+135                 raise exc_cls(reason=reason, id=id)
+136 
+137     def create_security_group(self, context, security_group, default_sg=False):
+138         """Create security group.
+139 
+140         If default_sg is true that means we are a default security group for
+141         a given tenant if it does not exist.
+142         """
+143         s = security_group['security_group']
+144         kwargs = {
+145             'context': context,
+146             'security_group': s,
+147             'is_default': default_sg,
+148         }
+149 
+150         self._registry_notify(resources.SECURITY_GROUP, events.BEFORE_CREATE,
+151                               exc_cls=ext_sg.SecurityGroupConflict, **kwargs)
+152 
+153         tenant_id = s['tenant_id']
+154 
+155         if not default_sg:
+156             self._ensure_default_security_group(context, tenant_id)
+157 
+158         with db_api.autonested_transaction(context.session):
+159             security_group_db = SecurityGroup(id=s.get('id') or (
+160                                               uuidutils.generate_uuid()),
+161                                               description=s['description'],
+162                                               tenant_id=tenant_id,
+163                                               name=s['name'])
+164             context.session.add(security_group_db)
+165             if default_sg:
+166                 context.session.add(DefaultSecurityGroup(
+167                     security_group=security_group_db,
+168                     tenant_id=security_group_db['tenant_id']))
+169             for ethertype in ext_sg.sg_supported_ethertypes:
+170                 if default_sg:
+171                     # Allow intercommunication
+172                     ingress_rule = SecurityGroupRule(
+173                         id=uuidutils.generate_uuid(), tenant_id=tenant_id,
+174                         security_group=security_group_db,
+175                         direction='ingress',
+176                         ethertype=ethertype,
+177                         source_group=security_group_db)
+178                     context.session.add(ingress_rule)
+179 
+180                 egress_rule = SecurityGroupRule(
+181                     id=uuidutils.generate_uuid(), tenant_id=tenant_id,
+182                     security_group=security_group_db,
+183                     direction='egress',
+184                     ethertype=ethertype)
+185                 context.session.add(egress_rule)
+186 
+187                 secgroup_dict = self._make_security_group_dict(
+188                                     security_group_db)
+189                 kwargs['security_group'] = secgroup_dict
+190 
+191                 self._registry_notify(resources.SECURITY_GROUP,
+192                                       events.PRECOMMIT_CREATE,
+193                                       exc_cls=ext_sg.SecurityGroupConflict,
+194                                       **kwargs)
+195 
+196         registry.notify(resources.SECURITY_GROUP, events.AFTER_CREATE, self,
+197                         **kwargs)
+198         return secgroup_dict
+199 
+200     def get_security_groups(self, context, filters=None, fields=None,
+201                             sorts=None, limit=None,
+202                             marker=None, page_reverse=False, default_sg=False):
+203 
+204         # If default_sg is True do not call _ensure_default_security_group()
+205         # so this can be done recursively. Context.tenant_id is checked
+206         # because all the unit tests do not explicitly set the context on
+207         # GETS. TODO(arosen)  context handling can probably be improved here.
+208         if not default_sg and context.tenant_id:
+209             tenant_id = filters.get('tenant_id')
+210             if tenant_id:
+211                 tenant_id = tenant_id[0]
+212             else:
+213                 tenant_id = context.tenant_id
+214             self._ensure_default_security_group(context, tenant_id)
+215         marker_obj = self._get_marker_obj(context, 'security_group', limit,
+216                                           marker)
+217         return self._get_collection(context,
+218                                     SecurityGroup,
+219                                     self._make_security_group_dict,
+220                                     filters=filters, fields=fields,
+221                                     sorts=sorts,
+222                                     limit=limit, marker_obj=marker_obj,
+223                                     page_reverse=page_reverse)
+224 
+225     def get_security_groups_count(self, context, filters=None):
+226         return self._get_collection_count(context, SecurityGroup,
+227                                           filters=filters)
+228 
+229     def get_security_group(self, context, id, fields=None, tenant_id=None):
+230         """Tenant id is given to handle the case when creating a security
+231         group rule on behalf of another use.
+232         """
+233 
+234         if tenant_id:
+235             tmp_context_tenant_id = context.tenant_id
+236             context.tenant_id = tenant_id
+237 
+238         try:
+239             with context.session.begin(subtransactions=True):
+240                 ret = self._make_security_group_dict(self._get_security_group(
+241                                                      context, id), fields)
+242                 ret['security_group_rules'] = self.get_security_group_rules(
+243                     context, {'security_group_id': [id]})
+244         finally:
+245             if tenant_id:
+246                 context.tenant_id = tmp_context_tenant_id
+247         return ret
+248 
+249     def _get_security_group(self, context, id):
+250         try:
+251             query = self._model_query(context, SecurityGroup)
+252             sg = query.filter(SecurityGroup.id == id).one()
+253 
+254         except exc.NoResultFound:
+255             raise ext_sg.SecurityGroupNotFound(id=id)
+256         return sg
+257 
+258     def delete_security_group(self, context, id):
+259         filters = {'security_group_id': [id]}
+260         ports = self._get_port_security_group_bindings(context, filters)
+261         if ports:
+262             raise ext_sg.SecurityGroupInUse(id=id)
+263         # confirm security group exists
+264         sg = self._get_security_group(context, id)
+265 
+266         if sg['name'] == 'default' and not context.is_admin:
+267             raise ext_sg.SecurityGroupCannotRemoveDefault()
+268         kwargs = {
+269             'context': context,
+270             'security_group_id': id,
+271             'security_group': sg,
+272         }
+273         self._registry_notify(resources.SECURITY_GROUP, events.BEFORE_DELETE,
+274                               exc_cls=ext_sg.SecurityGroupInUse, id=id,
+275                               **kwargs)
+276 
+277         with context.session.begin(subtransactions=True):
+278             self._registry_notify(resources.SECURITY_GROUP,
+279                                   events.PRECOMMIT_DELETE,
+280                                   exc_cls=ext_sg.SecurityGroupInUse, id=id,
+281                                   **kwargs)
+282             context.session.delete(sg)
+283 
+284         kwargs.pop('security_group')
+285         registry.notify(resources.SECURITY_GROUP, events.AFTER_DELETE, self,
+286                         **kwargs)
+287 
+288     def update_security_group(self, context, id, security_group):
+289         s = security_group['security_group']
+290 
+291         kwargs = {
+292             'context': context,
+293             'security_group_id': id,
+294             'security_group': s,
+295         }
+296         self._registry_notify(resources.SECURITY_GROUP, events.BEFORE_UPDATE,
+297                               exc_cls=ext_sg.SecurityGroupConflict, **kwargs)
+298 
+299         with context.session.begin(subtransactions=True):
+300             sg = self._get_security_group(context, id)
+301             if sg['name'] == 'default' and 'name' in s:
+302                 raise ext_sg.SecurityGroupCannotUpdateDefault()
+303             self._registry_notify(
+304                     resources.SECURITY_GROUP,
+305                     events.PRECOMMIT_UPDATE,
+306                     exc_cls=ext_sg.SecurityGroupConflict, **kwargs)
+307             sg.update(s)
+308         sg_dict = self._make_security_group_dict(sg)
+309 
+310         kwargs['security_group'] = sg_dict
+311         registry.notify(resources.SECURITY_GROUP, events.AFTER_UPDATE, self,
+312                         **kwargs)
+313         return sg_dict
+314 
+315     def _make_security_group_dict(self, security_group, fields=None):
+316         res = {'id': security_group['id'],
+317                'name': security_group['name'],
+318                'tenant_id': security_group['tenant_id'],
+319                'description': security_group['description']}
+320         res['security_group_rules'] = [self._make_security_group_rule_dict(r)
+321                                        for r in security_group.rules]
+322         return self._fields(res, fields)
+323 
+324     def _make_security_group_binding_dict(self, security_group, fields=None):
+325         res = {'port_id': security_group['port_id'],
+326                'security_group_id': security_group['security_group_id']}
+327         return self._fields(res, fields)
+328 
+329     def _create_port_security_group_binding(self, context, port_id,
+330                                             security_group_id):
+331         with context.session.begin(subtransactions=True):
+332             db = SecurityGroupPortBinding(port_id=port_id,
+333                                           security_group_id=security_group_id)
+334             context.session.add(db)
+335 
+336     def _get_port_security_group_bindings(self, context,
+337                                           filters=None, fields=None):
+338         return self._get_collection(context,
+339                                     SecurityGroupPortBinding,
+340                                     self._make_security_group_binding_dict,
+341                                     filters=filters, fields=fields)
+342 
+343     def _delete_port_security_group_bindings(self, context, port_id):
+344         query = self._model_query(context, SecurityGroupPortBinding)
+345         bindings = query.filter(
+346             SecurityGroupPortBinding.port_id == port_id)
+347         with context.session.begin(subtransactions=True):
+348             for binding in bindings:
+349                 context.session.delete(binding)
+350 
+351     def create_security_group_rule_bulk(self, context, security_group_rules):
+352         return self._create_bulk('security_group_rule', context,
+353                                  security_group_rules)
+354 
+355     def create_security_group_rule_bulk_native(self, context,
+356                                                security_group_rules):
+357         rules = security_group_rules['security_group_rules']
+358         scoped_session(context.session)
+359         security_group_id = self._validate_security_group_rules(
+360             context, security_group_rules)
+361         with context.session.begin(subtransactions=True):
+362             if not self.get_security_group(context, security_group_id):
+363                 raise ext_sg.SecurityGroupNotFound(id=security_group_id)
+364 
+365             self._check_for_duplicate_rules(context, rules)
+366             ret = []
+367             for rule_dict in rules:
+368                 res_rule_dict = self._create_security_group_rule(
+369                     context, rule_dict, validate=False)
+370                 ret.append(res_rule_dict)
+371             return ret
+372 
+373     def create_security_group_rule(self, context, security_group_rule):
+374         return self._create_security_group_rule(context, security_group_rule)
+375 
+376     def _create_security_group_rule(self, context, security_group_rule,
+377                                     validate=True):
+378         if validate:
+379             self._validate_security_group_rule(context, security_group_rule)
+380             self._check_for_duplicate_rules_in_db(context, security_group_rule)
+381 
+382         rule_dict = security_group_rule['security_group_rule']
+383         kwargs = {
+384             'context': context,
+385             'security_group_rule': rule_dict
+386         }
+387         self._registry_notify(resources.SECURITY_GROUP_RULE,
+388                               events.BEFORE_CREATE,
+389                               exc_cls=ext_sg.SecurityGroupConflict, **kwargs)
+390 
+391         with context.session.begin(subtransactions=True):
+392             db = SecurityGroupRule(
+393                 id=(rule_dict.get('id') or uuidutils.generate_uuid()),
+394                 tenant_id=rule_dict['tenant_id'],
+395                 security_group_id=rule_dict['security_group_id'],
+396                 direction=rule_dict['direction'],
+397                 remote_group_id=rule_dict.get('remote_group_id'),
+398                 ethertype=rule_dict['ethertype'],
+399                 protocol=rule_dict['protocol'],
+400                 port_range_min=rule_dict['port_range_min'],
+401                 port_range_max=rule_dict['port_range_max'],
+402                 remote_ip_prefix=rule_dict.get('remote_ip_prefix'))
+403             context.session.add(db)
+404             res_rule_dict = self._make_security_group_rule_dict(db)
+405             kwargs['security_group_rule'] = res_rule_dict
+406             self._registry_notify(resources.SECURITY_GROUP_RULE,
+407                               events.PRECOMMIT_CREATE,
+408                               exc_cls=ext_sg.SecurityGroupConflict, **kwargs)
+409         registry.notify(
+410             resources.SECURITY_GROUP_RULE, events.AFTER_CREATE, self,
+411             **kwargs)
+412         return res_rule_dict
+413 
+414     def _get_ip_proto_number(self, protocol):
+415         if protocol is None:
+416             return
+417         # According to bug 1381379, protocol is always set to string to avoid
+418         # problems with comparing int and string in PostgreSQL. Here this
+419         # string is converted to int to give an opportunity to use it as
+420         # before.
+421         return int(constants.IP_PROTOCOL_MAP.get(protocol, protocol))
+422 
+423     def _validate_port_range(self, rule):
+424         """Check that port_range is valid."""
+425         if (rule['port_range_min'] is None and
+426             rule['port_range_max'] is None):
+427             return
+428         if not rule['protocol']:
+429             raise ext_sg.SecurityGroupProtocolRequiredWithPorts()
+430         ip_proto = self._get_ip_proto_number(rule['protocol'])
+431         if ip_proto in [constants.PROTO_NUM_TCP, constants.PROTO_NUM_UDP]:
+432             if rule['port_range_min'] == 0 or rule['port_range_max'] == 0:
+433                 raise ext_sg.SecurityGroupInvalidPortValue(port=0)
+434             elif (rule['port_range_min'] is not None and
+435                 rule['port_range_max'] is not None and
+436                 rule['port_range_min'] <= rule['port_range_max']):
+437                 pass
+438             else:
+439                 raise ext_sg.SecurityGroupInvalidPortRange()
+440         elif ip_proto == constants.PROTO_NUM_ICMP:
+441             for attr, field in [('port_range_min', 'type'),
+442                                 ('port_range_max', 'code')]:
+443                 if rule[attr] is not None and not (0 <= rule[attr] <= 255):
+444                     raise ext_sg.SecurityGroupInvalidIcmpValue(
+445                         field=field, attr=attr, value=rule[attr])
+446             if (rule['port_range_min'] is None and
+447                     rule['port_range_max'] is not None):
+448                 raise ext_sg.SecurityGroupMissingIcmpType(
+449                     value=rule['port_range_max'])
+450 
+451     def _validate_ethertype_and_protocol(self, rule):
+452         """Check if given ethertype and  protocol are valid or not"""
+453         if rule['protocol'] in [constants.PROTO_NAME_IPV6_ENCAP,
+454                                 constants.PROTO_NAME_IPV6_FRAG,
+455                                 constants.PROTO_NAME_IPV6_ICMP,
+456                                 constants.PROTO_NAME_IPV6_NONXT,
+457                                 constants.PROTO_NAME_IPV6_OPTS,
+458                                 constants.PROTO_NAME_IPV6_ROUTE]:
+459             if rule['ethertype'] == constants.IPv4:
+460                 raise ext_sg.SecurityGroupEthertypeConflictWithProtocol(
+461                         ethertype=rule['ethertype'], protocol=rule['protocol'])
+462 
+463     def _validate_single_tenant_and_group(self, security_group_rules):
+464         """Check that all rules belong to the same security group and tenant
+465         """
+466         sg_groups = set()
+467         tenants = set()
+468         for rule_dict in security_group_rules['security_group_rules']:
+469             rule = rule_dict['security_group_rule']
+470             sg_groups.add(rule['security_group_id'])
+471             if len(sg_groups) > 1:
+472                 raise ext_sg.SecurityGroupNotSingleGroupRules()
+473 
+474             tenants.add(rule['tenant_id'])
+475             if len(tenants) > 1:
+476                 raise ext_sg.SecurityGroupRulesNotSingleTenant()
+477         return sg_groups.pop()
+478 
+479     def _validate_security_group_rule(self, context, security_group_rule):
+480         rule = security_group_rule['security_group_rule']
+481         self._validate_port_range(rule)
+482         self._validate_ip_prefix(rule)
+483         self._validate_ethertype_and_protocol(rule)
+484 
+485         if rule['remote_ip_prefix'] and rule['remote_group_id']:
+486             raise ext_sg.SecurityGroupRemoteGroupAndRemoteIpPrefix()
+487 
+488         remote_group_id = rule['remote_group_id']
+489         # Check that remote_group_id exists for tenant
+490         if remote_group_id:
+491             self.get_security_group(context, remote_group_id,
+492                                     tenant_id=rule['tenant_id'])
+493 
+494         security_group_id = rule['security_group_id']
+495 
+496         # Confirm that the tenant has permission
+497         # to add rules to this security group.
+498         self.get_security_group(context, security_group_id,
+499                                 tenant_id=rule['tenant_id'])
+500         return security_group_id
+501 
+502     def _validate_security_group_rules(self, context, security_group_rules):
+503         sg_id = self._validate_single_tenant_and_group(security_group_rules)
+504         for rule in security_group_rules['security_group_rules']:
+505             self._validate_security_group_rule(context, rule)
+506         return sg_id
+507 
+508     def _make_security_group_rule_dict(self, security_group_rule, fields=None):
+509         res = {'id': security_group_rule['id'],
+510                'tenant_id': security_group_rule['tenant_id'],
+511                'security_group_id': security_group_rule['security_group_id'],
+512                'ethertype': security_group_rule['ethertype'],
+513                'direction': security_group_rule['direction'],
+514                'protocol': security_group_rule['protocol'],
+515                'port_range_min': security_group_rule['port_range_min'],
+516                'port_range_max': security_group_rule['port_range_max'],
+517                'remote_ip_prefix': security_group_rule['remote_ip_prefix'],
+518                'remote_group_id': security_group_rule['remote_group_id']}
+519 
+520         return self._fields(res, fields)
+521 
+522     def _make_security_group_rule_filter_dict(self, security_group_rule):
+523         sgr = security_group_rule['security_group_rule']
+524         res = {'tenant_id': [sgr['tenant_id']],
+525                'security_group_id': [sgr['security_group_id']],
+526                'direction': [sgr['direction']]}
+527 
+528         include_if_present = ['protocol', 'port_range_max', 'port_range_min',
+529                               'ethertype', 'remote_ip_prefix',
+530                               'remote_group_id']
+531         for key in include_if_present:
+532             value = sgr.get(key)
+533             if value:
+534                 res[key] = [value]
+535         return res
+536 
+537     def _check_for_duplicate_rules(self, context, security_group_rules):
+538         for i in security_group_rules:
+539             found_self = False
+540             for j in security_group_rules:
+541                 if i['security_group_rule'] == j['security_group_rule']:
+542                     if found_self:
+543                         raise ext_sg.DuplicateSecurityGroupRuleInPost(rule=i)
+544                     found_self = True
+545 
+546             self._check_for_duplicate_rules_in_db(context, i)
+547 
+548     def _check_for_duplicate_rules_in_db(self, context, security_group_rule):
+549         # Check in database if rule exists
+550         filters = self._make_security_group_rule_filter_dict(
+551             security_group_rule)
+552         db_rules = self.get_security_group_rules(context, filters)
+553         # Note(arosen): the call to get_security_group_rules wildcards
+554         # values in the filter that have a value of [None]. For
+555         # example, filters = {'remote_group_id': [None]} will return
+556         # all security group rules regardless of their value of
+557         # remote_group_id. Therefore it is not possible to do this
+558         # query unless the behavior of _get_collection()
+559         # is changed which cannot be because other methods are already
+560         # relying on this behavior. Therefore, we do the filtering
+561         # below to check for these corner cases.
+562         for db_rule in db_rules:
+563             # need to remove id from db_rule for matching
+564             id = db_rule.pop('id')
+565             if (security_group_rule['security_group_rule'] == db_rule):
+566                 raise ext_sg.SecurityGroupRuleExists(id=id)
+567 
+568     def _validate_ip_prefix(self, rule):
+569         """Check that a valid cidr was specified as remote_ip_prefix
+570 
+571         No need to check that it is in fact an IP address as this is already
+572         validated by attribute validators.
+573         Check that rule ethertype is consistent with remote_ip_prefix ip type.
+574         Add mask to ip_prefix if absent (192.168.1.10 -> 192.168.1.10/32).
+575         """
+576         input_prefix = rule['remote_ip_prefix']
+577         if input_prefix:
+578             addr = netaddr.IPNetwork(input_prefix)
+579             # set input_prefix to always include the netmask:
+580             rule['remote_ip_prefix'] = str(addr)
+581             # check consistency of ethertype with addr version
+582             if rule['ethertype'] != "IPv%d" % (addr.version):
+583                 raise ext_sg.SecurityGroupRuleParameterConflict(
+584                     ethertype=rule['ethertype'], cidr=input_prefix)
+585 
+586     def get_security_group_rules(self, context, filters=None, fields=None,
+587                                  sorts=None, limit=None, marker=None,
+588                                  page_reverse=False):
+589         marker_obj = self._get_marker_obj(context, 'security_group_rule',
+590                                           limit, marker)
+591         return self._get_collection(context,
+592                                     SecurityGroupRule,
+593                                     self._make_security_group_rule_dict,
+594                                     filters=filters, fields=fields,
+595                                     sorts=sorts,
+596                                     limit=limit, marker_obj=marker_obj,
+597                                     page_reverse=page_reverse)
+598 
+599     def get_security_group_rules_count(self, context, filters=None):
+600         return self._get_collection_count(context, SecurityGroupRule,
+601                                           filters=filters)
+602 
+603     def get_security_group_rule(self, context, id, fields=None):
+604         security_group_rule = self._get_security_group_rule(context, id)
+605         return self._make_security_group_rule_dict(security_group_rule, fields)
+606 
+607     def _get_security_group_rule(self, context, id):
+608         try:
+609             query = self._model_query(context, SecurityGroupRule)
+610             sgr = query.filter(SecurityGroupRule.id == id).one()
+611         except exc.NoResultFound:
+612             raise ext_sg.SecurityGroupRuleNotFound(id=id)
+613         return sgr
+614 
+615     def delete_security_group_rule(self, context, id):
+616         kwargs = {
+617             'context': context,
+618             'security_group_rule_id': id
+619         }
+620         self._registry_notify(resources.SECURITY_GROUP_RULE,
+621                               events.BEFORE_DELETE, id=id,
+622                               exc_cls=ext_sg.SecurityGroupRuleInUse, **kwargs)
+623 
+624         with context.session.begin(subtransactions=True):
+625             query = self._model_query(context, SecurityGroupRule).filter(
+626                 SecurityGroupRule.id == id)
+627 
+628             self._registry_notify(resources.SECURITY_GROUP_RULE,
+629                                   events.PRECOMMIT_DELETE,
+630                                   exc_cls=ext_sg.SecurityGroupRuleInUse, id=id,
+631                                   **kwargs)
+632 
+633             try:
+634                 # As there is a filter on a primary key it is not possible for
+635                 # MultipleResultsFound to be raised
+636                 context.session.delete(query.one())
+637             except exc.NoResultFound:
+638                 raise ext_sg.SecurityGroupRuleNotFound(id=id)
+639 
+640         registry.notify(
+641             resources.SECURITY_GROUP_RULE, events.AFTER_DELETE, self,
+642             **kwargs)
+643 
+644     def _extend_port_dict_security_group(self, port_res, port_db):
+645         # Security group bindings will be retrieved from the SQLAlchemy
+646         # model. As they're loaded eagerly with ports because of the
+647         # joined load they will not cause an extra query.
+648         security_group_ids = [sec_group_mapping['security_group_id'] for
+649                               sec_group_mapping in port_db.security_groups]
+650         port_res[ext_sg.SECURITYGROUPS] = security_group_ids
+651         return port_res
+652 
+653     # Register dict extend functions for ports
+654     db_base_plugin_v2.NeutronDbPluginV2.register_dict_extend_funcs(
+655         attributes.PORTS, ['_extend_port_dict_security_group'])
+656 
+657     def _process_port_create_security_group(self, context, port,
+658                                             security_group_ids):
+659         if attributes.is_attr_set(security_group_ids):
+660             for security_group_id in security_group_ids:
+661                 self._create_port_security_group_binding(context, port['id'],
+662                                                          security_group_id)
+663         # Convert to list as a set might be passed here and
+664         # this has to be serialized
+665         port[ext_sg.SECURITYGROUPS] = (security_group_ids and
+666                                        list(security_group_ids) or [])
+667 
+668     def _ensure_default_security_group(self, context, tenant_id):
+669         """Create a default security group if one doesn't exist.
+670 
+671         :returns: the default security group id for given tenant.
+672         """
+673         # Make no more than two attempts
+674         for attempts in (1, 2):
+675             try:
+676                 query = self._model_query(context, DefaultSecurityGroup)
+677                 default_group = query.filter_by(tenant_id=tenant_id).one()
+678                 return default_group['security_group_id']
+679             except exc.NoResultFound as ex:
+680                 if attempts > 1:
+681                     # the second iteration means that attempt to add default
+682                     # group failed with duplicate error. Since we're still
+683                     # not seeing this group we're most probably inside a
+684                     # transaction with REPEATABLE READ isolation level ->
+685                     # need to restart the whole transaction
+686                     raise db_exc.RetryRequest(ex)
+687 
+688                 security_group = {
+689                     'security_group':
+690                         {'name': 'default',
+691                          'tenant_id': tenant_id,
+692                          'description': _('Default security group')}
+693                 }
+694                 try:
+695                     security_group = self.create_security_group(
+696                         context, security_group, default_sg=True)
+697                     return security_group['id']
+698                 except db_exc.DBDuplicateEntry as ex:
+699                     # default security group was created concurrently
+700                     LOG.debug("Duplicate default security group %s was "
+701                               "not created", ex.value)
+702 
+703     def _get_security_groups_on_port(self, context, port):
+704         """Check that all security groups on port belong to tenant.
+705 
+706         :returns: all security groups IDs on port belonging to tenant.
+707         """
+708         port = port['port']
+709         if not attributes.is_attr_set(port.get(ext_sg.SECURITYGROUPS)):
+710             return
+711         if port.get('device_owner') and utils.is_port_trusted(port):
+712             return
+713 
+714         port_sg = port.get(ext_sg.SECURITYGROUPS, [])
+715         filters = {'id': port_sg}
+716         tenant_id = port.get('tenant_id')
+717         if tenant_id:
+718             filters['tenant_id'] = [tenant_id]
+719         valid_groups = set(g['id'] for g in
+720                            self.get_security_groups(context, fields=['id'],
+721                                                     filters=filters))
+722 
+723         requested_groups = set(port_sg)
+724         port_sg_missing = requested_groups - valid_groups
+725         if port_sg_missing:
+726             raise ext_sg.SecurityGroupNotFound(id=', '.join(port_sg_missing))
+727 
+728         return requested_groups
+729 
+730     def _ensure_default_security_group_on_port(self, context, port):
+731         # we don't apply security groups for dhcp, router
+732         port = port['port']
+733         if port.get('device_owner') and utils.is_port_trusted(port):
+734             return
+735         default_sg = self._ensure_default_security_group(context,
+736                                                          port['tenant_id'])
+737         if not attributes.is_attr_set(port.get(ext_sg.SECURITYGROUPS)):
+738             port[ext_sg.SECURITYGROUPS] = [default_sg]
+739 
+740     def _check_update_deletes_security_groups(self, port):
+741         """Return True if port has as a security group and it's value
+742         is either [] or not is_attr_set, otherwise return False
+743         """
+744         if (ext_sg.SECURITYGROUPS in port['port'] and
+745             not (attributes.is_attr_set(port['port'][ext_sg.SECURITYGROUPS])
+746                  and port['port'][ext_sg.SECURITYGROUPS] != [])):
+747             return True
+748         return False
+749 
+750     def _check_update_has_security_groups(self, port):
+751         """Return True if port has security_groups attribute set and
+752         its not empty, or False otherwise.
+753         This method is called both for port create and port update.
+754         """
+755         if (ext_sg.SECURITYGROUPS in port['port'] and
+756             (attributes.is_attr_set(port['port'][ext_sg.SECURITYGROUPS]) and
+757              port['port'][ext_sg.SECURITYGROUPS] != [])):
+758             return True
+759         return False
+760 
+761     def update_security_group_on_port(self, context, id, port,
+762                                       original_port, updated_port):
+763         """Update security groups on port.
+764 
+765         This method returns a flag which indicates request notification
+766         is required and does not perform notification itself.
+767         It is because another changes for the port may require notification.
+768         """
+769         need_notify = False
+770         port_updates = port['port']
+771         if (ext_sg.SECURITYGROUPS in port_updates and
+772             not utils.compare_elements(
+773                 original_port.get(ext_sg.SECURITYGROUPS),
+774                 port_updates[ext_sg.SECURITYGROUPS])):
+775             # delete the port binding and read it with the new rules
+776             port_updates[ext_sg.SECURITYGROUPS] = (
+777                 self._get_security_groups_on_port(context, port))
+778             self._delete_port_security_group_bindings(context, id)
+779             self._process_port_create_security_group(
+780                 context,
+781                 updated_port,
+782                 port_updates[ext_sg.SECURITYGROUPS])
+783             need_notify = True
+784         else:
+785             updated_port[ext_sg.SECURITYGROUPS] = (
+786                 original_port[ext_sg.SECURITYGROUPS])
+787         return need_notify
